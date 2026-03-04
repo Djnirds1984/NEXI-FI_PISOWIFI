@@ -1,0 +1,181 @@
+#!/bin/ash
+
+# PisoWiFi API CGI Script
+# Compatible with BusyBox Ash shell
+
+# Set content type
+echo "Content-Type: application/json"
+echo ""
+
+# Read query string
+QUERY_STRING="$QUERY_STRING"
+
+# Extract action parameter
+ACTION=""
+for param in $(echo "$QUERY_STRING" | tr '&' '\n'); do
+    case "$param" in
+        action=*)
+            ACTION=$(echo "$param" | cut -d'=' -f2)
+            ;;
+    esac
+done
+
+# Read POST data if available
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    read -r POST_DATA
+fi
+
+# Function to output JSON response
+json_response() {
+    local success="$1"
+    local message="$2"
+    local data="$3"
+    
+    echo "{"
+    echo "  \"success\": $success,"
+    echo "  \"message\": \"$message\""
+    if [ -n "$data" ]; then
+        echo ", $data"
+    fi
+    echo "}"
+}
+
+# Function to get system status
+get_status() {
+    local hostname=$(uci get system.@system[0].hostname 2>/dev/null || echo "OpenWrt")
+    local uptime=$(uptime | awk '{print $1,$2,$3}')
+    local wan_ip=$(ifconfig wan 2>/dev/null | grep 'inet addr' | awk '{print $2}' | cut -d: -f2 || echo "N/A")
+    local lan_ip=$(ifconfig br-lan 2>/dev/null | grep 'inet addr' | awk '{print $2}' | cut -d: -f2 || echo "N/A")
+    
+    local data="\"data\": {"
+    data="$data \"hostname\": \"$hostname\","
+    data="$data \"uptime\": \"$uptime\","
+    data="$data \"wan_ip\": \"$wan_ip\","
+    data="$data \"lan_ip\": \"$lan_ip\""
+    data="$data }"
+    
+    json_response "true" "Status retrieved successfully" "$data"
+}
+
+# Function to get WiFi settings
+get_wifi() {
+    local ssid=$(uci get wireless.@wifi-iface[0].ssid 2>/dev/null || echo "OpenWrt")
+    local key=$(uci get wireless.@wifi-iface[0].key 2>/dev/null || echo "")
+    
+    local data="\"data\": {"
+    data="$data \"ssid\": \"$ssid\","
+    data="$data \"key\": \"$key\""
+    data="$data }"
+    
+    json_response "true" "WiFi settings retrieved successfully" "$data"
+}
+
+# Function to set WiFi settings
+set_wifi() {
+    if [ -z "$POST_DATA" ]; then
+        json_response "false" "No data provided"
+        return
+    fi
+    
+    # Extract SSID and key from JSON (simple parsing)
+    local ssid=$(echo "$POST_DATA" | sed -n 's/.*"ssid":"\([^"]*\)".*/\1/p')
+    local key=$(echo "$POST_DATA" | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')
+    
+    if [ -z "$ssid" ]; then
+        json_response "false" "SSID is required"
+        return
+    fi
+    
+    # Set WiFi settings using UCI
+    uci set wireless.@wifi-iface[0].ssid="$ssid"
+    if [ -n "$key" ]; then
+        uci set wireless.@wifi-iface[0].key="$key"
+    fi
+    
+    # Commit changes
+    uci commit wireless
+    
+    # Restart WiFi (optional - uncomment if needed)
+    # wifi reload
+    
+    json_response "true" "WiFi settings updated successfully"
+}
+
+# Function to get license settings
+get_license() {
+    local centralized_key=$(uci get pisowifi.config.centralized_key 2>/dev/null || echo "")
+    
+    local data="\"data\": {"
+    data="$data \"centralized_key\": \"$centralized_key\""
+    data="$data }"
+    
+    json_response "true" "License settings retrieved successfully" "$data"
+}
+
+# Function to set license settings
+set_license() {
+    if [ -z "$POST_DATA" ]; then
+        json_response "false" "No data provided"
+        return
+    fi
+    
+    # Extract centralized key from JSON
+    local centralized_key=$(echo "$POST_DATA" | sed -n 's/.*"centralized_key":"\([^"]*\)".*/\1/p')
+    
+    # Create pisowifi config section if it doesn't exist
+    if ! uci show pisowifi 2>/dev/null | grep -q "pisowifi.config"; then
+        uci add pisowifi config
+        uci rename pisowifi.@config[-1]=config
+    fi
+    
+    # Set license key
+    uci set pisowifi.config.centralized_key="$centralized_key"
+    uci commit pisowifi
+    
+    json_response "true" "License settings updated successfully"
+}
+
+# Function to get sales data
+get_sales() {
+    # Mock sales data - replace with actual data from your system
+    local today_sales="150.00"
+    local total_sessions="25"
+    
+    # Try to read from actual sales log if available
+    if [ -f "/tmp/pisowifi_sales.log" ]; then
+        today_sales=$(tail -1 /tmp/pisowifi_sales.log | awk -F',' '{print $2}' 2>/dev/null || echo "150.00")
+        total_sessions=$(wc -l < /tmp/pisowifi_sales.log 2>/dev/null || echo "25")
+    fi
+    
+    local data="\"data\": {"
+    data="$data \"today_sales\": \"$today_sales\","
+    data="$data \"total_sessions\": \"$total_sessions\""
+    data="$data }"
+    
+    json_response "true" "Sales data retrieved successfully" "$data"
+}
+
+# Main action dispatcher
+case "$ACTION" in
+    "get_status")
+        get_status
+        ;;
+    "get_wifi")
+        get_wifi
+        ;;
+    "set_wifi")
+        set_wifi
+        ;;
+    "get_license")
+        get_license
+        ;;
+    "set_license")
+        set_license
+        ;;
+    "get_sales")
+        get_sales
+        ;;
+    *)
+        json_response "false" "Invalid action: $ACTION"
+        ;;
+esac

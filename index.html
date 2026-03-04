@@ -1,22 +1,245 @@
 <!DOCTYPE html>
-<html>
-	<head>
-		<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
-		<meta http-equiv="Pragma" content="no-cache" />
-		<meta http-equiv="Expires" content="0" />
-		<meta http-equiv="Expires" content="Thu, 01 Jan 1970 00:00:00 GMT" />
-		<meta http-equiv="refresh" content="0; URL=cgi-bin/luci/" />
-		<style>
-			body { background: white; font-family: arial, helvetica, sans-serif; }
-			a { color: black; }
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PisoWiFi Management</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8 max-w-4xl" x-data="pisoWifi()">
+        <h1 class="text-3xl font-bold text-center mb-8 text-gray-800">PisoWiFi Management System</h1>
+        
+        <!-- Tab Navigation -->
+        <div class="bg-white rounded-lg shadow-lg">
+            <div class="border-b border-gray-200">
+                <nav class="flex space-x-8 px-6" aria-label="Tabs">
+                    <button @click="activeTab = 'status'" 
+                            :class="activeTab === 'status' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm">
+                        Status
+                    </button>
+                    <button @click="activeTab = 'wifi'" 
+                            :class="activeTab === 'wifi' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm">
+                        WiFi
+                    </button>
+                    <button @click="activeTab = 'license'" 
+                            :class="activeTab === 'license' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm">
+                        License
+                    </button>
+                    <button @click="activeTab = 'sales'" 
+                            :class="activeTab === 'sales' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm">
+                        Sales
+                    </button>
+                </nav>
+            </div>
 
-			@media (prefers-color-scheme: dark) {
-				body { background: black; }
-				a { color: white; }
-			}
-		</style>
-	</head>
-	<body>
-		<a href="cgi-bin/luci/">LuCI - Lua Configuration Interface</a>
-	</body>
+            <!-- Tab Content -->
+            <div class="p-6">
+                <!-- Status Tab -->
+                <div x-show="activeTab === 'status'" class="space-y-6">
+                    <h2 class="text-2xl font-semibold text-gray-800">System Status</h2>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="bg-gray-50 p-4 rounded-lg">
+                            <h3 class="font-medium text-gray-700">Router Info</h3>
+                            <p class="text-sm text-gray-600" x-text="status.hostname ? 'Hostname: ' + status.hostname : 'Loading...'"></p>
+                            <p class="text-sm text-gray-600" x-text="status.uptime ? 'Uptime: ' + status.uptime : 'Loading...'"></p>
+                        </div>
+                        <div class="bg-gray-50 p-4 rounded-lg">
+                            <h3 class="font-medium text-gray-700">Network Status</h3>
+                            <p class="text-sm text-gray-600" x-text="status.wan_ip ? 'WAN IP: ' + status.wan_ip : 'Loading...'"></p>
+                            <p class="text-sm text-gray-600" x-text="status.lan_ip ? 'LAN IP: ' + status.lan_ip : 'Loading...'"></p>
+                        </div>
+                    </div>
+                    <button @click="loadStatus()" class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">
+                        Refresh Status
+                    </button>
+                </div>
+
+                <!-- WiFi Tab -->
+                <div x-show="activeTab === 'wifi'" class="space-y-6">
+                    <h2 class="text-2xl font-semibold text-gray-800">WiFi Settings</h2>
+                    <form @submit.prevent="saveWifi()" class="space-y-4">
+                        <div>
+                            <label for="ssid" class="block text-sm font-medium text-gray-700">SSID (Network Name)</label>
+                            <input type="text" id="ssid" x-model="wifi.ssid" 
+                                   class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <div>
+                            <label for="key" class="block text-sm font-medium text-gray-700">WiFi Key (Password)</label>
+                            <input type="password" id="key" x-model="wifi.key" 
+                                   class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <div class="flex space-x-4">
+                            <button type="submit" class="bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded">
+                                Save WiFi Settings
+                            </button>
+                            <button type="button" @click="loadWifi()" class="bg-gray-500 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded">
+                                Refresh
+                            </button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- License Tab -->
+                <div x-show="activeTab === 'license'" class="space-y-6">
+                    <h2 class="text-2xl font-semibold text-gray-800">License Management</h2>
+                    <form @submit.prevent="saveLicense()" class="space-y-4">
+                        <div>
+                            <label for="centralized_key" class="block text-sm font-medium text-gray-700">Centralized Key</label>
+                            <input type="password" id="centralized_key" x-model="license.centralized_key" 
+                                   class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <div class="flex space-x-4">
+                            <button type="submit" class="bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded">
+                                Save License Key
+                            </button>
+                            <button type="button" @click="loadLicense()" class="bg-gray-500 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded">
+                                Refresh
+                            </button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Sales Tab -->
+                <div x-show="activeTab === 'sales'" class="space-y-6">
+                    <h2 class="text-2xl font-semibold text-gray-800">Sales Management</h2>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="bg-gray-50 p-4 rounded-lg">
+                            <h3 class="font-medium text-gray-700">Today's Sales</h3>
+                            <p class="text-2xl font-bold text-green-600" x-text="sales.today_sales ? '₱' + sales.today_sales : 'Loading...'"></p>
+                        </div>
+                        <div class="bg-gray-50 p-4 rounded-lg">
+                            <h3 class="font-medium text-gray-700">Total Sessions</h3>
+                            <p class="text-2xl font-bold text-blue-600" x-text="sales.total_sessions ? sales.total_sessions : 'Loading...'"></p>
+                        </div>
+                    </div>
+                    <button @click="loadSales()" class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">
+                        Refresh Sales Data
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Alert Messages -->
+        <div x-show="message.text" 
+             :class="message.type === 'success' ? 'bg-green-100 border-green-400 text-green-700' : 'bg-red-100 border-red-400 text-red-700'"
+             class="fixed top-4 right-4 border px-4 py-3 rounded">
+            <span x-text="message.text"></span>
+            <button @click="message.text = ''" class="ml-2 font-bold">×</button>
+        </div>
+    </div>
+
+    <script>
+        function pisoWifi() {
+            return {
+                activeTab: 'status',
+                status: {},
+                wifi: {
+                    ssid: '',
+                    key: ''
+                },
+                license: {
+                    centralized_key: ''
+                },
+                sales: {
+                    today_sales: 0,
+                    total_sessions: 0
+                },
+                message: {
+                    text: '',
+                    type: ''
+                },
+
+                init() {
+                    this.loadStatus();
+                    this.loadWifi();
+                    this.loadLicense();
+                    this.loadSales();
+                },
+
+                async apiCall(action, data = null) {
+                    try {
+                        const options = {
+                            method: data ? 'POST' : 'GET',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            }
+                        };
+                        if (data) {
+                            options.body = JSON.stringify(data);
+                        }
+                        
+                        const response = await fetch(`/cgi-bin/api?action=${action}`, options);
+                        const result = await response.json();
+                        
+                        if (result.success) {
+                            this.showMessage(result.message || 'Operation successful', 'success');
+                            return result.data;
+                        } else {
+                            this.showMessage(result.message || 'Operation failed', 'error');
+                            return null;
+                        }
+                    } catch (error) {
+                        this.showMessage('API call failed: ' + error.message, 'error');
+                        return null;
+                    }
+                },
+
+                async loadStatus() {
+                    const data = await this.apiCall('get_status');
+                    if (data) {
+                        this.status = data;
+                    }
+                },
+
+                async loadWifi() {
+                    const data = await this.apiCall('get_wifi');
+                    if (data) {
+                        this.wifi = data;
+                    }
+                },
+
+                async saveWifi() {
+                    const result = await this.apiCall('set_wifi', this.wifi);
+                    if (result) {
+                        this.loadWifi();
+                    }
+                },
+
+                async loadLicense() {
+                    const data = await this.apiCall('get_license');
+                    if (data) {
+                        this.license = data;
+                    }
+                },
+
+                async saveLicense() {
+                    const result = await this.apiCall('set_license', this.license);
+                    if (result) {
+                        this.loadLicense();
+                    }
+                },
+
+                async loadSales() {
+                    const data = await this.apiCall('get_sales');
+                    if (data) {
+                        this.sales = data;
+                    }
+                },
+
+                showMessage(text, type) {
+                    this.message = { text, type };
+                    setTimeout(() => {
+                        this.message.text = '';
+                    }, 3000);
+                }
+            }
+        }
+    </script>
+</body>
 </html>
