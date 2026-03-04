@@ -6,6 +6,7 @@
     <title>PisoWiFi Management</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+    <link rel="icon" type="image/png" href="/luci-static/bootstrap/logo_48.png">
 </head>
 <body class="bg-gray-100">
     <div class="flex h-screen" x-data="pisoWifi()">
@@ -550,6 +551,17 @@
                     setTimeout(() => {
                         this.message.text = '';
                     }, 3000);
+                },
+
+                async toggleWifi(band) {
+                    const group = band === '2g' ? this.wifi.wifi2g : this.wifi.wifi5g;
+                    if (group.module_enabled !== '1') {
+                        const label = band === '2g' ? '2.4GHz' : '5GHz';
+                        this.showMessage(`${label} WiFi module not detected`, 'error');
+                        return;
+                    }
+                    group.enabled = group.enabled === '1' ? '0' : '1';
+                    await this.saveWifi();
                 },
 
                 async changeAdminPassword() {
