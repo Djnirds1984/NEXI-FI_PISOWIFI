@@ -22,7 +22,11 @@ done
 
 # Read POST data if available
 if [ "$REQUEST_METHOD" = "POST" ]; then
-    read -r POST_DATA
+    if [ -n "$CONTENT_LENGTH" ]; then
+        POST_DATA="$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)"
+    else
+        POST_DATA="$(cat)"
+    fi
 fi
 
 # Get Content-Type header for multipart form data
@@ -200,13 +204,8 @@ set_wifi() {
         fi
     fi
     
-    # Commit changes
     uci commit wireless
-    
-    # Restart WiFi service
-    wifi reload 2>/dev/null || true
-    /etc/init.d/network restart 2>/dev/null || true
-    
+    ( sleep 1; wifi reload 2>/dev/null; /etc/init.d/network restart 2>/dev/null ) >/dev/null 2>&1 &
     json_response "true" "WiFi settings updated successfully"
 }
 
