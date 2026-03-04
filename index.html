@@ -332,18 +332,18 @@
                                                    class="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100">
                                         </div>
                                         
-                                        <div x-show="selectedFile" class="bg-blue-50 p-4 rounded-lg border border-blue-200">
+                                        <div x-show="firmware.selectedFile" class="bg-blue-50 p-4 rounded-lg border border-blue-200">
                                             <h4 class="font-medium text-gray-800 mb-2">📋 File Information</h4>
-                                            <p class="text-sm text-gray-600"><strong>File Name:</strong> <span x-text="selectedFile ? selectedFile.name : ''"></span></p>
-                                            <p class="text-sm text-gray-600"><strong>File Size:</strong> <span x-text="selectedFile ? formatFileSize(selectedFile.size) : ''"></span></p>
-                                            <p class="text-sm text-gray-600"><strong>File Type:</strong> <span x-text="selectedFile ? selectedFile.type : ''"></span></p>
+                                            <p class="text-sm text-gray-600"><strong>File Name:</strong> <span x-text="firmware.selectedFile ? firmware.selectedFile.name : ''"></span></p>
+                                            <p class="text-sm text-gray-600"><strong>File Size:</strong> <span x-text="firmware.selectedFile ? formatFileSize(firmware.selectedFile.size) : ''"></span></p>
+                                            <p class="text-sm text-gray-600"><strong>File Type:</strong> <span x-text="firmware.selectedFile ? firmware.selectedFile.type : ''"></span></p>
                                         </div>
                                         
                                         <div class="flex space-x-4 pt-4">
-                                            <button type="submit" :disabled="!selectedFile || isUploading" 
+                                            <button type="submit" :disabled="!firmware.selectedFile || firmware.isUploading" 
                                                     class="bg-red-500 hover:bg-red-600 disabled:bg-gray-400 disabled:cursor-not-allowed text-white font-bold py-2 px-6 rounded-lg transition-colors">
-                                                <span x-show="isUploading">⏳ Flashing...</span>
-                                                <span x-show="!isUploading">🔥 Flash Firmware</span>
+                                                <span x-show="firmware.isUploading">⏳ Flashing...</span>
+                                                <span x-show="!firmware.isUploading">🔥 Flash Firmware</span>
                                             </button>
                                             <button type="button" @click="clearFileSelection()" 
                                                     class="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-6 rounded-lg transition-colors">

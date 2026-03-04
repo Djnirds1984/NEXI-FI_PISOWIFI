@@ -78,17 +78,21 @@ get_wifi() {
     local wifi5g_channel=$(uci get wireless.radio1.channel 2>/dev/null || echo "auto")
     local wifi5g_txpower=$(uci get wireless.radio1.txpower 2>/dev/null || echo "20")
     
-    # Check if WiFi modules are enabled
-    local wifi2g_module_enabled="1"
-    local wifi5g_module_enabled="1"
-    
-    # Check if radios exist
-    if ! uci show wireless | grep -q "radio0"; then
-        wifi2g_module_enabled="0"
+    # Check if WiFi modules are enabled (robust detection)
+    local wifi2g_module_enabled="0"
+    local wifi5g_module_enabled="0"
+    if uci show wireless 2>/dev/null | grep -q "radio0"; then
+        wifi2g_module_enabled="1"
     fi
-    
-    if ! uci show wireless | grep -q "radio1"; then
-        wifi5g_module_enabled="0"
+    if uci show wireless 2>/dev/null | grep -q "radio1"; then
+        wifi5g_module_enabled="1"
+    fi
+    # Fallback to sysfs if UCI sections are missing
+    if [ "$wifi2g_module_enabled" = "0" ] && [ -d "/sys/class/ieee80211/phy0" ]; then
+        wifi2g_module_enabled="1"
+    fi
+    if [ "$wifi5g_module_enabled" = "0" ] && [ -d "/sys/class/ieee80211/phy1" ]; then
+        wifi5g_module_enabled="1"
     fi
     
     local data="\"data\": {"
