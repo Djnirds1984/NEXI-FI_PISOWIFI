@@ -60,46 +60,148 @@ get_status() {
     json_response "true" "Status retrieved successfully" "$data"
 }
 
-# Function to get WiFi settings
+# Function to get comprehensive WiFi settings (LuCI-style)
 get_wifi() {
-    local ssid=$(uci get wireless.@wifi-iface[0].ssid 2>/dev/null || echo "OpenWrt")
-    local key=$(uci get wireless.@wifi-iface[0].key 2>/dev/null || echo "")
+    # Get 2.4GHz WiFi settings
+    local wifi2g_disabled=$(uci get wireless.radio0.disabled 2>/dev/null || echo "0")
+    local wifi2g_ssid=$(uci get wireless.@wifi-iface[0].ssid 2>/dev/null || echo "OpenWrt")
+    local wifi2g_key=$(uci get wireless.@wifi-iface[0].key 2>/dev/null || echo "")
+    local wifi2g_encryption=$(uci get wireless.@wifi-iface[0].encryption 2>/dev/null || echo "none")
+    local wifi2g_channel=$(uci get wireless.radio0.channel 2>/dev/null || echo "auto")
+    local wifi2g_txpower=$(uci get wireless.radio0.txpower 2>/dev/null || echo "20")
+    
+    # Get 5GHz WiFi settings
+    local wifi5g_disabled=$(uci get wireless.radio1.disabled 2>/dev/null || echo "1")
+    local wifi5g_ssid=$(uci get wireless.@wifi-iface[1].ssid 2>/dev/null || echo "OpenWrt_5G")
+    local wifi5g_key=$(uci get wireless.@wifi-iface[1].key 2>/dev/null || echo "")
+    local wifi5g_encryption=$(uci get wireless.@wifi-iface[1].encryption 2>/dev/null || echo "none")
+    local wifi5g_channel=$(uci get wireless.radio1.channel 2>/dev/null || echo "auto")
+    local wifi5g_txpower=$(uci get wireless.radio1.txpower 2>/dev/null || echo "20")
+    
+    # Check if WiFi modules are enabled
+    local wifi2g_module_enabled="1"
+    local wifi5g_module_enabled="1"
+    
+    # Check if radios exist
+    if ! uci show wireless | grep -q "radio0"; then
+        wifi2g_module_enabled="0"
+    fi
+    
+    if ! uci show wireless | grep -q "radio1"; then
+        wifi5g_module_enabled="0"
+    fi
     
     local data="\"data\": {"
-    data="$data \"ssid\": \"$ssid\","
-    data="$data \"key\": \"$key\""
+    data="$data \"wifi2g_enabled\": \"$([ \"$wifi2g_disabled\" = \"0\" ] && echo \"1\" || echo \"0\")\","
+    data="$data \"wifi2g_ssid\": \"$wifi2g_ssid\","
+    data="$data \"wifi2g_key\": \"$wifi2g_key\","
+    data="$data \"wifi2g_encryption\": \"$wifi2g_encryption\","
+    data="$data \"wifi2g_channel\": \"$wifi2g_channel\","
+    data="$data \"wifi2g_txpower\": \"$wifi2g_txpower\","
+    data="$data \"wifi2g_module_enabled\": \"$wifi2g_module_enabled\","
+    data="$data \"wifi5g_enabled\": \"$([ \"$wifi5g_disabled\" = \"0\" ] && echo \"1\" || echo \"0\")\","
+    data="$data \"wifi5g_ssid\": \"$wifi5g_ssid\","
+    data="$data \"wifi5g_key\": \"$wifi5g_key\","
+    data="$data \"wifi5g_encryption\": \"$wifi5g_encryption\","
+    data="$data \"wifi5g_channel\": \"$wifi5g_channel\","
+    data="$data \"wifi5g_txpower\": \"$wifi5g_txpower\","
+    data="$data \"wifi5g_module_enabled\": \"$wifi5g_module_enabled\""
     data="$data }"
     
     json_response "true" "WiFi settings retrieved successfully" "$data"
 }
 
-# Function to set WiFi settings
+# Function to set comprehensive WiFi settings (LuCI-style)
 set_wifi() {
     if [ -z "$POST_DATA" ]; then
         json_response "false" "No data provided"
         return
     fi
     
-    # Extract SSID and key from JSON (simple parsing)
-    local ssid=$(echo "$POST_DATA" | sed -n 's/.*"ssid":"\([^"]*\)".*/\1/p')
-    local key=$(echo "$POST_DATA" | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')
+    # Extract 2.4GHz settings
+    local wifi2g_enabled=$(echo "$POST_DATA" | sed -n 's/.*"wifi2g_enabled":"\([^"]*\)".*/\1/p')
+    local wifi2g_ssid=$(echo "$POST_DATA" | sed -n 's/.*"wifi2g_ssid":"\([^"]*\)".*/\1/p')
+    local wifi2g_key=$(echo "$POST_DATA" | sed -n 's/.*"wifi2g_key":"\([^"]*\)".*/\1/p')
+    local wifi2g_encryption=$(echo "$POST_DATA" | sed -n 's/.*"wifi2g_encryption":"\([^"]*\)".*/\1/p')
+    local wifi2g_channel=$(echo "$POST_DATA" | sed -n 's/.*"wifi2g_channel":"\([^"]*\)".*/\1/p')
+    local wifi2g_txpower=$(echo "$POST_DATA" | sed -n 's/.*"wifi2g_txpower":"\([^"]*\)".*/\1/p')
     
-    if [ -z "$ssid" ]; then
-        json_response "false" "SSID is required"
-        return
+    # Extract 5GHz settings
+    local wifi5g_enabled=$(echo "$POST_DATA" | sed -n 's/.*"wifi5g_enabled":"\([^"]*\)".*/\1/p')
+    local wifi5g_ssid=$(echo "$POST_DATA" | sed -n 's/.*"wifi5g_ssid":"\([^"]*\)".*/\1/p')
+    local wifi5g_key=$(echo "$POST_DATA" | sed -n 's/.*"wifi5g_key":"\([^"]*\)".*/\1/p')
+    local wifi5g_encryption=$(echo "$POST_DATA" | sed -n 's/.*"wifi5g_encryption":"\([^"]*\)".*/\1/p')
+    local wifi5g_channel=$(echo "$POST_DATA" | sed -n 's/.*"wifi5g_channel":"\([^"]*\)".*/\1/p')
+    local wifi5g_txpower=$(echo "$POST_DATA" | sed -n 's/.*"wifi5g_txpower":"\([^"]*\)".*/\1/p')
+    
+    # Update 2.4GHz settings if radio0 exists
+    if uci show wireless | grep -q "radio0"; then
+        if [ -n "$wifi2g_enabled" ]; then
+            if [ "$wifi2g_enabled" = "1" ]; then
+                uci set wireless.radio0.disabled="0"
+            else
+                uci set wireless.radio0.disabled="1"
+            fi
+        fi
+        
+        if [ -n "$wifi2g_ssid" ]; then
+            uci set wireless.@wifi-iface[0].ssid="$wifi2g_ssid"
+        fi
+        
+        if [ -n "$wifi2g_key" ]; then
+            uci set wireless.@wifi-iface[0].key="$wifi2g_key"
+        fi
+        
+        if [ -n "$wifi2g_encryption" ]; then
+            uci set wireless.@wifi-iface[0].encryption="$wifi2g_encryption"
+        fi
+        
+        if [ -n "$wifi2g_channel" ]; then
+            uci set wireless.radio0.channel="$wifi2g_channel"
+        fi
+        
+        if [ -n "$wifi2g_txpower" ]; then
+            uci set wireless.radio0.txpower="$wifi2g_txpower"
+        fi
     fi
     
-    # Set WiFi settings using UCI
-    uci set wireless.@wifi-iface[0].ssid="$ssid"
-    if [ -n "$key" ]; then
-        uci set wireless.@wifi-iface[0].key="$key"
+    # Update 5GHz settings if radio1 exists
+    if uci show wireless | grep -q "radio1"; then
+        if [ -n "$wifi5g_enabled" ]; then
+            if [ "$wifi5g_enabled" = "1" ]; then
+                uci set wireless.radio1.disabled="0"
+            else
+                uci set wireless.radio1.disabled="1"
+            fi
+        fi
+        
+        if [ -n "$wifi5g_ssid" ]; then
+            uci set wireless.@wifi-iface[1].ssid="$wifi5g_ssid"
+        fi
+        
+        if [ -n "$wifi5g_key" ]; then
+            uci set wireless.@wifi-iface[1].key="$wifi5g_key"
+        fi
+        
+        if [ -n "$wifi5g_encryption" ]; then
+            uci set wireless.@wifi-iface[1].encryption="$wifi5g_encryption"
+        fi
+        
+        if [ -n "$wifi5g_channel" ]; then
+            uci set wireless.radio1.channel="$wifi5g_channel"
+        fi
+        
+        if [ -n "$wifi5g_txpower" ]; then
+            uci set wireless.radio1.txpower="$wifi5g_txpower"
+        fi
     fi
     
     # Commit changes
     uci commit wireless
     
-    # Restart WiFi (optional - uncomment if needed)
-    # wifi reload
+    # Restart WiFi service
+    wifi reload 2>/dev/null || true
+    /etc/init.d/network restart 2>/dev/null || true
     
     json_response "true" "WiFi settings updated successfully"
 }
