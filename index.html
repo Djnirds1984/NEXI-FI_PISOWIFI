@@ -77,25 +77,25 @@
                             <h3 class="font-semibold text-gray-800 flex items-center">
                                 📡 2.4GHz WiFi 
                                 <span class="ml-2 px-2 py-1 text-xs rounded-full" 
-                                      :class="wifi.wifi2g_enabled === '1' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'"
-                                      x-text="wifi.wifi2g_enabled === '1' ? 'Enabled' : 'Disabled'"></span>
+                                      :class="wifi.wifi2g.enabled === '1' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'"
+                                      x-text="wifi.wifi2g.enabled === '1' ? 'Enabled' : 'Disabled'"></span>
                             </h3>
                             <button @click="toggleWifi('2g')" 
                                     class="px-3 py-1 text-sm rounded-md transition-colors"
-                                    :class="wifi.wifi2g_enabled === '1' ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-green-500 hover:bg-green-600 text-white'"
-                                    x-text="wifi.wifi2g_enabled === '1' ? 'Disable' : 'Enable'"></button>
+                                    :class="wifi.wifi2g.enabled === '1' ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-green-500 hover:bg-green-600 text-white'"
+                                    x-text="wifi.wifi2g.enabled === '1' ? 'Disable' : 'Enable'"></button>
                         </div>
                         
-                        <div x-show="wifi.wifi2g_module_enabled === '1'" class="space-y-4">
+                        <div x-show="wifi.wifi2g.module_enabled === '1'" class="space-y-4">
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <div>
                                     <label for="wifi2g_ssid" class="block text-sm font-medium text-gray-700 mb-2">📝 SSID (Network Name)</label>
-                                    <input type="text" id="wifi2g_ssid" x-model="wifi.wifi2g_ssid" 
+                                    <input type="text" id="wifi2g_ssid" x-model="wifi.wifi2g.ssid" 
                                            class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2">
                                 </div>
                                 <div>
                                     <label for="wifi2g_key" class="block text-sm font-medium text-gray-700 mb-2">🔑 WiFi Key (Password)</label>
-                                    <input type="password" id="wifi2g_key" x-model="wifi.wifi2g_key" 
+                                    <input type="password" id="wifi2g_key" x-model="wifi.wifi2g.key" 
                                            class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2">
                                 </div>
                             </div>
@@ -103,7 +103,7 @@
                             <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                                 <div>
                                     <label for="wifi2g_encryption" class="block text-sm font-medium text-gray-700 mb-2">🔐 Encryption</label>
-                                    <select id="wifi2g_encryption" x-model="wifi.wifi2g_encryption" 
+                                    <select id="wifi2g_encryption" x-model="wifi.wifi2g.encryption" 
                                             class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2">
                                         <option value="none">None</option>
                                         <option value="psk">WPA-PSK</option>
@@ -113,7 +113,7 @@
                                 </div>
                                 <div>
                                     <label for="wifi2g_channel" class="block text-sm font-medium text-gray-700 mb-2">📡 Channel</label>
-                                    <select id="wifi2g_channel" x-model="wifi.wifi2g_channel" 
+                                    <select id="wifi2g_channel" x-model="wifi.wifi2g.channel" 
                                             class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2">
                                         <option value="auto">Auto</option>
                                         <option value="1">1</option>
@@ -123,13 +123,13 @@
                                 </div>
                                 <div>
                                     <label for="wifi2g_txpower" class="block text-sm font-medium text-gray-700 mb-2">📶 TX Power (dBm)</label>
-                                    <input type="number" id="wifi2g_txpower" x-model="wifi.wifi2g_txpower" min="0" max="30" 
+                                    <input type="number" id="wifi2g_txpower" x-model="wifi.wifi2g.txpower" min="0" max="30" 
                                            class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2">
                                 </div>
                             </div>
                         </div>
                         
-                        <div x-show="wifi.wifi2g_module_enabled === '0'" class="text-center py-4">
+                        <div x-show="wifi.wifi2g.module_enabled === '0'" class="text-center py-4">
                             <div class="text-gray-500">2.4GHz WiFi module not detected</div>
                         </div>
                     </div>
@@ -140,25 +140,25 @@
                             <h3 class="font-semibold text-gray-800 flex items-center">
                                 🚀 5GHz WiFi 
                                 <span class="ml-2 px-2 py-1 text-xs rounded-full" 
-                                      :class="wifi.wifi5g_enabled === '1' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'"
-                                      x-text="wifi.wifi5g_enabled === '1' ? 'Enabled' : 'Disabled'"></span>
+                                      :class="wifi.wifi5g.enabled === '1' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'"
+                                      x-text="wifi.wifi5g.enabled === '1' ? 'Enabled' : 'Disabled'"></span>
                             </h3>
                             <button @click="toggleWifi('5g')" 
                                     class="px-3 py-1 text-sm rounded-md transition-colors"
-                                    :class="wifi.wifi5g_enabled === '1' ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-green-500 hover:bg-green-600 text-white'"
-                                    x-text="wifi.wifi5g_enabled === '1' ? 'Disable' : 'Enable'"></button>
+                                    :class="wifi.wifi5g.enabled === '1' ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-green-500 hover:bg-green-600 text-white'"
+                                    x-text="wifi.wifi5g.enabled === '1' ? 'Disable' : 'Enable'"></button>
                         </div>
                         
-                        <div x-show="wifi.wifi5g_module_enabled === '1'" class="space-y-4">
+                        <div x-show="wifi.wifi5g.module_enabled === '1'" class="space-y-4">
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <div>
                                     <label for="wifi5g_ssid" class="block text-sm font-medium text-gray-700 mb-2">📝 SSID (Network Name)</label>
-                                    <input type="text" id="wifi5g_ssid" x-model="wifi.wifi5g_ssid" 
+                                    <input type="text" id="wifi5g_ssid" x-model="wifi.wifi5g.ssid" 
                                            class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2">
                                 </div>
                                 <div>
                                     <label for="wifi5g_key" class="block text-sm font-medium text-gray-700 mb-2">🔑 WiFi Key (Password)</label>
-                                    <input type="password" id="wifi5g_key" x-model="wifi.wifi5g_key" 
+                                    <input type="password" id="wifi5g_key" x-model="wifi.wifi5g.key" 
                                            class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2">
                                 </div>
                             </div>
@@ -166,7 +166,7 @@
                             <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                                 <div>
                                     <label for="wifi5g_encryption" class="block text-sm font-medium text-gray-700 mb-2">🔐 Encryption</label>
-                                    <select id="wifi5g_encryption" x-model="wifi.wifi5g_encryption" 
+                                    <select id="wifi5g_encryption" x-model="wifi.wifi5g.encryption" 
                                             class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2">
                                         <option value="none">None</option>
                                         <option value="psk">WPA-PSK</option>
@@ -176,7 +176,7 @@
                                 </div>
                                 <div>
                                     <label for="wifi5g_channel" class="block text-sm font-medium text-gray-700 mb-2">📡 Channel</label>
-                                    <select id="wifi5g_channel" x-model="wifi.wifi5g_channel" 
+                                    <select id="wifi5g_channel" x-model="wifi.wifi5g.channel" 
                                             class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2">
                                         <option value="auto">Auto</option>
                                         <option value="36">36</option>
@@ -192,13 +192,13 @@
                                 </div>
                                 <div>
                                     <label for="wifi5g_txpower" class="block text-sm font-medium text-gray-700 mb-2">📶 TX Power (dBm)</label>
-                                    <input type="number" id="wifi5g_txpower" x-model="wifi.wifi5g_txpower" min="0" max="30" 
+                                    <input type="number" id="wifi5g_txpower" x-model="wifi.wifi5g.txpower" min="0" max="30" 
                                            class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 px-3 py-2">
                                 </div>
                             </div>
                         </div>
                         
-                        <div x-show="wifi.wifi5g_module_enabled === '0'" class="text-center py-4">
+                        <div x-show="wifi.wifi5g.module_enabled === '0'" class="text-center py-4">
                             <div class="text-gray-500">5GHz WiFi module not detected</div>
                         </div>
                     </div>
@@ -385,20 +385,24 @@
                 settingsTab: 'admin_password',
                 status: {},
                 wifi: {
-                    wifi2g_enabled: '1',
-                    wifi2g_ssid: '',
-                    wifi2g_key: '',
-                    wifi2g_encryption: 'none',
-                    wifi2g_channel: 'auto',
-                    wifi2g_txpower: '20',
-                    wifi2g_module_enabled: '1',
-                    wifi5g_enabled: '0',
-                    wifi5g_ssid: '',
-                    wifi5g_key: '',
-                    wifi5g_encryption: 'none',
-                    wifi5g_channel: 'auto',
-                    wifi5g_txpower: '20',
-                    wifi5g_module_enabled: '1'
+                    wifi2g: {
+                        enabled: '1',
+                        ssid: '',
+                        key: '',
+                        encryption: 'none',
+                        channel: 'auto',
+                        txpower: '20',
+                        module_enabled: '1'
+                    },
+                    wifi5g: {
+                        enabled: '0',
+                        ssid: '',
+                        key: '',
+                        encryption: 'none',
+                        channel: 'auto',
+                        txpower: '20',
+                        module_enabled: '1'
+                    }
                 },
                 license: {
                     centralized_key: ''
@@ -467,12 +471,43 @@
                 async loadWifi() {
                     const data = await this.apiCall('get_wifi');
                     if (data) {
-                        this.wifi = data;
+                        this.wifi.wifi2g = {
+                            enabled: data.wifi2g_enabled,
+                            ssid: data.wifi2g_ssid,
+                            key: data.wifi2g_key,
+                            encryption: data.wifi2g_encryption,
+                            channel: data.wifi2g_channel,
+                            txpower: data.wifi2g_txpower,
+                            module_enabled: data.wifi2g_module_enabled
+                        };
+                        this.wifi.wifi5g = {
+                            enabled: data.wifi5g_enabled,
+                            ssid: data.wifi5g_ssid,
+                            key: data.wifi5g_key,
+                            encryption: data.wifi5g_encryption,
+                            channel: data.wifi5g_channel,
+                            txpower: data.wifi5g_txpower,
+                            module_enabled: data.wifi5g_module_enabled
+                        };
                     }
                 },
 
                 async saveWifi() {
-                    const result = await this.apiCall('set_wifi', this.wifi);
+                    const payload = {
+                        wifi2g_enabled: this.wifi.wifi2g.enabled,
+                        wifi2g_ssid: this.wifi.wifi2g.ssid,
+                        wifi2g_key: this.wifi.wifi2g.key,
+                        wifi2g_encryption: this.wifi.wifi2g.encryption,
+                        wifi2g_channel: this.wifi.wifi2g.channel,
+                        wifi2g_txpower: this.wifi.wifi2g.txpower,
+                        wifi5g_enabled: this.wifi.wifi5g.enabled,
+                        wifi5g_ssid: this.wifi.wifi5g.ssid,
+                        wifi5g_key: this.wifi.wifi5g.key,
+                        wifi5g_encryption: this.wifi.wifi5g.encryption,
+                        wifi5g_channel: this.wifi.wifi5g.channel,
+                        wifi5g_txpower: this.wifi.wifi5g.txpower
+                    };
+                    const result = await this.apiCall('set_wifi', payload);
                     if (result) {
                         this.loadWifi();
                     }
