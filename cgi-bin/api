@@ -32,6 +32,11 @@ fi
 # Get Content-Type header for multipart form data
 CONTENT_TYPE="$CONTENT_TYPE"
 
+# Escape strings for safe JSON output
+json_escape() {
+    echo "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\r/\\r/g' -e 's/\n/\\n/g'
+}
+
 # Function to output JSON response
 json_response() {
     local success="$1"
@@ -53,12 +58,16 @@ get_status() {
     local uptime=$(uptime | awk '{print $1,$2,$3}')
     local wan_ip=$(ifconfig wan 2>/dev/null | grep 'inet addr' | awk '{print $2}' | cut -d: -f2 || echo "N/A")
     local lan_ip=$(ifconfig br-lan 2>/dev/null | grep 'inet addr' | awk '{print $2}' | cut -d: -f2 || echo "N/A")
+    local hostname_esc=$(json_escape "$hostname")
+    local uptime_esc=$(json_escape "$uptime")
+    local wan_ip_esc=$(json_escape "$wan_ip")
+    local lan_ip_esc=$(json_escape "$lan_ip")
     
     local data="\"data\": {"
-    data="$data \"hostname\": \"$hostname\","
-    data="$data \"uptime\": \"$uptime\","
-    data="$data \"wan_ip\": \"$wan_ip\","
-    data="$data \"lan_ip\": \"$lan_ip\""
+    data="$data \"hostname\": \"$hostname_esc\","
+    data="$data \"uptime\": \"$uptime_esc\","
+    data="$data \"wan_ip\": \"$wan_ip_esc\","
+    data="$data \"lan_ip\": \"$lan_ip_esc\""
     data="$data }"
     
     json_response "true" "Status retrieved successfully" "$data"
@@ -73,6 +82,11 @@ get_wifi() {
     local wifi2g_encryption=$(uci get wireless.@wifi-iface[0].encryption 2>/dev/null || echo "none")
     local wifi2g_channel=$(uci get wireless.radio0.channel 2>/dev/null || echo "auto")
     local wifi2g_txpower=$(uci get wireless.radio0.txpower 2>/dev/null || echo "20")
+    local wifi2g_ssid_esc=$(json_escape "$wifi2g_ssid")
+    local wifi2g_key_esc=$(json_escape "$wifi2g_key")
+    local wifi2g_encryption_esc=$(json_escape "$wifi2g_encryption")
+    local wifi2g_channel_esc=$(json_escape "$wifi2g_channel")
+    local wifi2g_txpower_esc=$(json_escape "$wifi2g_txpower")
     
     # Get 5GHz WiFi settings
     local wifi5g_disabled=$(uci get wireless.radio1.disabled 2>/dev/null || echo "1")
@@ -81,6 +95,11 @@ get_wifi() {
     local wifi5g_encryption=$(uci get wireless.@wifi-iface[1].encryption 2>/dev/null || echo "none")
     local wifi5g_channel=$(uci get wireless.radio1.channel 2>/dev/null || echo "auto")
     local wifi5g_txpower=$(uci get wireless.radio1.txpower 2>/dev/null || echo "20")
+    local wifi5g_ssid_esc=$(json_escape "$wifi5g_ssid")
+    local wifi5g_key_esc=$(json_escape "$wifi5g_key")
+    local wifi5g_encryption_esc=$(json_escape "$wifi5g_encryption")
+    local wifi5g_channel_esc=$(json_escape "$wifi5g_channel")
+    local wifi5g_txpower_esc=$(json_escape "$wifi5g_txpower")
     
     # Check if WiFi modules are enabled (robust detection)
     local wifi2g_module_enabled="0"
@@ -101,18 +120,18 @@ get_wifi() {
     
     local data="\"data\": {"
     data="$data \"wifi2g_enabled\": \"$([ \"$wifi2g_disabled\" = \"0\" ] && echo \"1\" || echo \"0\")\","
-    data="$data \"wifi2g_ssid\": \"$wifi2g_ssid\","
-    data="$data \"wifi2g_key\": \"$wifi2g_key\","
-    data="$data \"wifi2g_encryption\": \"$wifi2g_encryption\","
-    data="$data \"wifi2g_channel\": \"$wifi2g_channel\","
-    data="$data \"wifi2g_txpower\": \"$wifi2g_txpower\","
+    data="$data \"wifi2g_ssid\": \"$wifi2g_ssid_esc\","
+    data="$data \"wifi2g_key\": \"$wifi2g_key_esc\","
+    data="$data \"wifi2g_encryption\": \"$wifi2g_encryption_esc\","
+    data="$data \"wifi2g_channel\": \"$wifi2g_channel_esc\","
+    data="$data \"wifi2g_txpower\": \"$wifi2g_txpower_esc\","
     data="$data \"wifi2g_module_enabled\": \"$wifi2g_module_enabled\","
     data="$data \"wifi5g_enabled\": \"$([ \"$wifi5g_disabled\" = \"0\" ] && echo \"1\" || echo \"0\")\","
-    data="$data \"wifi5g_ssid\": \"$wifi5g_ssid\","
-    data="$data \"wifi5g_key\": \"$wifi5g_key\","
-    data="$data \"wifi5g_encryption\": \"$wifi5g_encryption\","
-    data="$data \"wifi5g_channel\": \"$wifi5g_channel\","
-    data="$data \"wifi5g_txpower\": \"$wifi5g_txpower\","
+    data="$data \"wifi5g_ssid\": \"$wifi5g_ssid_esc\","
+    data="$data \"wifi5g_key\": \"$wifi5g_key_esc\","
+    data="$data \"wifi5g_encryption\": \"$wifi5g_encryption_esc\","
+    data="$data \"wifi5g_channel\": \"$wifi5g_channel_esc\","
+    data="$data \"wifi5g_txpower\": \"$wifi5g_txpower_esc\","
     data="$data \"wifi5g_module_enabled\": \"$wifi5g_module_enabled\""
     data="$data }"
     
@@ -212,9 +231,10 @@ set_wifi() {
 # Function to get license settings
 get_license() {
     local centralized_key=$(uci get pisowifi.config.centralized_key 2>/dev/null || echo "")
+    local centralized_key_esc=$(json_escape "$centralized_key")
     
     local data="\"data\": {"
-    data="$data \"centralized_key\": \"$centralized_key\""
+    data="$data \"centralized_key\": \"$centralized_key_esc\""
     data="$data }"
     
     json_response "true" "License settings retrieved successfully" "$data"
