@@ -25,6 +25,9 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     read -r POST_DATA
 fi
 
+# Get Content-Type header for multipart form data
+CONTENT_TYPE="$CONTENT_TYPE"
+
 # Function to output JSON response
 json_response() {
     local success="$1"
@@ -193,6 +196,84 @@ change_admin_password() {
     json_response "true" "Admin password changed successfully"
 }
 
+# Function to handle firmware flash
+flash_firmware() {
+    # Check if multipart form data contains firmware file
+    if [ -z "$POST_DATA" ]; then
+        json_response "false" "No firmware file uploaded"
+        return
+    fi
+    
+    # Extract boundary from Content-Type header
+    local boundary=$(echo "$CONTENT_TYPE" | sed -n 's/.*boundary=\([^;]*\).*/\1/p')
+    
+    if [ -z "$boundary" ]; then
+        json_response "false" "Invalid multipart form data"
+        return
+    fi
+    
+    # Create temporary directory for firmware processing
+    local temp_dir="/tmp/pisowifi_firmware"
+    mkdir -p "$temp_dir"
+    
+    # Extract firmware file from multipart data
+    # This is a simplified implementation - in production, use proper multipart parsing
+    local firmware_file="$temp_dir/firmware.bin"
+    
+    # Look for firmware data in the POST body
+    echo "$POST_DATA" | sed -n '/Content-Disposition: form-data; name="firmware"/,/------/p' | head -n -1 | tail -n +2 > "$firmware_file"
+    
+    # Validate firmware file
+    if [ ! -f "$firmware_file" ] || [ ! -s "$firmware_file" ]; then
+        rm -rf "$temp_dir"
+        json_response "false" "Failed to extract firmware file"
+        return
+    fi
+    
+    # Check minimum file size (should be at least 1MB for OpenWrt firmware)
+    local file_size=$(stat -c%s "$firmware_file" 2>/dev/null || echo "0")
+    if [ "$file_size" -lt 1048576 ]; then
+        rm -rf "$temp_dir"
+        json_response "false" "Firmware file too small (minimum 1MB required)"
+        return
+    fi
+    
+    # Validate firmware magic bytes (basic check for common firmware formats)
+    local magic=$(hexdump -C "$firmware_file" | head -1 | awk '{print $2$3$4$5}')
+    local is_valid_firmware=false
+    
+    # Check for common firmware signatures
+    case "$magic" in
+        "27051956"|"1f8b0800"|"4c5a4950"|"75737461")  # Common firmware signatures
+            is_valid_firmware=true
+            ;;
+    esac
+    
+    if [ "$is_valid_firmware" != "true" ]; then
+        rm -rf "$temp_dir"
+        json_response "false" "Invalid firmware file format"
+        return
+    fi
+    
+    # Create a marker file to indicate firmware flash in progress
+    echo "flash_in_progress" > /tmp/pisowifi_flash_in_progress
+    
+    # Save firmware to standard location
+    cp "$firmware_file" /tmp/openwrt-firmware.bin
+    
+    # Clean up temporary directory
+    rm -rf "$temp_dir"
+    
+    # Schedule the actual flash operation with sysupgrade
+    # Use nohup to ensure it continues even if the web connection drops
+    (
+        sleep 5
+        /sbin/sysupgrade -F /tmp/openwrt-firmware.bin
+    ) > /dev/null 2>&1 &
+    
+    json_response "true" "Firmware flash initiated. Router will reboot in 30 seconds. Please wait 5 minutes before accessing again."
+}
+
 # Main action dispatcher
 case "$ACTION" in
     "get_status")
@@ -215,6 +296,9 @@ case "$ACTION" in
         ;;
     "change_admin_password")
         change_admin_password
+        ;;
+    "flash_firmware")
+        flash_firmware
         ;;
     *)
         json_response "false" "Invalid action: $ACTION"

@@ -155,6 +155,11 @@
                                         class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm">
                                     Change Admin Password
                                 </button>
+                                <button @click="settingsTab = 'flash_firmware'" 
+                                        :class="settingsTab === 'flash_firmware' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                                        class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm">
+                                    Flash Firmware
+                                </button>
                             </nav>
                         </div>
                         <div class="p-6">
@@ -187,6 +192,57 @@
                                             </button>
                                         </div>
                                     </form>
+                                </div>
+                            </div>
+
+                            <!-- Flash Firmware Sub-page -->
+                            <div x-show="settingsTab === 'flash_firmware'" class="space-y-6">
+                                <div class="bg-yellow-50 p-6 rounded-lg border border-yellow-200">
+                                    <div class="flex items-center mb-4">
+                                        <div class="text-3xl text-yellow-600 mr-3">⚠️</div>
+                                        <div>
+                                            <h3 class="font-semibold text-gray-800">🔥 Flash Firmware</h3>
+                                            <p class="text-sm text-gray-600">Warning: Flashing firmware can potentially brick your device. Ensure you have the correct firmware file.</p>
+                                        </div>
+                                    </div>
+                                    
+                                    <form @submit.prevent="uploadFirmware()" class="space-y-4">
+                                        <div>
+                                            <label for="firmware_file" class="block text-sm font-medium text-gray-700 mb-2">📁 Select OpenWrt Firmware File</label>
+                                            <input type="file" id="firmware_file" @change="handleFileSelect($event)" accept=".bin,.trx,.img" 
+                                                   class="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100">
+                                        </div>
+                                        
+                                        <div x-show="selectedFile" class="bg-blue-50 p-4 rounded-lg border border-blue-200">
+                                            <h4 class="font-medium text-gray-800 mb-2">📋 File Information</h4>
+                                            <p class="text-sm text-gray-600"><strong>File Name:</strong> <span x-text="selectedFile ? selectedFile.name : ''"></span></p>
+                                            <p class="text-sm text-gray-600"><strong>File Size:</strong> <span x-text="selectedFile ? formatFileSize(selectedFile.size) : ''"></span></p>
+                                            <p class="text-sm text-gray-600"><strong>File Type:</strong> <span x-text="selectedFile ? selectedFile.type : ''"></span></p>
+                                        </div>
+                                        
+                                        <div class="flex space-x-4 pt-4">
+                                            <button type="submit" :disabled="!selectedFile || isUploading" 
+                                                    class="bg-red-500 hover:bg-red-600 disabled:bg-gray-400 disabled:cursor-not-allowed text-white font-bold py-2 px-6 rounded-lg transition-colors">
+                                                <span x-show="isUploading">⏳ Flashing...</span>
+                                                <span x-show="!isUploading">🔥 Flash Firmware</span>
+                                            </button>
+                                            <button type="button" @click="clearFileSelection()" 
+                                                    class="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-6 rounded-lg transition-colors">
+                                                🔄 Clear
+                                            </button>
+                                        </div>
+                                    </form>
+                                </div>
+                                
+                                <div class="bg-blue-50 p-4 rounded-lg border border-blue-200">
+                                    <h4 class="font-medium text-gray-800 mb-2">💡 Instructions</h4>
+                                    <ul class="text-sm text-gray-600 list-disc list-inside space-y-1">
+                                        <li>Download the correct OpenWrt firmware for your router model</li>
+                                        <li>Ensure the firmware file is compatible with your device</li>
+                                        <li>Do not interrupt the flashing process</li>
+                                        <li>The router will reboot automatically after flashing</li>
+                                        <li>Wait at least 5 minutes before accessing the router again</li>
+                                    </ul>
                                 </div>
                             </div>
                         </div>
@@ -225,6 +281,11 @@
                     current: '',
                     new: '',
                     confirm: ''
+                },
+                firmware: {
+                    selectedFile: null,
+                    isUploading: false,
+                    uploadProgress: 0
                 },
                 message: {
                     text: '',
@@ -356,6 +417,94 @@
                     this.adminPassword.current = '';
                     this.adminPassword.new = '';
                     this.adminPassword.confirm = '';
+                },
+
+                handleFileSelect(event) {
+                    const file = event.target.files[0];
+                    if (file) {
+                        // Validate file type
+                        const validExtensions = ['.bin', '.trx', '.img'];
+                        const fileExtension = '.' + file.name.split('.').pop().toLowerCase();
+                        
+                        if (!validExtensions.includes(fileExtension)) {
+                            this.showMessage('Invalid file type. Please select a .bin, .trx, or .img file', 'error');
+                            event.target.value = '';
+                            this.firmware.selectedFile = null;
+                            return;
+                        }
+                        
+                        // Validate file size (max 50MB)
+                        const maxSize = 50 * 1024 * 1024; // 50MB
+                        if (file.size > maxSize) {
+                            this.showMessage('File too large. Maximum size is 50MB', 'error');
+                            event.target.value = '';
+                            this.firmware.selectedFile = null;
+                            return;
+                        }
+                        
+                        this.firmware.selectedFile = file;
+                    }
+                },
+
+                clearFileSelection() {
+                    this.firmware.selectedFile = null;
+                    this.firmware.uploadProgress = 0;
+                    document.getElementById('firmware_file').value = '';
+                },
+
+                formatFileSize(bytes) {
+                    if (bytes === 0) return '0 Bytes';
+                    const k = 1024;
+                    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+                    const i = Math.floor(Math.log(bytes) / Math.log(k));
+                    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+                },
+
+                async uploadFirmware() {
+                    if (!this.firmware.selectedFile) {
+                        this.showMessage('Please select a firmware file', 'error');
+                        return;
+                    }
+
+                    // Confirm the flash operation
+                    const confirmed = confirm('⚠️ WARNING: This will flash new firmware to your router. The router will reboot and may be inaccessible for several minutes. Are you sure you want to continue?');
+                    
+                    if (!confirmed) {
+                        return;
+                    }
+
+                    this.firmware.isUploading = true;
+                    this.firmware.uploadProgress = 0;
+
+                    try {
+                        const formData = new FormData();
+                        formData.append('firmware', this.firmware.selectedFile);
+                        formData.append('filename', this.firmware.selectedFile.name);
+
+                        const response = await fetch('/cgi-bin/api?action=flash_firmware', {
+                            method: 'POST',
+                            body: formData
+                        });
+
+                        const result = await response.json();
+                        
+                        if (result.success) {
+                            this.showMessage('Firmware flash initiated. Router will reboot in 30 seconds. Please wait 5 minutes before accessing again.', 'success');
+                            this.clearFileSelection();
+                            
+                            // Disable the interface after successful flash
+                            setTimeout(() => {
+                                this.firmware.isUploading = true; // Keep disabled
+                                this.showMessage('Router is rebooting with new firmware. Please wait...', 'success');
+                            }, 30000);
+                        } else {
+                            this.showMessage(result.message || 'Firmware flash failed', 'error');
+                            this.firmware.isUploading = false;
+                        }
+                    } catch (error) {
+                        this.showMessage('Firmware upload failed: ' + error.message, 'error');
+                        this.firmware.isUploading = false;
+                    }
                 }
             }
         }
