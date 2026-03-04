@@ -155,6 +155,44 @@ get_sales() {
     json_response "true" "Sales data retrieved successfully" "$data"
 }
 
+# Function to change admin password
+change_admin_password() {
+    if [ -z "$POST_DATA" ]; then
+        json_response "false" "No data provided"
+        return
+    fi
+    
+    # Extract passwords from JSON
+    local current_password=$(echo "$POST_DATA" | sed -n 's/.*"current_password":"\([^"]*\)".*/\1/p')
+    local new_password=$(echo "$POST_DATA" | sed -n 's/.*"new_password":"\([^"]*\)".*/\1/p')
+    
+    if [ -z "$current_password" ] || [ -z "$new_password" ]; then
+        json_response "false" "Both current and new passwords are required"
+        return
+    fi
+    
+    # Check if current password is correct (this is a basic implementation)
+    # In a real implementation, you would check against a stored password hash
+    local stored_password=$(uci get pisowifi.admin.password 2>/dev/null || echo "admin")
+    
+    if [ "$current_password" != "$stored_password" ]; then
+        json_response "false" "Current password is incorrect"
+        return
+    fi
+    
+    # Create admin config section if it doesn't exist
+    if ! uci show pisowifi 2>/dev/null | grep -q "pisowifi.admin"; then
+        uci add pisowifi admin
+        uci rename pisowifi.@admin[-1]=admin
+    fi
+    
+    # Update password
+    uci set pisowifi.admin.password="$new_password"
+    uci commit pisowifi
+    
+    json_response "true" "Admin password changed successfully"
+}
+
 # Main action dispatcher
 case "$ACTION" in
     "get_status")
@@ -174,6 +212,9 @@ case "$ACTION" in
         ;;
     "get_sales")
         get_sales
+        ;;
+    "change_admin_password")
+        change_admin_password
         ;;
     *)
         json_response "false" "Invalid action: $ACTION"
