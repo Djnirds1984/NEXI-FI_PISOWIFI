@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PisoWiFi - Dashboard</title>
+    <link rel="stylesheet" href="static/css/main.css">
+    <link rel="stylesheet" href="static/css/sidebar.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <nav class="sidebar">
+            <div class="sidebar-header">
+                <h2>🌐 PisoWiFi</h2>
+            </div>
+            <ul class="sidebar-menu">
+                <li><a href="#dashboard" class="active">📊 Dashboard</a></li>
+                <li><a href="#hotspot">🔥 Hotspot</a></li>
+                <li><a href="#vouchers">🎫 Vouchers</a></li>
+                <li><a href="#users">👥 Users</a></li>
+                <li><a href="#settings">⚙️ Settings</a></li>
+                <li><a href="#logs">📋 Logs</a></li>
+            </ul>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <header class="header">
+                <h1>PisoWiFi Dashboard</h1>
+                <div class="header-actions">
+                    <span id="system-time"></span>
+                    <button class="btn-logout">Logout</button>
+                </div>
+            </header>
+
+            <div class="dashboard-grid">
+                <!-- System Status -->
+                <div class="card">
+                    <h3>System Status</h3>
+                    <div class="status-item">
+                        <span>Hotspot Status:</span>
+                        <span id="hotspot-status" class="status-active">Active</span>
+                    </div>
+                    <div class="status-item">
+                        <span>Active Users:</span>
+                        <span id="active-users">0</span>
+                    </div>
+                    <div class="status-item">
+                        <span>Uptime:</span>
+                        <span id="system-uptime">0h 0m</span>
+                    </div>
+                </div>
+
+                <!-- Network Info -->
+                <div class="card">
+                    <h3>Network Information</h3>
+                    <div class="network-info">
+                        <p><strong>Hotspot IP:</strong> <span id="hotspot-ip">10.0.0.1</span></p>
+                        <p><strong>Gateway:</strong> <span id="gateway-ip">192.168.1.1</span></p>
+                        <p><strong>DNS:</strong> <span id="dns-server">8.8.8.8</span></p>
+                        <p><strong>Interface:</strong> <span id="wifi-interface">wlan0</span></p>
+                    </div>
+                </div>
+
+                <!-- Voucher Stats -->
+                <div class="card">
+                    <h3>Voucher Statistics</h3>
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <span class="stat-number" id="total-vouchers">0</span>
+                            <span class="stat-label">Total</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-number" id="active-vouchers">0</span>
+                            <span class="stat-label">Active</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-number" id="used-vouchers">0</span>
+                            <span class="stat-label">Used</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Quick Actions -->
+                <div class="card">
+                    <h3>Quick Actions</h3>
+                    <div class="action-buttons">
+                        <button class="btn btn-primary" onclick="window.location.href='#vouchers'">Create Voucher</button>
+                        <button class="btn btn-secondary" onclick="restartHotspot()">Restart Hotspot</button>
+                        <button class="btn btn-info" onclick="viewActiveUsers()">View Users</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Connected Users Table -->
+            <div class="card">
+                <h3>Connected Users</h3>
+                <div class="table-container">
+                    <table id="users-table">
+                        <thead>
+                            <tr>
+                                <th>IP Address</th>
+                                <th>MAC Address</th>
+                                <th>Time Connected</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="users-tbody">
+                            <!-- Users will be populated here -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="static/js/dashboard.js"></script>
+</body>
+</html>
