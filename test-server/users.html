@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PisoWiFi - User Management</title>
+    <link rel="stylesheet" href="static/css/main.css">
+    <link rel="stylesheet" href="static/css/sidebar.css">
+    <link rel="stylesheet" href="static/css/users.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <nav class="sidebar">
+            <div class="sidebar-header">
+                <h2>🌐 PisoWiFi</h2>
+            </div>
+            <ul class="sidebar-menu">
+                <li><a href="index.html">📊 Dashboard</a></li>
+                <li><a href="hotspot.html">🔥 Hotspot</a></li>
+                <li><a href="vouchers.html">🎫 Vouchers</a></li>
+                <li><a href="users.html" class="active">👥 Users</a></li>
+                <li><a href="settings.html">⚙️ Settings</a></li>
+                <li><a href="logs.html">📋 Logs</a></li>
+            </ul>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <header class="header">
+                <h1>User Management</h1>
+                <div class="header-actions">
+                    <button class="btn btn-primary" onclick="showAddUserModal()">➕ Add User</button>
+                    <button class="btn btn-secondary" onclick="exportUsers()">📊 Export Users</button>
+                    <button class="btn btn-danger" onclick="clearInactiveUsers()">🗑️ Clear Inactive</button>
+                </div>
+            </header>
+
+            <!-- User Statistics -->
+            <div class="stats-container">
+                <div class="stat-card">
+                    <div class="stat-icon">👥</div>
+                    <div class="stat-content">
+                        <div class="stat-number" id="total-users">0</div>
+                        <div class="stat-label">Total Users</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🟢</div>
+                    <div class="stat-content">
+                        <div class="stat-number" id="online-users">0</div>
+                        <div class="stat-label">Online Now</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📱</div>
+                    <div class="stat-content">
+                        <div class="stat-number" id="active-devices">0</div>
+                        <div class="stat-label">Active Devices</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⏰</div>
+                    <div class="stat-content">
+                        <div class="stat-number" id="avg-session">0m</div>
+                        <div class="stat-label">Avg Session</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- User Filters -->
+            <div class="filters-container">
+                <div class="filter-group">
+                    <label for="status-filter">Status:</label>
+                    <select id="status-filter" onchange="filterUsers()">
+                        <option value="">All Users</option>
+                        <option value="online">Online</option>
+                        <option value="offline">Offline</option>
+                        <option value="active">Active</option>
+                        <option value="expired">Expired</option>
+                        <option value="blocked">Blocked</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="device-filter">Device Type:</label>
+                    <select id="device-filter" onchange="filterUsers()">
+                        <option value="">All Devices</option>
+                        <option value="mobile">Mobile</option>
+                        <option value="laptop">Laptop</option>
+                        <option value="tablet">Tablet</option>
+                        <option value="other">Other</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="search-users">Search:</label>
+                    <input type="text" id="search-users" placeholder="Search users..." onkeyup="searchUsers()">
+                </div>
+            </div>
+
+            <!-- Users Table -->
+            <div class="card">
+                <h3>Connected Users</h3>
+                <div class="table-container">
+                    <table id="users-table">
+                        <thead>
+                            <tr>
+                                <th>IP Address</th>
+                                <th>MAC Address</th>
+                                <th>Device Name</th>
+                                <th>Device Type</th>
+                                <th>Status</th>
+                                <th>Connected Since</th>
+                                <th>Session Time</th>
+                                <th>Data Used</th>
+                                <th>Voucher Code</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="users-tbody">
+                            <!-- Users will be populated here -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- User Sessions -->
+            <div class="card">
+                <h3>Recent Sessions</h3>
+                <div class="table-container">
+                    <table id="sessions-table">
+                        <thead>
+                            <tr>
+                                <th>User IP</th>
+                                <th>Start Time</th>
+                                <th>End Time</th>
+                                <th>Duration</th>
+                                <th>Data Used</th>
+                                <th>Voucher</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sessions-tbody">
+                            <!-- Sessions will be populated here -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Bandwidth Usage Chart -->
+            <div class="card">
+                <h3>Real-time Bandwidth Usage</h3>
+                <div class="bandwidth-chart" id="bandwidth-chart">
+                    <canvas id="bandwidth-canvas" width="800" height="200"></canvas>
+                </div>
+                <div class="bandwidth-stats">
+                    <div class="stat-item">
+                        <span class="stat-label">Total Download:</span>
+                        <span class="stat-value" id="total-download">0 MB</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Total Upload:</span>
+                        <span class="stat-value" id="total-upload">0 MB</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Peak Download:</span>
+                        <span class="stat-value" id="peak-download">0 Mbps</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Peak Upload:</span>
+                        <span class="stat-value" id="peak-upload">0 Mbps</span>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Add/Edit User Modal -->
+    <div id="user-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="user-modal-title">Add User</h3>
+                <span class="close" onclick="closeUserModal()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <form id="user-form">
+                    <input type="hidden" id="user-id">
+                    
+                    <div class="form-group">
+                        <label for="user-ip">IP Address:</label>
+                        <input type="text" id="user-ip" pattern="\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="user-mac">MAC Address:</label>
+                        <input type="text" id="user-mac" pattern="^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="device-name">Device Name:</label>
+                        <input type="text" id="device-name" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="device-type">Device Type:</label>
+                        <select id="device-type" required>
+                            <option value="mobile">Mobile</option>
+                            <option value="laptop">Laptop</option>
+                            <option value="tablet">Tablet</option>
+                            <option value="other">Other</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="user-voucher">Voucher Code:</label>
+                        <input type="text" id="user-voucher" placeholder="Enter voucher code">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="user-status">Status:</label>
+                        <select id="user-status" required>
+                            <option value="online">Online</option>
+                            <option value="offline">Offline</option>
+                            <option value="blocked">Blocked</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="max-data">Max Data (MB):</label>
+                        <input type="number" id="max-data" min="0" value="0" placeholder="0 = unlimited">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="session-limit">Session Limit (minutes):</label>
+                        <input type="number" id="session-limit" min="0" value="0" placeholder="0 = unlimited">
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeUserModal()">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="saveUser()">Save User</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="static/js/users.js"></script>
+</body>
+</html>

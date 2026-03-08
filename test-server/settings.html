@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PisoWiFi - System Settings</title>
+    <link rel="stylesheet" href="static/css/main.css">
+    <link rel="stylesheet" href="static/css/sidebar.css">
+    <link rel="stylesheet" href="static/css/settings.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <nav class="sidebar">
+            <div class="sidebar-header">
+                <h2>🌐 PisoWiFi</h2>
+            </div>
+            <ul class="sidebar-menu">
+                <li><a href="index.html">📊 Dashboard</a></li>
+                <li><a href="hotspot.html">🔥 Hotspot</a></li>
+                <li><a href="vouchers.html">🎫 Vouchers</a></li>
+                <li><a href="users.html">👥 Users</a></li>
+                <li><a href="settings.html" class="active">⚙️ Settings</a></li>
+                <li><a href="logs.html">📋 Logs</a></li>
+            </ul>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <header class="header">
+                <h1>System Settings</h1>
+            </header>
+
+            <!-- Settings Tabs -->
+            <div class="settings-tabs">
+                <button class="tab-button active" onclick="showTab('general')">General</button>
+                <button class="tab-button" onclick="showTab('network')">Network</button>
+                <button class="tab-button" onclick="showTab('security')">Security</button>
+                <button class="tab-button" onclick="showTab('backup')">Backup & Restore</button>
+            </div>
+
+            <!-- General Settings -->
+            <div id="general-tab" class="tab-content active">
+                <div class="card">
+                    <h3>System Configuration</h3>
+                    <form id="general-settings-form">
+                        <div class="form-group">
+                            <label for="system-name">System Name:</label>
+                            <input type="text" id="system-name" value="PisoWiFi System">
+                        </div>
+                        <div class="form-group">
+                            <label for="admin-email">Admin Email:</label>
+                            <input type="email" id="admin-email" placeholder="admin@example.com">
+                        </div>
+                        <div class="form-group">
+                            <label for="timezone">Timezone:</label>
+                            <select id="timezone">
+                                <option value="Asia/Manila">Asia/Manila (UTC+8)</option>
+                                <option value="UTC">UTC</option>
+                                <option value="America/New_York">America/New_York (UTC-5/-4)</option>
+                                <option value="Europe/London">Europe/London (UTC+0/+1)</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="language">Language:</label>
+                            <select id="language">
+                                <option value="en">English</option>
+                                <option value="fil">Filipino</option>
+                                <option value="es">Spanish</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="auto-update"> Enable Auto Update
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="maintenance-mode"> Maintenance Mode
+                            </label>
+                        </div>
+                        <button type="button" class="btn btn-primary" onclick="saveGeneralSettings()">Save Settings</button>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <h3>System Information</h3>
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <span class="info-label">Version:</span>
+                            <span class="info-value" id="system-version">v1.0.0</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Uptime:</span>
+                            <span class="info-value" id="system-uptime">Loading...</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">CPU Usage:</span>
+                            <span class="info-value" id="cpu-usage">Loading...</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Memory Usage:</span>
+                            <span class="info-value" id="memory-usage">Loading...</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Network Settings -->
+            <div id="network-tab" class="tab-content">
+                <div class="card">
+                    <h3>Network Configuration</h3>
+                    <form id="network-settings-form">
+                        <div class="form-group">
+                            <label for="wan-interface">WAN Interface:</label>
+                            <select id="wan-interface">
+                                <option value="eth0">eth0</option>
+                                <option value="eth1">eth1</option>
+                                <option value="pppoe">PPPoE</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="lan-ip">LAN IP Address:</label>
+                            <input type="text" id="lan-ip" value="192.168.1.1" pattern="\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}">
+                        </div>
+                        <div class="form-group">
+                            <label for="lan-subnet">LAN Subnet Mask:</label>
+                            <input type="text" id="lan-subnet" value="255.255.255.0">
+                        </div>
+                        <div class="form-group">
+                            <label for="dhcp-start">DHCP Start:</label>
+                            <input type="text" id="dhcp-start" value="192.168.1.100">
+                        </div>
+                        <div class="form-group">
+                            <label for="dhcp-end">DHCP End:</label>
+                            <input type="text" id="dhcp-end" value="192.168.1.200">
+                        </div>
+                        <div class="form-group">
+                            <label for="dns-server">DNS Server:</label>
+                            <input type="text" id="dns-server" value="8.8.8.8, 8.8.4.4">
+                        </div>
+                        <button type="button" class="btn btn-primary" onclick="saveNetworkSettings()">Save Network Settings</button>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <h3>WiFi Settings</h3>
+                    <form id="wifi-settings-form">
+                        <div class="form-group">
+                            <label for="wifi-ssid">WiFi SSID:</label>
+                            <input type="text" id="wifi-ssid" value="PisoWiFi">
+                        </div>
+                        <div class="form-group">
+                            <label for="wifi-password">WiFi Password:</label>
+                            <input type="password" id="wifi-password" placeholder="Enter password">
+                        </div>
+                        <div class="form-group">
+                            <label for="wifi-channel">Channel:</label>
+                            <select id="wifi-channel">
+                                <option value="auto">Auto</option>
+                                <option value="1">1</option>
+                                <option value="6">6</option>
+                                <option value="11">11</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="wifi-mode">Mode:</label>
+                            <select id="wifi-mode">
+                                <option value="bgn">802.11 b/g/n</option>
+                                <option value="bg">802.11 b/g</option>
+                                <option value="n">802.11 n</option>
+                            </select>
+                        </div>
+                        <button type="button" class="btn btn-primary" onclick="saveWiFiSettings()">Save WiFi Settings</button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Security Settings -->
+            <div id="security-tab" class="tab-content">
+                <div class="card">
+                    <h3>Admin Access</h3>
+                    <form id="security-settings-form">
+                        <div class="form-group">
+                            <label for="admin-username">Admin Username:</label>
+                            <input type="text" id="admin-username" value="admin">
+                        </div>
+                        <div class="form-group">
+                            <label for="admin-password">New Password:</label>
+                            <input type="password" id="admin-password" placeholder="Enter new password">
+                        </div>
+                        <div class="form-group">
+                            <label for="confirm-password">Confirm Password:</label>
+                            <input type="password" id="confirm-password" placeholder="Confirm new password">
+                        </div>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="enable-ssh"> Enable SSH Access
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label for="ssh-port">SSH Port:</label>
+                            <input type="number" id="ssh-port" value="22" min="1" max="65535">
+                        </div>
+                        <button type="button" class="btn btn-primary" onclick="saveSecuritySettings()">Save Security Settings</button>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <h3>Firewall Settings</h3>
+                    <form id="firewall-settings-form">
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="enable-firewall" checked> Enable Firewall
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="block-ping"> Block Ping (ICMP)
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="block-ssh-wan"> Block SSH from WAN
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label for="max-connections">Max Connections per IP:</label>
+                            <input type="number" id="max-connections" value="100" min="1" max="1000">
+                        </div>
+                        <button type="button" class="btn btn-primary" onclick="saveFirewallSettings()">Save Firewall Settings</button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Backup & Restore -->
+            <div id="backup-tab" class="tab-content">
+                <div class="card">
+                    <h3>Backup & Restore</h3>
+                    <div class="backup-section">
+                        <h4>Backup Configuration</h4>
+                        <p>Create a backup of your current system configuration.</p>
+                        <button type="button" class="btn btn-primary" onclick="createBackup()">📥 Create Backup</button>
+                    </div>
+                    
+                    <div class="backup-section">
+                        <h4>Restore Configuration</h4>
+                        <p>Restore system configuration from a backup file.</p>
+                        <div class="form-group">
+                            <label for="backup-file">Select Backup File:</label>
+                            <input type="file" id="backup-file" accept=".json,.cfg">
+                        </div>
+                        <button type="button" class="btn btn-warning" onclick="restoreBackup()">📤 Restore Backup</button>
+                    </div>
+
+                    <div class="backup-section">
+                        <h4>Factory Reset</h4>
+                        <p>Reset all settings to factory defaults. This will erase all custom configurations.</p>
+                        <button type="button" class="btn btn-danger" onclick="factoryReset()">⚠️ Factory Reset</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>System Maintenance</h3>
+                    <div class="maintenance-section">
+                        <button type="button" class="btn btn-secondary" onclick="restartServices()">🔄 Restart Services</button>
+                        <button type="button" class="btn btn-secondary" onclick="rebootSystem()">🔄 Reboot System</button>
+                        <button type="button" class="btn btn-secondary" onclick="clearLogs()">🗑️ Clear Logs</button>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="static/js/settings.js"></script>
+</body>
+</html>
