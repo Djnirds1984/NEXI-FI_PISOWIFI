@@ -56,11 +56,12 @@ class HotspotManager {
             const response = await fetch(`${this.apiUrl}?action=get_hotspot_settings`);
             const data = await response.json();
             
-            if (data.success) {
-                this.populateForms(data.settings || this.getDefaultSettings());
+            if (data.success && data.settings && typeof data.settings === 'object') {
+                this.populateForms(data.settings);
                 await this.loadWiFiInterfaces();
             } else {
-                this.showNotification('Failed to load hotspot settings: ' + data.error, 'error');
+                const errorMsg = data.success === false ? data.error : 'Invalid settings data received';
+                this.showNotification('Failed to load hotspot settings: ' + errorMsg, 'error');
                 this.populateForms(this.getDefaultSettings());
             }
         } catch (error) {
@@ -245,41 +246,55 @@ class HotspotManager {
     }
 
     populateForms(settings) {
+        // Ensure settings is valid and has required properties
+        if (!settings || typeof settings !== 'object') {
+            console.warn('Invalid settings provided to populateForms');
+            return;
+        }
+
         // Basic settings
-        Object.keys(settings.basic).forEach(key => {
-            const element = document.getElementById(key.replace('_', '-'));
-            if (element) {
-                element.value = settings.basic[key];
-            }
-        });
+        if (settings.basic && typeof settings.basic === 'object') {
+            Object.keys(settings.basic).forEach(key => {
+                const element = document.getElementById(key.replace('_', '-'));
+                if (element) {
+                    element.value = settings.basic[key];
+                }
+            });
+        }
 
         // Advanced settings
-        Object.keys(settings.advanced).forEach(key => {
-            const element = document.getElementById(key.replace('_', '-'));
-            if (element) {
-                if (element.type === 'checkbox') {
-                    element.checked = settings.advanced[key];
-                } else {
-                    element.value = settings.advanced[key];
+        if (settings.advanced && typeof settings.advanced === 'object') {
+            Object.keys(settings.advanced).forEach(key => {
+                const element = document.getElementById(key.replace('_', '-'));
+                if (element) {
+                    if (element.type === 'checkbox') {
+                        element.checked = settings.advanced[key];
+                    } else {
+                        element.value = settings.advanced[key];
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Interface settings
-        Object.keys(settings.interface).forEach(key => {
-            const element = document.getElementById(key.replace('_', '-'));
-            if (element) {
-                element.value = settings.interface[key];
-            }
-        });
+        if (settings.interface && typeof settings.interface === 'object') {
+            Object.keys(settings.interface).forEach(key => {
+                const element = document.getElementById(key.replace('_', '-'));
+                if (element) {
+                    element.value = settings.interface[key];
+                }
+            });
+        }
 
         // Portal settings
-        Object.keys(settings.portal).forEach(key => {
-            const element = document.getElementById(key.replace('_', '-'));
-            if (element) {
-                element.value = settings.portal[key];
-            }
-        });
+        if (settings.portal && typeof settings.portal === 'object') {
+            Object.keys(settings.portal).forEach(key => {
+                const element = document.getElementById(key.replace('_', '-'));
+                if (element) {
+                    element.value = settings.portal[key];
+                }
+            });
+        }
     }
 
     async saveBasicSettings() {

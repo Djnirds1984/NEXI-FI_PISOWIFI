@@ -1,114 +1,59 @@
-#!/usr/bin/ucode
-# PisoWiFi API - Fixed Ucode version for your OpenWrt setup
+#!/bin/sh
+echo "Content-Type: application/json"
+echo ""
 
-import { cursor } from "uci";
-import { system } from "posix";
-import { printf } from "stdio";
-import { getenv } from "stdlib";
-
-# JSON output function
-function json_response(data) {
-    printf("Content-Type: application/json\n\n%s", json(data));
+get_param() {
+    echo "$QUERY_STRING" | sed -n "s/.*$1=\([^&]*\).*/\1/p"
 }
 
-# Get system status
-function get_system_status() {
-    let status = {
-        service: "unknown",
-        interface: "unknown", 
-        users: 0,
-        signal: "N/A"
-    };
-    
-    # Check dnsmasq service
-    let dnsmasq_check = system("/etc/init.d/dnsmasq status >/dev/null 2>&1");
-    status.service = dnsmasq_check == 0 ? "running" : "stopped";
-    
-    # Check network interfaces
-    let interfaces = ["wlan0", "wlan1"];
-    for (let i = 0; i < length(interfaces); i++) {
-        let iface = interfaces[i];
-        let state_path = "/sys/class/net/" + iface + "/operstate";
+ACTION=$(get_param "action")
+
+case "$ACTION" in
+    "get_hotspot_status")
+        # Check dnsmasq
+        SERV="stopped"
+        pgrep dnsmasq >/dev/null && SERV="running"
         
-        let state_file = open(state_path, "r");
-        if (state_file) {
-            let state = trim(state_file.read("*a"));
-            state_file.close();
-            
-            if (state == "up") {
-                status.interface = "up";
-                break;
-            }
-        }
-    }
-    
-    if (status.interface == "unknown") {
-        status.interface = "down";
-    }
-    
-    return status;
-}
+        # Detect if ANY wireless interface is UP
+        INT="down"
+        # Checks br-lan (common for bridges) or any wlan interface
+        for iface in br-lan wlan0 wlan1 eth0; do
+            if [ -f "/sys/class/net/$iface/operstate" ]; then
+                [ "$(cat /sys/class/net/$iface/operstate)" = "up" ] && INT="up" && break
+            fi
+        done
 
-# Get hotspot settings
-function get_hotspot_settings() {
-    let settings = {
-        enabled: "1",
-        ssid: "PisoWiFi_Free",
-        ip: "10.0.0.1"
-    };
-    
-    # Try to get real SSID from UCI
-    let uci_cursor = cursor();
-    if (uci_cursor) {
-        let uci_ssid = uci_cursor.get("wireless", "@wifi-iface[0]", "ssid");
-        if (uci_ssid) {
-            settings.ssid = uci_ssid;
-        }
-    }
-    
-    return settings;
-}
+        # Get actual connected user count from DHCP leases
+        USERS=$(grep -c "^" /var/lib/misc/dnsmasq.leases 2>/dev/null || echo 0)
 
-# Main execution
-try {
-    let query_string = getenv("QUERY_STRING") || "";
-    
-    # Parse action from query string
-    let action = "";
-    if (query_string) {
-        let pairs = split(query_string, "&");
-        for (let i = 0; i < length(pairs); i++) {
-            let pair = pairs[i];
-            let parts = split(pair, "=");
-            if (length(parts) == 2 && parts[0] == "action") {
-                action = parts[1];
-                break;
-            }
-        }
-    }
-    
-    let response = {
-        success: false,
-        error: "Unknown action"
-    };
-    
-    if (action == "get_hotspot_status") {
-        response = {
-            success: true,
-            status: get_system_status()
-        };
-    }
-    else if (action == "get_hotspot_settings") {
-        response = {
-            success: true,
-            settings: get_hotspot_settings()
-        };
-    }
-    
-    json_response(response);
-} catch (e) {
-    json_response({
-        success: false,
-        error: "Script error: " + e
-    });
+        cat <<EOT
+{
+  "success": true,
+  "status": {
+    "service": "$SERV",
+    "interface": "$INT",
+    "users": $USERS,
+    "signal": "N/A"
+  }
 }
+EOT
+        ;;
+
+    "get_hotspot_settings")
+        SSID=$(uci get wireless.@wifi-iface[0].ssid 2>/dev/null || echo "PisoWiFi_Free")
+        cat <<EOT
+{
+  "success": true,
+  "settings": {
+    "enabled": "1",
+    "ssid": "$SSID",
+    "ip": "10.0.0.1"
+  }
+}
+EOT
+        ;;
+
+    *)
+        echo "{\"success\": false, \"error\": \"Invalid action\"}"
+        ;;
+esac
