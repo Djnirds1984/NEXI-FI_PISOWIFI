@@ -13,7 +13,6 @@ function index()
 
     local page = entry({"admin", "pisowifi"}, firstchild(), _("PisoWiFi"), 60)
     page.dependent = false
-    page.acl_depends = { "luci-app-pisowifi" }
 
     entry({"admin", "pisowifi", "dashboard"}, cbi("pisowifi/dashboard"), _("Dashboard"), 1)
     entry({"admin", "pisowifi", "wifi-setup"}, cbi("pisowifi/wifi-setup"), _("WiFi Setup"), 2)
