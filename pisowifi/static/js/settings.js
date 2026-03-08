@@ -2,7 +2,7 @@
 class SettingsManager {
     constructor() {
         this.currentTab = 'general';
-        this.apiUrl = '/cgi-bin/api-real.cgi';
+        this.apiUrl = '/pisowifi/cgi-bin/api-real.cgi';
         this.init();
     }
 

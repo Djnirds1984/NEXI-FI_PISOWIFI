@@ -6,7 +6,7 @@ class LogsManager {
         this.currentPage = 1;
         this.logsPerPage = 50;
         this.autoScroll = true;
-        this.apiUrl = '/cgi-bin/api-real.cgi';
+        this.apiUrl = '/pisowifi/cgi-bin/api-real.cgi';
         this.init();
     }
 

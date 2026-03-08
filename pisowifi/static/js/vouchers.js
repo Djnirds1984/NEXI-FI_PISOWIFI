@@ -3,7 +3,7 @@ class VoucherManager {
     constructor() {
         this.vouchers = [];
         this.filteredVouchers = [];
-        this.apiUrl = '/cgi-bin/api-real.cgi';
+        this.apiUrl = '/pisowifi/cgi-bin/api-real.cgi';
         this.init();
     }
 

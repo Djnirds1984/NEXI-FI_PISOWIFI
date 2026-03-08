@@ -1,7 +1,7 @@
 // Hotspot Configuration JavaScript with Real API Integration
 class HotspotManager {
     constructor() {
-        this.apiUrl = '/cgi-bin/api-real.cgi';
+        this.apiUrl = '/pisowifi/cgi-bin/api-real.cgi';
         this.init();
     }
 
@@ -563,17 +563,35 @@ class HotspotManager {
     async updateStatus() {
         try {
             const response = await fetch(`${this.apiUrl}?action=get_hotspot_status`);
+            
+            // Check if response is ok before trying to parse JSON
+            if (!response.ok) {
+                console.error(`HTTP error! status: ${response.status} - ${response.statusText}`);
+                this.updateStatusDisplay(this.getErrorStatus(`Server Error: ${response.status}`));
+                return;
+            }
+            
+            // Check content type before parsing
+            const contentType = response.headers.get('content-type');
+            if (!contentType || !contentType.includes('application/json')) {
+                console.error('Expected JSON response but got:', contentType);
+                const text = await response.text();
+                console.error('Response body:', text);
+                this.updateStatusDisplay(this.getErrorStatus('Invalid server response'));
+                return;
+            }
+            
             const data = await response.json();
             
             if (data.success) {
                 this.updateStatusDisplay(data.status || this.getDefaultStatus());
             } else {
                 console.error('Failed to get hotspot status:', data.error);
-                this.updateStatusDisplay(this.getDefaultStatus());
+                this.updateStatusDisplay(this.getErrorStatus(data.error || 'Unknown error'));
             }
         } catch (error) {
             console.error('Error updating hotspot status:', error);
-            this.updateStatusDisplay(this.getDefaultStatus());
+            this.updateStatusDisplay(this.getErrorStatus('Connection failed'));
         }
     }
 
@@ -581,6 +599,15 @@ class HotspotManager {
         return {
             service: 'Unknown',
             interface: 'Unknown',
+            users: 0,
+            signal: 'N/A'
+        };
+    }
+
+    getErrorStatus(errorMessage) {
+        return {
+            service: 'Error',
+            interface: errorMessage || 'Connection Failed',
             users: 0,
             signal: 'N/A'
         };

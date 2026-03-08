@@ -5,7 +5,7 @@ class UserManager {
         this.sessions = [];
         this.filteredUsers = [];
         this.bandwidthData = [];
-        this.apiUrl = '/cgi-bin/api-real.cgi';
+        this.apiUrl = '/pisowifi/cgi-bin/api-real.cgi';
         this.init();
     }
 
