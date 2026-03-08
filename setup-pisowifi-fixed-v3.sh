@@ -173,19 +173,95 @@ mkdir -p /www/pisowifi/static/js
 mkdir -p /www/pisowifi/static/images
 mkdir -p /www/pisowifi/cgi-bin
 
-# Check if PisoWiFi files exist in current directory
-if [ -d "./pisowifi" ]; then
-    echo "Installing PisoWiFi web files from current directory..."
+# Check current directory and PisoWiFi files location
+if [ "$(pwd)" = "/www" ] && [ -d "./pisowifi" ]; then
+    echo "Installing PisoWiFi web files from /www/pisowifi/..."
     cp -r ./pisowifi/* /www/pisowifi/
+    
+    # Set proper permissions for CGI scripts
+    echo "Setting CGI script permissions..."
+    if [ -f "/www/pisowifi/cgi-bin/api-real.cgi" ]; then
+        chmod 755 /www/pisowifi/cgi-bin/api-real.cgi
+        echo "Set permissions for api-real.cgi"
+    fi
+    
+    # Set permissions for all CGI scripts in the directory
+    if [ -d "/www/pisowifi/cgi-bin" ]; then
+        find /www/pisowifi/cgi-bin -name "*.cgi" -exec chmod 755 {} \; 2>/dev/null
+        echo "Set permissions for all CGI scripts"
+    fi
+elif [ "$(pwd)" = "/www/pisowifi" ]; then
+    echo "Already in PisoWiFi directory, skipping file copy..."
+    
+    # Set proper permissions for CGI scripts
+    echo "Setting CGI script permissions..."
+    if [ -f "./cgi-bin/api-real.cgi" ]; then
+        chmod 755 ./cgi-bin/api-real.cgi
+        echo "Set permissions for api-real.cgi"
+    fi
+    
+    # Set permissions for all CGI scripts in the directory
+    if [ -d "./cgi-bin" ]; then
+        find ./cgi-bin -name "*.cgi" -exec chmod 755 {} \; 2>/dev/null
+        echo "Set permissions for all CGI scripts"
+    fi
 else
-    echo "Warning: PisoWiFi files not found in current directory."
-    echo "Please copy PisoWiFi files to /www/pisowifi/ manually."
+    echo "Installing PisoWiFi web files from current directory..."
+    cp -r ./pisowifi/* /www/pisowifi/ 2>/dev/null
+    
+    # Set proper permissions for CGI scripts
+    echo "Setting CGI script permissions..."
+    if [ -f "/www/pisowifi/cgi-bin/api-real.cgi" ]; then
+        chmod 755 /www/pisowifi/cgi-bin/api-real.cgi
+        echo "Set permissions for api-real.cgi"
+    fi
+    
+    # Set permissions for all CGI scripts in the directory
+    if [ -d "/www/pisowifi/cgi-bin" ]; then
+        find /www/pisowifi/cgi-bin -name "*.cgi" -exec chmod 755 {} \; 2>/dev/null
+        echo "Set permissions for all CGI scripts"
+    fi
 fi
 
 # Configure web server
 echo "Configuring web server..."
+
+# Basic uhttpd configuration
 uci set uhttpd.main.index_page='index.html'
+
+# Configure CGI support
+uci set uhttpd.main.cgi_prefix='/cgi-bin'
+uci set uhttpd.main.script_timeout='60'
+
+# Add CGI interpreter for .cgi files
+uci add_list uhttpd.main.interpreter='.cgi=/usr/bin/ucode'
+
+# Configure document root to include our PisoWiFi directory
+uci set uhttpd.main.home='/www'
+
+# Add specific CGI directory mapping for PisoWiFi
+uci add uhttpd uhttpd
+uci set uhttpd.@uhttpd[-1].listen_http='0.0.0.0:80'
+uci set uhttpd.@uhttpd[-1].home='/www/pisowifi'
+uci set uhttpd.@uhttpd[-1].cgi_prefix='/cgi-bin'
+uci set uhttpd.@uhttpd[-1].cgi_path='/www/pisowifi/cgi-bin'
+uci set uhttpd.@uhttpd[-1].script_timeout='60'
+uci add_list uhttpd.@uhttpd[-1].interpreter='.cgi=/usr/bin/ucode'
+
 uci commit uhttpd
+
+# Restart uhttpd service to apply CGI configuration
+echo "Restarting uhttpd service..."
+if [ -f "/etc/init.d/uhttpd" ]; then
+    /etc/init.d/uhttpd restart
+    if [ $? -eq 0 ]; then
+        echo "uhttpd service restarted successfully"
+    else
+        echo "Warning: Failed to restart uhttpd service"
+    fi
+else
+    echo "Warning: uhttpd service not found"
+fi
 
 # Create sample vouchers with safety checks
 echo "Creating sample vouchers..."
@@ -240,6 +316,64 @@ done
 if command -v wifi >/dev/null 2>&1; then
     echo "Reloading WiFi configuration..."
     wifi reload
+fi
+
+# Test CGI configuration
+echo ""
+echo "Testing CGI configuration..."
+if [ -f "/www/pisowifi/cgi-bin/api-real.cgi" ]; then
+    echo "✓ CGI script found at /www/pisowifi/cgi-bin/api-real.cgi"
+    
+    # Test if CGI script is executable
+    if [ -x "/www/pisowifi/cgi-bin/api-real.cgi" ]; then
+        echo "✓ CGI script is executable"
+    else
+        echo "✗ CGI script is not executable - fixing..."
+        chmod 755 /www/pisowifi/cgi-bin/api-real.cgi
+    fi
+    
+    # Test basic CGI functionality
+    echo "Testing CGI script functionality..."
+    
+    # Create a simple test CGI script
+    echo "Creating test CGI script..."
+    cat > /www/pisowifi/cgi-bin/test.cgi << 'EOF'
+#!/usr/bin/ucode
+print("Content-Type: application/json\n")
+print('{"success": true, "message": "CGI is working!"}')
+EOF
+    chmod 755 /www/pisowifi/cgi-bin/test.cgi
+    
+    if command -v curl >/dev/null 2>&1; then
+        echo "Testing CGI with simple test script..."
+        result=$(curl -s "http://localhost/cgi-bin/test.cgi" 2>/dev/null)
+        if echo "$result" | grep -q "CGI is working"; then
+            echo "✓ CGI configuration is working correctly"
+            rm -f /www/pisowifi/cgi-bin/test.cgi
+        elif echo "$result" | grep -q "404"; then
+            echo "✗ CGI still returning 404 - checking uhttpd status..."
+            echo "  Current uhttpd configuration:"
+            uci show uhttpd 2>/dev/null | grep -E "(cgi|home)" || echo "  No CGI configuration found"
+            echo "  Try accessing: http://10.0.0.1/cgi-bin/test.cgi"
+        else
+            echo "? CGI test inconclusive - result: $result"
+        fi
+        
+        # Test the actual API script
+        echo "Testing api-real.cgi..."
+        result=$(curl -s "http://localhost/cgi-bin/api-real.cgi?action=get_hotspot_settings" 2>/dev/null | head -c 100)
+        if echo "$result" | grep -q "success"; then
+            echo "✓ api-real.cgi is responding correctly"
+        elif echo "$result" | grep -q "404"; then
+            echo "✗ api-real.cgi returning 404"
+        else
+            echo "? api-real.cgi test inconclusive - result: $result"
+        fi
+    else
+        echo "  Note: curl not available for CGI testing"
+    fi
+else
+    echo "✗ CGI script not found at /www/pisowifi/cgi-bin/api-real.cgi"
 fi
 
 echo ""
