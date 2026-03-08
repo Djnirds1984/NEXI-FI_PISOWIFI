@@ -1,4 +1,4 @@
-﻿# Simple HTTP Server for PisoWiFi Testing
+# Simple HTTP Server for PisoWiFi Testing
 # This simulates the OpenWrt uhttpd environment
 
 $port = 8080
@@ -99,6 +99,68 @@ function Handle-ApiRequest {
                 source = "system"
                 message = "Test server started successfully"
                 category = "system"
+            }
+        )
+    }
+    elseif ($context.Request.RawUrl -like "*action=get_hotspot_settings*") {
+        $responseData.success = $true
+        $responseData.settings = @{
+            hotspot_name = "PisoWiFi-Test"
+            hotspot_password = "test12345"
+            admin_password = "admin123"
+            voucher_expiry = 24
+            max_clients = 50
+            captive_portal = $true
+            redirect_url = "http://10.0.0.1"
+            tx_power = 100
+            wifi_interface = "wlan0"
+            wifi_ssid = "PisoWiFi-Free"
+            wifi_channel = 6
+            wifi_mode = "ap"
+            wifi_encryption = "none"
+        }
+    }
+    elseif ($context.Request.RawUrl -like "*action=get_hotspot_status*") {
+        $responseData.success = $true
+        $responseData.status = @{
+            service = "running"
+            interface = "wlan0"
+            users = 3
+            signal = "-45 dBm"
+            uptime = "2h 30m"
+            ssid = "PisoWiFi-Free"
+            channel = 6
+            mode = "ap"
+        }
+    }
+    elseif ($context.Request.RawUrl -like "*action=get_wifi_interfaces*") {
+        $responseData.success = $true
+        $responseData.interfaces = @(
+            @{
+                name = "wlan0"
+                type = "wireless_interface"
+                status = "active"
+                ssid = "PisoWiFi-Free"
+                mode = "ap"
+                channel = 6
+                frequency = "2437"
+                txpower = "20 dBm"
+                signal = "-45 dBm"
+                clients = 3
+                mac_address = "00:11:22:33:44:55"
+            },
+            @{
+                name = "wlan1"
+                type = "wireless_interface"
+                status = "inactive"
+                ssid = ""
+                mode = "ap"
+                channel = 11
+                frequency = "2462"
+                txpower = "20 dBm"
+                signal = "N/A"
+                clients = 0
+                mac_address = "00:11:22:33:44:66"
             }
         )
     }

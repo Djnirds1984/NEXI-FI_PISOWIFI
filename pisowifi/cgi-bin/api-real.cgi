@@ -2160,8 +2160,18 @@ function handleRequest() {
         }
     }
     
+    # Print CGI headers first
+    printf("Content-Type: application/json\r\n\r\n");
     printf("%s", json(response));
 }
 
-# Execute request handler
-handleRequest();
+# Execute request handler with error handling
+try {
+    handleRequest();
+} catch (e) {
+    printf("Content-Type: application/json\r\n\r\n");
+    printf("%s", json({
+        success: false,
+        error: "CGI execution error: " + e
+    }));
+}
