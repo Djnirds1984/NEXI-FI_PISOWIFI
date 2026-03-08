@@ -11,6 +11,181 @@ import { getenv, setenv } from "stdlib";
 const HOTSPOT_IP = "10.0.0.1";
 const DEFAULT_SSID = "PisoWiFi_Free";
 
+# Enhanced WiFi detection and management functions
+function getAvailableWiFiDevices() {
+    const devices = [];
+    
+    try {
+        # Method 1: Check physical wireless devices
+        const phy_devices = popen("ls /sys/class/ieee80211/ 2>/dev/null", "r");
+        if (phy_devices) {
+            let line;
+            while ((line = phy_devices.read("line"))) {
+                const device = line.trim();
+                if (device) {
+                    devices.push({
+                        name: device,
+                        type: 'physical',
+                        path: `/sys/class/ieee80211/${device}`,
+                        status: 'hardware_detected'
+                    });
+                }
+            }
+            phy_devices.close();
+        }
+        
+        # Method 2: Check UCI wireless devices
+        const cursor = cursor();
+        cursor.load('wireless');
+        const wireless_config = cursor.get_all('wireless') || {};
+        
+        for (let section in wireless_config) {
+            const config = wireless_config[section];
+            if (config && config['.type'] === 'wifi-device') {
+                let found = false;
+                for (let device of devices) {
+                    if (device.name === section) {
+                        device.uci_config = config;
+                        device.status = 'configured';
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    devices.push({
+                        name: section,
+                        type: 'uci_device',
+                        uci_config: config,
+                        status: 'configured'
+                    });
+                }
+            }
+        }
+        
+        # Method 3: Check for USB wireless devices
+        const usb_devices = popen("lsusb | grep -i wireless", "r");
+        if (usb_devices) {
+            let line;
+            while ((line = usb_devices.read("line"))) {
+                if (line.match(/(Wireless|WiFi|WLAN)/i)) {
+                    devices.push({
+                        name: 'usb_wifi',
+                        type: 'usb',
+                        description: line.trim(),
+                        status: 'usb_detected'
+                    });
+                }
+            }
+            usb_devices.close();
+        }
+        
+        # Method 4: Check PCI wireless devices
+        const pci_devices = popen("lspci | grep -i network", "r");
+        if (pci_devices) {
+            let line;
+            while ((line = pci_devices.read("line"))) {
+                if (line.match(/(Network|Wireless|WiFi)/i)) {
+                    devices.push({
+                        name: 'pci_wifi',
+                        type: 'pci',
+                        description: line.trim(),
+                        status: 'pci_detected'
+                    });
+                }
+            }
+            pci_devices.close();
+        }
+        
+    } catch (e) {
+        # Final fallback
+        devices.push({
+            name: 'radio0',
+            type: 'fallback',
+            description: 'Default wireless device',
+            status: 'fallback'
+        });
+    }
+    
+    return devices;
+}
+
+function getWiFiCapabilities(device_name) {
+    const capabilities = {
+        bands: [],
+        modes: [],
+        channels: {},
+        features: []
+    };
+    
+    try {
+        # Get device capabilities
+        const iw_output = popen(`iw phy ${device_name} info 2>/dev/null`, "r");
+        if (iw_output) {
+            let line;
+            let current_band;
+            
+            while ((line = iw_output.read("line"))) {
+                # Parse bands
+                if (line.match(/Band\s+(\d+)/)) {
+                    current_band = line.match(/Band\s+(\d+)/)[1];
+                    capabilities.bands.push(current_band);
+                }
+                
+                # Parse supported modes
+                if (line.match(/\*\s+(\w+\s*){1,3}/)) {
+                    const mode = line.trim();
+                    if (mode.includes('AP') || mode.includes('STA') || mode.includes('Monitor')) {
+                        capabilities.modes.push(mode);
+                    }
+                }
+                
+                # Parse channels
+                if (line.match(/\*\s+(\d+)\s+MHz\s+\[(\d+)\]/)) {
+                    const match = line.match(/\*\s+(\d+)\s+MHz\s+\[(\d+)\]/);
+                    const freq = match[1];
+                    const channel = match[2];
+                    if (current_band) {
+                        if (!capabilities.channels[current_band]) {
+                            capabilities.channels[current_band] = [];
+                        }
+                        capabilities.channels[current_band].push({
+                            channel: channel,
+                            frequency: freq
+                        });
+                    }
+                }
+                
+                # Parse features
+                if (line.match(/Features:/)) {
+                    while ((line = iw_output.read("line")) && line.trim()) {
+                        if (line.includes('*')) {
+                            capabilities.features.push(line.trim());
+                        }
+                    }
+                }
+            }
+            iw_output.close();
+        }
+        
+        # Get regulatory information
+        const reg_output = popen("iw reg get", "r");
+        if (reg_output) {
+            let line;
+            while ((line = reg_output.read("line"))) {
+                if (line.match(/country\s+(\w+):/)) {
+                    capabilities.country = line.match(/country\s+(\w+):/)[1];
+                }
+            }
+            reg_output.close();
+        }
+        
+    } catch (e) {
+        capabilities.error = e.toString();
+    }
+    
+    return capabilities;
+}
+
 # Real UCI configuration functions
 function loadConfig() {
     const config = {};
@@ -284,8 +459,10 @@ function getSystemStatus() {
         }
         status.interfaces = interfaces;
         
-        # Get wireless status
+        # Enhanced wireless status detection
         const wifi_status = {};
+        
+        # Method 1: Check iw dev for wireless interfaces
         const iw_output = popen("iw dev", "r");
         if (iw_output) {
             let line;
@@ -293,7 +470,14 @@ function getSystemStatus() {
             while ((line = iw_output.read("line"))) {
                 if (line.match(/Interface\s+(\w+)/)) {
                     current_device = line.match(/Interface\s+(\w+)/)[1];
-                    wifi_status[current_device] = {};
+                    wifi_status[current_device] = {
+                        type: 'wireless',
+                        status: 'detected',
+                        ssid: null,
+                        mode: null,
+                        channel: null,
+                        signal: null
+                    };
                 }
                 if (line.match(/ssid\s+(.+)/)) {
                     const ssid = line.match(/ssid\s+(.+)/)[1];
@@ -301,9 +485,92 @@ function getSystemStatus() {
                         wifi_status[current_device].ssid = ssid;
                     }
                 }
+                if (line.match(/type\s+(.+)/)) {
+                    const mode = line.match(/type\s+(.+)/)[1];
+                    if (current_device) {
+                        wifi_status[current_device].mode = mode;
+                    }
+                }
+                if (line.match(/channel\s+(\d+)/)) {
+                    const channel = line.match(/channel\s+(\d+)/)[1];
+                    if (current_device) {
+                        wifi_status[current_device].channel = channel;
+                    }
+                }
             }
             iw_output.close();
         }
+        
+        # Method 2: Check UCI wireless configuration
+        const cursor = cursor();
+        cursor.load('wireless');
+        const wireless_config = cursor.get_all('wireless') || {};
+        
+        for (let section in wireless_config) {
+            const config = wireless_config[section];
+            if (config && config['.type'] === 'wifi-device') {
+                # Found wireless device configuration
+                const device_name = section;
+                if (!wifi_status[device_name]) {
+                    wifi_status[device_name] = {
+                        type: 'wireless_device',
+                        status: 'configured',
+                        band: config.band || '2g',
+                        channel: config.channel || 'auto',
+                        htmode: config.htmode || 'HT20'
+                    };
+                }
+            }
+            if (config && config['.type'] === 'wifi-iface') {
+                # Found wireless interface configuration
+                const iface_name = config.device || section;
+                if (!wifi_status[iface_name]) {
+                    wifi_status[iface_name] = {
+                        type: 'wireless_interface',
+                        status: config.disabled === '1' ? 'disabled' : 'enabled',
+                        ssid: config.ssid || null,
+                        mode: config.mode || 'ap',
+                        network: config.network || 'lan'
+                    };
+                } else {
+                    # Update existing entry with interface info
+                    wifi_status[iface_name].ssid = config.ssid || wifi_status[iface_name].ssid;
+                    wifi_status[iface_name].mode = config.mode || wifi_status[iface_name].mode;
+                    wifi_status[iface_name].status = config.disabled === '1' ? 'disabled' : 'enabled';
+                }
+            }
+        }
+        
+        # Method 3: Check for physical wireless devices
+        const wifi_devices = popen("ls /sys/class/ieee80211/ 2>/dev/null", "r");
+        if (wifi_devices) {
+            let line;
+            while ((line = wifi_devices.read("line"))) {
+                const device = line.trim();
+                if (device && !wifi_status[device]) {
+                    wifi_status[device] = {
+                        type: 'physical_device',
+                        status: 'hardware_detected'
+                    };
+                }
+            }
+            wifi_devices.close();
+        }
+        
+        # Method 4: Check wireless regulatory domain
+        const reg_domain = popen("iw reg get | grep country", "r");
+        if (reg_domain) {
+            let line;
+            while ((line = reg_domain.read("line"))) {
+                if (line.match(/country\s+(\w+)/)) {
+                    const country = line.match(/country\s+(\w+)/)[1];
+                    status.regulatory_domain = country;
+                    break;
+                }
+            }
+            reg_domain.close();
+        }
+        
         status.wireless = wifi_status;
         
         # Get service status
@@ -404,35 +671,251 @@ const handlers = {
             };
         },
         
+        "/api/wifi_devices": function() {
+            const devices = getAvailableWiFiDevices();
+            return {
+                success: true,
+                devices: devices,
+                count: devices.length,
+                timestamp: system("date +%s")
+            };
+        },
+        
+        "/api/wifi_capabilities": function(params) {
+            const device_name = params.device || 'phy0';
+            const capabilities = getWiFiCapabilities(device_name);
+            return {
+                success: true,
+                device: device_name,
+                capabilities: capabilities,
+                timestamp: system("date +%s")
+            };
+        },
+        
         "/api/wifi_interfaces": function() {
             const interfaces = [];
+            const detailed_info = {};
+            
             try {
+                # Method 1: Get UCI wireless configuration first
+                const cursor = cursor();
+                cursor.load('wireless');
+                const wireless_config = cursor.get_all('wireless') || {};
+                
+                # Collect device and interface configurations
+                const devices = {};
+                const ifaces = {};
+                
+                for (let section in wireless_config) {
+                    const config = wireless_config[section];
+                    if (config && config['.type'] === 'wifi-device') {
+                        devices[section] = {
+                            type: 'device',
+                            band: config.band || '2g',
+                            channel: config.channel || 'auto',
+                            htmode: config.htmode || 'HT20',
+                            txpower: config.txpower || 'auto',
+                            country: config.country || '00',
+                            disabled: config.disabled === '1'
+                        };
+                    }
+                    if (config && config['.type'] === 'wifi-iface') {
+                        ifaces[section] = {
+                            type: 'interface',
+                            device: config.device || 'unknown',
+                            ssid: config.ssid || 'unnamed',
+                            mode: config.mode || 'ap',
+                            network: config.network || 'lan',
+                            encryption: config.encryption || 'none',
+                            key: config.key || '',
+                            disabled: config.disabled === '1'
+                        };
+                    }
+                }
+                
+                # Method 2: Get current wireless interfaces from iw
                 const iw_output = popen("iw dev", "r");
                 if (iw_output) {
                     let line;
                     let current_device;
+                    let current_iface;
+                    
                     while ((line = iw_output.read("line"))) {
+                        # Parse interface name
                         if (line.match(/Interface\s+(\w+)/)) {
-                            current_device = line.match(/Interface\s+(\w+)/)[1];
-                            interfaces.push({
-                                name: current_device,
-                                description: 'Wireless Interface'
-                            });
+                            current_iface = line.match(/Interface\s+(\w+)/)[1];
+                            current_device = null;
+                            
+                            # Initialize detailed info for this interface
+                            if (!detailed_info[current_iface]) {
+                                detailed_info[current_iface] = {
+                                    name: current_iface,
+                                    type: 'wireless_interface',
+                                    status: 'detected',
+                                    ssid: null,
+                                    mode: null,
+                                    channel: null,
+                                    frequency: null,
+                                    txpower: null,
+                                    signal: null,
+                                    clients: 0,
+                                    mac_address: null
+                                };
+                            }
+                        }
+                        
+                        # Parse SSID
+                        if (line.match(/ssid\s+(.+)/)) {
+                            const ssid = line.match(/ssid\s+(.+)/)[1];
+                            if (current_iface && detailed_info[current_iface]) {
+                                detailed_info[current_iface].ssid = ssid;
+                            }
+                        }
+                        
+                        # Parse type/mode
+                        if (line.match(/type\s+(.+)/)) {
+                            const mode = line.match(/type\s+(.+)/)[1];
+                            if (current_iface && detailed_info[current_iface]) {
+                                detailed_info[current_iface].mode = mode;
+                            }
+                        }
+                        
+                        # Parse channel
+                        if (line.match(/channel\s+(\d+)/)) {
+                            const channel = line.match(/channel\s+(\d+)/)[1];
+                            if (current_iface && detailed_info[current_iface]) {
+                                detailed_info[current_iface].channel = channel;
+                            }
+                        }
+                        
+                        # Parse frequency
+                        if (line.match(/(\d+)\s+MHz/)) {
+                            const freq = line.match(/(\d+)\s+MHz/)[1];
+                            if (current_iface && detailed_info[current_iface]) {
+                                detailed_info[current_iface].frequency = freq;
+                            }
+                        }
+                        
+                        # Parse txpower
+                        if (line.match(/txpower\s+([\d.]+)\s+dBm/)) {
+                            const txpower = line.match(/txpower\s+([\d.]+)\s+dBm/)[1];
+                            if (current_iface && detailed_info[current_iface]) {
+                                detailed_info[current_iface].txpower = txpower;
+                            }
                         }
                     }
                     iw_output.close();
                 }
+                
+                # Method 3: Get MAC addresses for interfaces
+                const ip_link_output = popen("ip link show", "r");
+                if (ip_link_output) {
+                    let line;
+                    let current_iface;
+                    
+                    while ((line = ip_link_output.read("line"))) {
+                        if (line.match(/^(\d+):\s+(\w+):/)) {
+                            current_iface = line.match(/^(\d+):\s+(\w+):/)[2];
+                        }
+                        if (line.match(/link\/ether\s+([a-fA-F0-9:]{17})/)) {
+                            const mac = line.match(/link\/ether\s+([a-fA-F0-9:]{17})/)[1];
+                            if (current_iface && detailed_info[current_iface]) {
+                                detailed_info[current_iface].mac_address = mac;
+                            }
+                        }
+                    }
+                    ip_link_output.close();
+                }
+                
+                # Method 4: Get connected stations/clients
+                for (let iface in detailed_info) {
+                    try {
+                        const stations_output = popen(`iw dev ${iface} station dump | grep "Station" | wc -l`, "r");
+                        if (stations_output) {
+                            const station_count = stations_output.read("line");
+                            stations_output.close();
+                            detailed_info[iface].clients = parseInt(station_count) || 0;
+                        }
+                    } catch (e) {
+                        detailed_info[iface].clients = 0;
+                    }
+                }
+                
+                # Method 5: Get signal strength for interfaces
+                for (let iface in detailed_info) {
+                    try {
+                        const survey_output = popen(`iw dev ${iface} survey dump | grep "signal:" | head -1`, "r");
+                        if (survey_output) {
+                            let line;
+                            while ((line = survey_output.read("line"))) {
+                                if (line.match(/signal:\s+([-\d]+)\s+dBm/)) {
+                                    const signal = line.match(/signal:\s+([-\d]+)\s+dBm/)[1];
+                                    detailed_info[iface].signal = signal;
+                                    break;
+                                }
+                            }
+                            survey_output.close();
+                        }
+                    } catch (e) {
+                        # Signal detection failed, continue
+                    }
+                }
+                
+                # Build final interface list
+                for (let iface_name in detailed_info) {
+                    const info = detailed_info[iface_name];
+                    
+                    # Merge with UCI configuration
+                    for (let uci_iface in ifaces) {
+                        if (ifaces[uci_iface].device === iface_name || uci_iface === iface_name) {
+                            info.uci_config = ifaces[uci_iface];
+                            info.ssid = info.ssid || ifaces[uci_iface].ssid;
+                            break;
+                        }
+                    }
+                    
+                    interfaces.push(info);
+                }
+                
+                # Add UCI devices that aren't currently active
+                for (let device_name in devices) {
+                    let found = false;
+                    for (let iface of interfaces) {
+                        if (iface.name === device_name) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        interfaces.push({
+                            name: device_name,
+                            type: 'wireless_device',
+                            status: devices[device_name].disabled ? 'disabled' : 'configured',
+                            band: devices[device_name].band,
+                            channel: devices[device_name].channel,
+                            htmode: devices[device_name].htmode,
+                            txpower: devices[device_name].txpower,
+                            uci_config: devices[device_name]
+                        });
+                    }
+                }
+                
             } catch (e) {
-                # Fallback to common interfaces
-                interfaces = [
-                    { name: 'wlan0', description: '2.4GHz Wireless' },
-                    { name: 'wlan1', description: '5GHz Wireless' }
-                ];
+                # Fallback to basic detection
+                interfaces.push({
+                    name: 'wlan0',
+                    type: 'wireless_interface',
+                    status: 'fallback',
+                    ssid: 'PisoWiFi',
+                    mode: 'ap',
+                    error: `Detection failed: ${e}`
+                });
             }
             
             return {
                 success: true,
                 interfaces: interfaces,
+                count: interfaces.length,
                 timestamp: system("date +%s")
             };
         }
@@ -1620,7 +2103,53 @@ function handleRequest() {
         error: "Invalid request"
     };
     
-    if (handlers[method] && handlers[method][clean_path]) {
+    # Check for action parameter first (for compatibility with existing JavaScript)
+    if (params.action) {
+        switch (params.action) {
+            case "get_hotspot_settings":
+                if (handlers[method] && handlers[method]["/api/hotspot_settings"]) {
+                    try {
+                        response = handlers[method]["/api/hotspot_settings"](params);
+                    } catch (e) {
+                        response = {
+                            success: false,
+                            error: "Internal error: " + e
+                        };
+                    }
+                }
+                break;
+            case "get_hotspot_status":
+                if (handlers[method] && handlers[method]["/api/hotspot_status"]) {
+                    try {
+                        response = handlers[method]["/api/hotspot_status"](params);
+                    } catch (e) {
+                        response = {
+                            success: false,
+                            error: "Internal error: " + e
+                        };
+                    }
+                }
+                break;
+            case "get_wifi_interfaces":
+                if (handlers[method] && handlers[method]["/api/wifi_interfaces"]) {
+                    try {
+                        response = handlers[method]["/api/wifi_interfaces"](params);
+                    } catch (e) {
+                        response = {
+                            success: false,
+                            error: "Internal error: " + e
+                        };
+                    }
+                }
+                break;
+            default:
+                response = {
+                    success: false,
+                    error: "Unknown action: " + params.action
+                };
+        }
+    }
+    else if (handlers[method] && handlers[method][clean_path]) {
         try {
             response = handlers[method][clean_path](params);
         } catch (e) {

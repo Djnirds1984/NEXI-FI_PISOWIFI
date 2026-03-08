@@ -87,6 +87,8 @@ class HotspotManager {
 
     populateWiFiInterfaces(interfaces) {
         const wifiInterfaceSelect = document.getElementById('wifi-interface');
+        const interfaceInfoDiv = document.getElementById('wifi-interface-info');
+        
         if (!wifiInterfaceSelect) return;
 
         // Clear existing options except the first one
@@ -94,13 +96,123 @@ class HotspotManager {
             wifiInterfaceSelect.remove(1);
         }
 
-        // Add available interfaces
+        // Add available interfaces with detailed information
         interfaces.forEach(iface => {
             const option = document.createElement('option');
             option.value = iface.name;
-            option.textContent = `${iface.name} (${iface.description || 'Wireless Interface'})`;
+            
+            // Build descriptive text based on available information
+            let description = '';
+            if (iface.type === 'wireless_interface') {
+                if (iface.ssid) {
+                    description = `${iface.name} - ${iface.ssid} (${iface.mode || 'AP'})`;
+                } else {
+                    description = `${iface.name} - ${iface.status} (${iface.mode || 'unknown'})`;
+                }
+            } else if (iface.type === 'wireless_device') {
+                description = `${iface.name} - ${iface.band || '2.4GHz'} Device (${iface.status})`;
+            } else if (iface.type === 'physical_device') {
+                description = `${iface.name} - Physical Device (${iface.status})`;
+            } else {
+                description = `${iface.name} - ${iface.type || 'Unknown'} (${iface.status})`;
+            }
+            
+            // Add client count if available
+            if (iface.clients > 0) {
+                description += ` - ${iface.clients} clients`;
+            }
+            
+            // Add signal info if available
+            if (iface.signal) {
+                description += ` - ${iface.signal}dBm`;
+            }
+            
+            option.textContent = description;
+            
+            // Store full interface data for later use
+            option.dataset.interfaceData = JSON.stringify(iface);
+            
             wifiInterfaceSelect.appendChild(option);
         });
+        
+        // Add interface change listener for detailed info display
+        wifiInterfaceSelect.addEventListener('change', (e) => {
+            this.displayInterfaceDetails(e.target.selectedOptions[0]);
+        });
+        
+        // Show details for currently selected interface
+        if (wifiInterfaceSelect.selectedOptions[0]) {
+            this.displayInterfaceDetails(wifiInterfaceSelect.selectedOptions[0]);
+        }
+    }
+    
+    displayInterfaceDetails(option) {
+        const interfaceInfoDiv = document.getElementById('wifi-interface-info');
+        if (!interfaceInfoDiv || !option.dataset.interfaceData) return;
+        
+        try {
+            const iface = JSON.parse(option.dataset.interfaceData);
+            let html = '<div class="interface-details">';
+            
+            // Basic info
+            html += `<h4>Interface: ${iface.name}</h4>`;
+            html += `<p><strong>Type:</strong> ${iface.type || 'Unknown'}</p>`;
+            html += `<p><strong>Status:</strong> ${iface.status || 'Unknown'}</p>`;
+            
+            // SSID and mode
+            if (iface.ssid) {
+                html += `<p><strong>SSID:</strong> ${iface.ssid}</p>`;
+            }
+            if (iface.mode) {
+                html += `<p><strong>Mode:</strong> ${iface.mode}</p>`;
+            }
+            
+            // Technical details
+            if (iface.channel) {
+                html += `<p><strong>Channel:</strong> ${iface.channel}</p>`;
+            }
+            if (iface.frequency) {
+                html += `<p><strong>Frequency:</strong> ${iface.frequency} MHz</p>`;
+            }
+            if (iface.txpower) {
+                html += `<p><strong>TX Power:</strong> ${iface.txpower} dBm</p>`;
+            }
+            if (iface.mac_address) {
+                html += `<p><strong>MAC Address:</strong> ${iface.mac_address}</p>`;
+            }
+            
+            // Clients and signal
+            if (iface.clients !== undefined) {
+                html += `<p><strong>Connected Clients:</strong> ${iface.clients}</p>`;
+            }
+            if (iface.signal) {
+                html += `<p><strong>Signal Strength:</strong> ${iface.signal} dBm</p>`;
+            }
+            
+            // UCI configuration info
+            if (iface.uci_config) {
+                html += '<h5>UCI Configuration:</h5>';
+                if (iface.uci_config.band) {
+                    html += `<p><strong>Band:</strong> ${iface.uci_config.band}</p>`;
+                }
+                if (iface.uci_config.encryption) {
+                    html += `<p><strong>Encryption:</strong> ${iface.uci_config.encryption}</p>`;
+                }
+                if (iface.uci_config.network) {
+                    html += `<p><strong>Network:</strong> ${iface.uci_config.network}</p>`;
+                }
+            }
+            
+            // Band info for devices
+            if (iface.band) {
+                html += `<p><strong>Band:</strong> ${iface.band}</p>`;
+            }
+            
+            html += '</div>';
+            interfaceInfoDiv.innerHTML = html;
+        } catch (e) {
+            console.error('Error displaying interface details:', e);
+        }
     }
 
     getDefaultSettings() {
