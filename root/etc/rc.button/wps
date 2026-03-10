@@ -1,0 +1,22 @@
+#!/bin/sh
+
+[ "$ACTION" = "pressed" ] || exit 0
+
+FILE="/tmp/pisowifi_coins"
+
+# Initialize if not exists
+if [ ! -f "$FILE" ]; then
+	echo "0" > "$FILE"
+fi
+
+# Read current count
+COUNT=$(cat "$FILE")
+
+# Increment
+COUNT=$((COUNT + 1))
+
+# Write back
+echo "$COUNT" > "$FILE"
+
+# Log for debugging
+logger -t pisowifi "Coin inserted via WPS button. Total: $COUNT"

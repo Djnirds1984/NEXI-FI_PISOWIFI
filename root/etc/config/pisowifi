@@ -1,0 +1,4 @@
+config pisowifi 'general'
+	option enabled '1'
+	option rate '1.0'
+	option welcome_msg 'Welcome to NEXI-FI PISOWIFI'

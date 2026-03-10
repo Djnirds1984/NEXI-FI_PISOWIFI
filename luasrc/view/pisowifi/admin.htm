@@ -1,0 +1,67 @@
+<%+header%>
+<h2 name="content">PisoWifi Dashboard</h2>
+
+<div class="cbi-map">
+	<fieldset class="cbi-section">
+		<legend>System Status</legend>
+		<table class="cbi-section-table">
+			<tr class="cbi-section-table-row">
+				<th class="cbi-section-table-cell">Hostname</th>
+				<td class="cbi-section-table-cell"><%=luci.sys.hostname()%></td>
+			</tr>
+			<tr class="cbi-section-table-row">
+				<th class="cbi-section-table-cell">Uptime</th>
+				<td class="cbi-section-table-cell"><%=luci.sys.uptime()%></td>
+			</tr>
+			<tr class="cbi-section-table-row">
+				<th class="cbi-section-table-cell">Load Average</th>
+				<td class="cbi-section-table-cell"><%=luci.sys.loadavg()%></td>
+			</tr>
+		</table>
+	</fieldset>
+
+	<fieldset class="cbi-section">
+		<legend>Hotspot Management</legend>
+		<div class="cbi-section-descr">Manage connected users and hotspot settings.</div>
+		
+		<h3>Active Sessions</h3>
+		<table class="cbi-section-table">
+			<tr class="cbi-section-table-titles">
+				<th class="cbi-section-table-cell">MAC Address</th>
+				<th class="cbi-section-table-cell">Action</th>
+			</tr>
+			<% 
+			-- Import our controller function
+			-- Since we exported it to _G, it might be available, but safer to require if possible.
+			-- However, calling the global function directly.
+			local users = {}
+			if get_active_users then
+				users = get_active_users()
+			else
+				-- Fallback if function not found in global scope (should not happen if controller loaded)
+				-- Or try to load the module
+				require "luci.controller.pisowifi"
+				if get_active_users then users = get_active_users() end
+			end
+			
+			for i, v in ipairs(users) do 
+			%>
+			<tr class="cbi-section-table-row">
+				<td class="cbi-section-table-cell"><%=v.mac%></td>
+				<td class="cbi-section-table-cell">
+					<form action="<%=luci.dispatcher.build_url("admin", "pisowifi", "kick")%>" method="post" style="display:inline;">
+						<input type="hidden" name="mac" value="<%=v.mac%>" />
+						<input type="submit" class="cbi-button cbi-button-remove" value="Kick" />
+					</form>
+				</td>
+			</tr>
+			<% end %>
+			<% if #users == 0 then %>
+			<tr class="cbi-section-table-row">
+				<td class="cbi-section-table-cell" colspan="2">No active users found.</td>
+			</tr>
+			<% end %>
+		</table>
+	</fieldset>
+</div>
+<%+footer%>

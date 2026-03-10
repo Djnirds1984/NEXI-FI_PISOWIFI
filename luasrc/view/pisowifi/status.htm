@@ -1,0 +1,18 @@
+<%+header%>
+<div class="pisowifi-container">
+    <h1>Connection Status</h1>
+    <p>You are now connected to the internet.</p>
+    
+    <div class="status-box">
+        <p>Time Remaining: <span id="time-remaining">Unlimited</span></p>
+        <p>IP Address: <%=luci.http.getenv("REMOTE_ADDR")%></p>
+    </div>
+
+    <form action="<%=luci.dispatcher.build_url("pisowifi", "logout")%>" method="post">
+        <button type="submit" class="pisowifi-btn">Logout</button>
+    </form>
+    
+    <hr>
+    <a href="<%=luci.dispatcher.build_url("admin", "pisowifi", "dashboard")%>">Admin Dashboard</a>
+</div>
+<%+footer%>

@@ -1,0 +1,161 @@
+<%+header%>
+
+
+<div class="pisowifi-container">
+    <h1>Welcome to NEXI-FI PISOWIFI</h1>
+    <div id="loading">Checking status...</div>
+    
+    <!-- Login / Coin Section -->
+    <div id="login-section" style="display:none;">
+        <p>Please insert coin to access the internet.</p>
+        <button id="insert-coin-btn" class="pisowifi-btn coin-btn">INSERT COIN</button>
+    </div>
+
+    <!-- Connected Section -->
+    <div id="connected-section" style="display:none;">
+        <h2>You are connected!</h2>
+        <p>IP: <span id="client-ip"></span></p>
+        <p>MAC: <span id="client-mac"></span></p>
+        <p>Time Remaining: <span id="time-remaining" style="font-weight:bold; font-size:1.2em;"></span></p>
+        <button id="logout-btn" class="pisowifi-btn" style="background-color: #dc3545;">Logout</button>
+    </div>
+
+    <!-- Coin Modal -->
+    <div id="coin-modal" class="modal">
+        <div class="modal-content">
+            <h2>Insert Coin Now</h2>
+            <p>Please press the WPS button on the router.</p>
+            <p>1 Press = 1 Peso = 12 Minutes</p>
+            
+            <div id="coin-display" style="font-size: 24px; margin: 20px;">
+                Total: <span id="coin-count">0</span> Pesos<br>
+                Time: <span id="coin-time">0</span> Minutes
+            </div>
+            
+            <button id="connect-btn" class="pisowifi-btn" style="display:none;">Done & Start Internet</button>
+            <br>
+            <button id="cancel-btn" style="margin-top: 10px; background:none; border:none; color:red; cursor:pointer;">Cancel</button>
+        </div>
+    </div>
+
+    <div id="status-message"></div>
+
+    <hr>
+    
+    <a href="<%=luci.dispatcher.build_url("admin", "pisowifi", "dashboard")%>" class="admin-link">Access Admin Dashboard</a>
+</div>
+
+<script type="text/javascript">
+(function() {
+    var apiUrl = "<%=luci.dispatcher.build_url('pisowifi', 'api')%>";
+    var coinInterval = null;
+    
+    function formatTime(seconds) {
+        if (seconds <= 0) return "Expired";
+        var h = Math.floor(seconds / 3600);
+        var m = Math.floor((seconds % 3600) / 60);
+        var s = seconds % 60;
+        return h + "h " + m + "m " + s + "s";
+    }
+
+    function checkStatus() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', apiUrl + '/status', true);
+        xhr.onload = function() {
+            if (xhr.status === 200) {
+                var data = JSON.parse(xhr.responseText);
+                document.getElementById('loading').style.display = 'none';
+                if (data.authenticated) {
+                    document.getElementById('login-section').style.display = 'none';
+                    document.getElementById('connected-section').style.display = 'block';
+                    document.getElementById('client-ip').innerText = data.ip;
+                    document.getElementById('client-mac').innerText = data.mac;
+                    document.getElementById('time-remaining').innerText = formatTime(data.time_remaining);
+                    
+                    // Auto refresh status every 10 seconds to update time
+                    setTimeout(checkStatus, 10000);
+                } else {
+                    document.getElementById('login-section').style.display = 'block';
+                    document.getElementById('connected-section').style.display = 'none';
+                }
+            }
+        };
+        xhr.send();
+    }
+
+    // Coin Logic
+    document.getElementById('insert-coin-btn').addEventListener('click', function() {
+        // Start coin session
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', apiUrl + '/start_coin', true);
+        xhr.onload = function() {
+            if (xhr.status === 200) {
+                document.getElementById('coin-modal').style.display = 'block';
+                document.getElementById('coin-count').innerText = "0";
+                document.getElementById('coin-time').innerText = "0";
+                document.getElementById('connect-btn').style.display = 'none';
+                
+                // Start polling
+                if (coinInterval) clearInterval(coinInterval);
+                coinInterval = setInterval(checkCoins, 1000);
+            }
+        };
+        xhr.send();
+    });
+
+    function checkCoins() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', apiUrl + '/check_coin', true);
+        xhr.onload = function() {
+            if (xhr.status === 200) {
+                var data = JSON.parse(xhr.responseText);
+                document.getElementById('coin-count').innerText = data.count;
+                document.getElementById('coin-time').innerText = data.minutes;
+                
+                if (data.count > 0) {
+                    document.getElementById('connect-btn').style.display = 'inline-block';
+                }
+            }
+        };
+        xhr.send();
+    }
+
+    document.getElementById('connect-btn').addEventListener('click', function() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', apiUrl + '/connect', true);
+        xhr.onload = function() {
+            if (xhr.status === 200) {
+                document.getElementById('coin-modal').style.display = 'none';
+                clearInterval(coinInterval);
+                checkStatus();
+            } else {
+                alert('Connection failed');
+            }
+        };
+        xhr.send();
+    });
+
+    document.getElementById('cancel-btn').addEventListener('click', function() {
+        document.getElementById('coin-modal').style.display = 'none';
+        clearInterval(coinInterval);
+    });
+
+    document.getElementById('logout-btn').addEventListener('click', function() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', apiUrl + '/logout', true);
+        xhr.onload = function() {
+            if (xhr.status === 200) {
+                checkStatus();
+            } else {
+                alert('Logout failed');
+            }
+        };
+        xhr.send();
+    });
+
+    // Initial check
+    checkStatus();
+})();
+</script>
+
+<%+footer%>
