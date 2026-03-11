@@ -1,9 +1,9 @@
 #!/bin/sh
 
-echo "=== INSTALLING PISOWIFI (CGI VERSION) ==="
+echo "=== INSTALLING PISOWIFI ==="
 
-# 1. Ensure Firewall Script is Present
-# Force overwrite to ensure fixes are applied
+# 1. Create Firewall Script
+# This handles Captive Portal Logic + DNS Hijacking
 echo "Creating Firewall Script..."
 cat << 'EOF' > /usr/bin/pisowifi_nftables.sh
 #!/bin/sh
@@ -20,38 +20,22 @@ CHAIN_NAT="pisowifi_nat"
 init() {
     # 0. Disable DNS Rebind Protection (Critical for Captive Portals)
     # The portal domain usually resolves to a local IP (10.0.0.1) which dnsmasq blocks by default.
-    # We only do this on INIT to avoid reloading dnsmasq on every client connect.
     uci set dhcp.@dnsmasq[0].rebind_protection='0'
-    
-    # Only add essential captive portal detection domains
-    # Clean up any existing entries first
-    sed -i '/address=\/.*connecttest/d' /etc/dnsmasq.conf
-    sed -i '/address=\/.*ncsi/d' /etc/dnsmasq.conf
-    sed -i '/address=\/.*gstatic/d' /etc/dnsmasq.conf
-    
-    # Add minimal captive portal detection domains
-    echo "address=/.msftconnecttest.com/10.0.0.1" >> /etc/dnsmasq.conf
-    echo "address=/.connecttest.gstatic.com/10.0.0.1" >> /etc/dnsmasq.conf
-    
     uci commit dhcp
     /etc/init.d/dnsmasq reload
 
-    # 1. FLUSH EVERYTHING FIRST (Crucial for re-declaring chains)
-    # We ignore errors here in case table doesn't exist
+    # 1. FLUSH EVERYTHING
     nft delete table inet $TABLE 2>/dev/null
     
-    # 2. Check and Create Table (if missing)
-    # The 'add table' command is idempotent in nftables (it won't error if exists),
-    # BUT if we flushed it before, we must ensure it's created properly.
+    # 2. Create Table
     nft add table inet $TABLE
     
     # 3. Filter Chain (Forwarding Control)
     # Hook: forward, Priority: -5 (Before OpenWrt default filtering)
     nft add chain inet $TABLE $CHAIN_FILTER { type filter hook forward priority -5 \; policy accept \; }
     
-    # Allow established/related traffic globally in this chain
-    # This is CRITICAL: It allows return traffic from the internet back to the client.
-    # Without this, "ether daddr" matching fails for routed traffic (NAT).
+    # CRITICAL: Allow established/related traffic globally in this chain
+    # This allows return traffic from the internet back to the client.
     nft add rule inet $TABLE $CHAIN_FILTER ct state established,related accept
     
     # 4. NAT Chain (Redirection)
@@ -61,27 +45,22 @@ init() {
     # 5. Postrouting (Masquerade)
     # Hook: postrouting, Priority: 100
     nft add chain inet $TABLE postrouting { type nat hook postrouting priority 100 \; }
-    # Try generic masquerade for non-lan interfaces
-    # Simpler: just masquerade everything leaving the WAN/Uplink
-    # If we don't know the WAN name, we can masquerade everything NOT going to LAN.
+    # Masquerade everything leaving the WAN/Uplink
     nft add rule inet $TABLE postrouting ip saddr 10.0.0.0/8 masquerade
     
     # 6. Input Chain (Allow access to Router Services)
-    # We need to explicitly allow traffic to 10.0.0.1:80 (Portal) and 53 (DNS)
     nft add chain inet $TABLE input { type filter hook input priority 0 \; policy accept \; }
     nft add rule inet $TABLE input tcp dport 80 accept
     nft add rule inet $TABLE input udp dport 53 accept
     nft add rule inet $TABLE input udp dport 67-68 accept
 
     # --- BLOCKING LOGIC ---
-    # Allow DHCP (Always)
-    # NOTE: We ONLY allow local services here. External access is BLOCKED by default below.
+    # Allow DHCP/DNS (Local)
     nft add rule inet $TABLE $CHAIN_FILTER udp dport 67-68 accept
     nft add rule inet $TABLE $CHAIN_FILTER ip daddr $IP accept
     
     # DNS HIJACKING (For Unauthenticated Users)
     # Redirect all DNS queries (UDP/TCP 53) to the local router (10.0.0.1)
-    # This prevents users from using 8.8.8.8 until they are authenticated.
     nft add rule inet $TABLE $CHAIN_NAT udp dport 53 dnat ip to $IP
     nft add rule inet $TABLE $CHAIN_NAT tcp dport 53 dnat ip to $IP
     
@@ -89,8 +68,7 @@ init() {
     nft add rule inet $TABLE $CHAIN_NAT tcp dport 80 dnat ip to $IP:80
     
     # Block everything else for unauthenticated users
-    # We add a rule at the BOTTOM of the filter chain to DROP everything
-    # Authenticated users will have rules inserted ABOVE this.
+    # Authenticated users will have rules inserted ABOVE this via 'allow' function.
     nft add rule inet $TABLE $CHAIN_FILTER drop
 }
 
@@ -101,10 +79,9 @@ allow() {
     nft list table inet $TABLE >/dev/null 2>&1 || init
     
     # Insert rule at TOP to bypass the drop rule
-    # Using 'accept' instead of 'return' to force permit immediately
     nft insert rule inet $TABLE $CHAIN_FILTER ether saddr $MAC accept
     
-    # Insert rule at TOP to bypass redirect
+    # Insert rule at TOP to bypass redirect/hijacking
     nft insert rule inet $TABLE $CHAIN_NAT ether saddr $MAC return
 }
 
@@ -130,12 +107,12 @@ case "$CMD" in
     deny) deny ;;
 esac
 EOF
-    chmod +x /usr/bin/pisowifi_nftables.sh
+chmod +x /usr/bin/pisowifi_nftables.sh
 
-# 2. Ensure Button Script is Present
-if [ ! -f "/etc/rc.button/wps" ]; then
-    echo "Creating Button Script..."
-    cat << 'EOF' > /etc/rc.button/wps
+# 2. Create Button Script (Coin Insert)
+echo "Creating Button Script..."
+if [ ! -d "/etc/rc.button" ]; then mkdir -p /etc/rc.button; fi
+cat << 'EOF' > /etc/rc.button/wps
 #!/bin/sh
 [ "$ACTION" = "pressed" ] || exit 0
 FILE="/tmp/pisowifi_coins"
@@ -145,51 +122,15 @@ COUNT=$((COUNT + 1))
 echo "$COUNT" > "$FILE"
 logger -t pisowifi "Coin inserted via WPS button. Total: $COUNT"
 EOF
-    chmod +x /etc/rc.button/wps
-fi
+chmod +x /etc/rc.button/wps
 
-# 3. Create Main CGI Script (The Controller)
-# This handles ALL logic: Serving the page, API requests, Coin checks.
-# Stop uhttpd temporarily to avoid "Text file busy" error
-echo "Stopping web server temporarily..."
-/etc/init.d/uhttpd stop 2>/dev/null
-sleep 2
-
+# 3. Create Main CGI Script (Controller + UI)
+echo "Creating CGI Controller..."
+if [ ! -d "/www/cgi-bin" ]; then mkdir -p /www/cgi-bin; fi
 cat << 'EOF' > /www/cgi-bin/pisowifi
 #!/bin/sh
 
-# Simple captive portal detection - only check for specific known detection URLs
-REQUEST_URI="${REQUEST_URI:-}"
-
-# Check for common captive portal detection URLs and return success
-# This prevents devices from thinking they have internet when they don't
-if echo "$REQUEST_URI" | grep -q "generate_204"; then
-    # Android/Google connectivity check - return 204 to indicate no internet
-    echo "Status: 204 No Content"
-    echo "Content-type: text/plain"
-    echo ""
-    exit 0
-fi
-
-if echo "$REQUEST_URI" | grep -q "connecttest.txt"; then
-    # Microsoft Windows connectivity check - return success but no real content
-    echo "HTTP/1.1 200 OK"
-    echo "Content-Type: text/plain"
-    echo ""
-    echo "Microsoft Connect Test - No Internet"
-    exit 0
-fi
-
-if echo "$REQUEST_URI" | grep -q "ncsi.txt"; then
-    # Microsoft NCSI check - return success but no real content
-    echo "HTTP/1.1 200 OK"
-    echo "Content-Type: text/plain"
-    echo ""
-    echo "Microsoft NCSI - No Internet"
-    exit 0
-fi
-
-# Set Content-Type for normal requests
+# Set Content-Type
 echo "Content-type: text/html"
 echo ""
 
@@ -223,7 +164,6 @@ handle_api() {
     case "$QUERY_STRING" in
         "action=status")
             # Check firewall status
-            # Use nft to check if table exists, if not init
             nft list table inet pisowifi >/dev/null 2>&1 || $FIREWALL_SCRIPT init
             
             AUTH="false"
@@ -234,13 +174,11 @@ handle_api() {
                 NOW=$(date +%s)
                 
                 # Check for integer overflow or empty expiry
-                # Using string comparison for basic validation
                 if [ -n "$EXPIRY" ] && [ "$EXPIRY" -eq "$EXPIRY" ] 2>/dev/null; then
                      if [ "$EXPIRY" -gt "$NOW" ]; then
                         AUTH="true"
                         TIME_REMAINING=$((EXPIRY - NOW))
                         # Ensure rule exists in NFT
-                        # Add error suppression to prevent log noise if chain missing
                         nft list chain inet pisowifi pisowifi_filter >/dev/null 2>&1
                         if [ $? -eq 0 ]; then
                             nft list chain inet pisowifi pisowifi_filter | grep -q "$MAC" || $FIREWALL_SCRIPT allow "$MAC"
@@ -251,6 +189,7 @@ handle_api() {
                      fi
                 fi
             fi
+            
             json_response "{\"authenticated\": $AUTH, \"time_remaining\": $TIME_REMAINING, \"mac\": \"$MAC\", \"ip\": \"$REMOTE_ADDR\"}"
             ;;
             
@@ -316,8 +255,6 @@ handle_api() {
             STATUS=$(echo "$QUERY_STRING" | grep -o "status=[^&]*" | cut -d= -f2)
             CLIENT_MAC=$(echo "$QUERY_STRING" | grep -o "mac=[^&]*" | cut -d= -f2 | sed 's/%3A/:/g')
             
-            # Simple rate limiting: Only log if status changed or every few minutes?
-            # For now, just log it. Use logger so it shows in logread.
             if [ "$STATUS" = "ONLINE" ]; then
                 logger -t pisowifi "INTERNET CHECK: Client $CLIENT_MAC is ONLINE ✅"
             else
@@ -397,8 +334,6 @@ function formatTime(s) {
 function checkInternet() {
     var img = new Image();
     var now = new Date().getTime();
-    // Use a reliable image source. Google Logo is good.
-    // We add a random query param to prevent caching.
     img.src = "https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png?t=" + now;
     
     img.onload = function() {
@@ -407,7 +342,6 @@ function checkInternet() {
             el.innerText = "Internet: ONLINE ✅";
             el.style.color = "green";
         }
-        // Send status back to server for logging
         fetch(apiUrl + "?action=log_internet&status=ONLINE&mac=" + encodeURIComponent(document.getElementById("client-mac") ? document.getElementById("client-mac").innerText : "UNKNOWN"));
     };
     
@@ -417,7 +351,6 @@ function checkInternet() {
             el.innerText = "Internet: OFFLINE ❌ (Check Connection)";
             el.style.color = "red";
         }
-        // Send status back to server for logging
         fetch(apiUrl + "?action=log_internet&status=OFFLINE&mac=" + encodeURIComponent(document.getElementById("client-mac") ? document.getElementById("client-mac").innerText : "UNKNOWN"));
     };
 }
@@ -432,10 +365,7 @@ function checkStatus() {
             document.getElementById("connected-section").style.display = "block";
             document.getElementById("time-remaining").innerText = formatTime(data.time_remaining);
             if(data.mac) document.getElementById("client-mac").innerText = data.mac;
-            
-            // Check internet status every time we update status (every 5s)
             checkInternet();
-            
             setTimeout(checkStatus, 5000);
         } else {
             document.getElementById("login-section").style.display = "block";
@@ -486,7 +416,6 @@ function closeModal() {
 
 checkStatus();
 </script>
-
 </body>
 </html>
 HTML
@@ -507,34 +436,4 @@ cat << 'EOF' > /www/index.html
 </html>
 EOF
 
-# Restart uhttpd after CGI script creation
-echo "Restarting web server..."
-/etc/init.d/uhttpd start 2>/dev/null
-
-echo "=== CGI INSTALLATION COMPLETE ==="
-echo "Access at http://10.0.0.1/cgi-bin/pisowifi"
-
-# 5. SETUP NETWORK & WIFI (SSID: NEXI-FI PISOWIFI)
-echo "Configuring Network and WiFi..."
-
-# Set LAN IP to 10.0.0.1
-uci set network.lan.ipaddr='10.0.0.1'
-uci commit network
-
-# Enable WiFi Radio
-uci set wireless.radio0.disabled='0'
-
-# Configure WiFi Interface (SSID: NEXI-FI PISOWIFI, Open)
-uci set wireless.@wifi-iface[0].device='radio0'
-uci set wireless.@wifi-iface[0].network='lan'
-uci set wireless.@wifi-iface[0].mode='ap'
-uci set wireless.@wifi-iface[0].ssid='NEXI-FI PISOWIFI'
-uci set wireless.@wifi-iface[0].encryption='none'
-uci set wireless.@wifi-iface[0].disabled='0'
-uci commit wireless
-
-echo "Restarting Network..."
-/etc/init.d/network restart
-/sbin/wifi reload
-
-echo "Network Configured: IP 10.0.0.1, SSID 'NEXI-FI PISOWIFI'"
+echo "=== INSTALLATION COMPLETE ==="
