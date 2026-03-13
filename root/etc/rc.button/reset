@@ -10,7 +10,7 @@ sqlite3 $DB_FILE "INSERT INTO coins (mac, coins) VALUES ('00:00:00:00:00:00', 1)
 COUNT=$(sqlite3 $DB_FILE "SELECT SUM(coins) FROM coins WHERE mac='00:00:00:00:00:00'")
 
 # Log for debugging
-logger -t pisowifi "Coin inserted via WPS button. Total: $COUNT"
+logger -t pisowifi "Coin inserted via RESET button. Total: $COUNT"
 
 # Ensure permissions are correct just in case they were reset
 chmod 666 $DB_FILE
