@@ -58,6 +58,35 @@
         return h + "h " + m + "m " + s + "s";
     }
 
+    function checkLicenseStatus() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', apiUrl + '/license_check', true);
+        xhr.onload = function() {
+            if (xhr.status === 200) {
+                var data = JSON.parse(xhr.responseText);
+                if (data.status === 'trial_created') {
+                    // Trial was created, now check main status
+                    checkStatus();
+                } else if (data.status === 'valid') {
+                    // License is valid, check main status
+                    checkStatus();
+                } else {
+                    // License is invalid
+                    document.getElementById('loading').style.display = 'none';
+                    document.getElementById('status-message').innerHTML = '<div style="color: red; padding: 10px; border: 1px solid red; background-color: #ffe6e6;">' + 
+                        '<h3>License Required</h3>' + 
+                        '<p>' + (data.message || 'License is invalid or expired') + '</p>' +
+                        '<p><a href="<%=luci.dispatcher.build_url("admin", "pisowifi", "license")%>" style="color: blue;">Go to License Management</a></p>' +
+                        '</div>';
+                }
+            } else {
+                // Error checking license, still allow access (fallback)
+                checkStatus();
+            }
+        };
+        xhr.send();
+    }
+
     function checkStatus() {
         var xhr = new XMLHttpRequest();
         xhr.open('GET', apiUrl + '/status', true);
@@ -153,8 +182,8 @@
         xhr.send();
     });
 
-    // Initial check
-    checkStatus();
+    // Initial check - check license first, then status
+    checkLicenseStatus();
 })();
 </script>
 

@@ -4,6 +4,7 @@ local sys = require "luci.sys"
 local http = require "luci.http"
 local util = require "luci.util"
 local json = require "luci.jsonc"
+local license_model = require "luci.model.pisowifi_license"
 
 -- Define constants
 local CHAIN_NAME = "PISOWIFI_AUTH"
@@ -27,10 +28,16 @@ function index()
 	entry({"pisowifi", "api", "check_coin"}, call("api_check_coin"), nil).sysauth = false
 	entry({"pisowifi", "api", "connect"}, call("api_connect"), nil).sysauth = false
 	
+	-- License API endpoints
+	entry({"pisowifi", "api", "license_check"}, call("api_license_check"), nil).sysauth = false
+	entry({"pisowifi", "api", "license_activate"}, call("api_license_activate"), nil).sysauth = false
+	entry({"pisowifi", "api", "license_status"}, call("api_license_status"), nil).sysauth = false
+	
 	-- Admin Dashboard (Protected)
 	entry({"admin", "pisowifi"}, alias("admin", "pisowifi", "dashboard"), "PisoWifi Admin", 60)
 	entry({"admin", "pisowifi", "dashboard"}, template("pisowifi/admin"), "Dashboard", 1)
-	entry({"admin", "pisowifi", "users"}, call("action_users"), "Users", 2)
+	entry({"admin", "pisowifi", "settings"}, cbi("pisowifi/settings"), "Settings", 2)
+	entry({"admin", "pisowifi", "users"}, call("action_users"), "Users", 3)
 	entry({"admin", "pisowifi", "kick"}, call("action_kick"), nil)
 end
 
@@ -128,6 +135,17 @@ function api_connect()
 		return
 	end
 	
+	-- Check license first
+	local hardware_id = license_model.get_hardware_id()
+	local license_data = license_model.get_license_status(hardware_id)
+	local is_license_valid, license_message = license_model.is_license_valid(license_data)
+	
+	if not is_license_valid then
+		http.status(403, "Forbidden")
+		http.write_json({error = "License invalid: " .. license_message})
+		return
+	end
+	
 	local count = read_coin_count()
 	if count <= 0 then
 		http.status(400, "Bad Request")
@@ -182,6 +200,25 @@ function api_status()
 	local authenticated = false
 	local time_remaining = 0
 	
+	-- Check license first
+	local hardware_id = license_model.get_hardware_id()
+	local license_data = license_model.get_license_status(hardware_id)
+	local is_license_valid, license_message = license_model.is_license_valid(license_data)
+	
+	if not is_license_valid then
+		-- License is invalid or expired
+		http.prepare_content("application/json")
+		http.write_json({
+			authenticated = false,
+			time_remaining = 0,
+			mac = mac,
+			ip = http.getenv("REMOTE_ADDR"),
+			license_status = "invalid",
+			license_message = license_message
+		})
+		return
+	end
+	
 	-- Check if firewall initialized, if not init it (for status check from captive portal)
 	-- init_firewall() -- Maybe too heavy to call on every status check?
 	-- Let's check if chain exists using iptables -C
@@ -223,7 +260,9 @@ function api_status()
 		authenticated = authenticated,
 		time_remaining = time_remaining,
 		mac = mac,
-		ip = http.getenv("REMOTE_ADDR")
+		ip = http.getenv("REMOTE_ADDR"),
+		license_status = "valid",
+		license_message = license_message
 	})
 end
 

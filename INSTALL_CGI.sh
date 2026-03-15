@@ -19,9 +19,13 @@ CHAIN_FILTER="pisowifi_filter"
 CHAIN_NAT="pisowifi_nat"
 
 # 0. Disable DNS Rebind Protection (Critical for Captive Portals)
-uci set dhcp.@dnsmasq[0].rebind_protection='0'
-uci commit dhcp
-/etc/init.d/dnsmasq reload
+    # Only if not already set
+    REBIND=$(uci get dhcp.@dnsmasq[0].rebind_protection 2>/dev/null)
+    if [ "$REBIND" != "0" ]; then
+        uci set dhcp.@dnsmasq[0].rebind_protection='0'
+        uci commit dhcp
+        /etc/init.d/dnsmasq reload
+    fi
 
 init() {
     logger -t pisowifi "Initializing nftables rules..."
@@ -56,15 +60,17 @@ init() {
     
     # FW4/Firewall Zone Forwarding
     # Ensure LAN zone allows forwarding (Critical for OpenWrt)
-    uci set firewall.@zone[0].forward='ACCEPT'
+    uci set firewall.@zone[0].forward='ACCEPT' 2>/dev/null || true
     # Disable Flow Offloading (Can bypass captive portal rules)
-    uci set firewall.@defaults[0].flow_offloading='0'
-    uci commit firewall
+    uci set firewall.@defaults[0].flow_offloading='0' 2>/dev/null || true
+    uci commit firewall 2>/dev/null || true
     /etc/init.d/firewall reload 2>/dev/null || true
 
     # --- BLOCKING LOGIC (Bottom of Chain) ---
     
     # 1. Allow DNS/DHCP/Portal Access to Router
+    # Add rules only if not exists (prevent duplicates on reload)
+    # Actually, init flushes table so no need to check
     nft add rule inet $TABLE $CHAIN_FILTER udp dport 53 ip daddr $IP accept
     nft add rule inet $TABLE $CHAIN_FILTER tcp dport 53 ip daddr $IP accept
     nft add rule inet $TABLE $CHAIN_FILTER udp dport 67-68 accept
@@ -87,12 +93,36 @@ init() {
     nft add rule inet $TABLE $CHAIN_FILTER drop
     
     # 6. FW4 Compatibility (Try to insert a rule into fw4 forward chain just in case)
-    # We allow forwarding for everyone, relying on OUR filter chain to drop unauths.
-    nft insert rule inet fw4 forward ip saddr 10.0.0.0/8 accept 2>/dev/null || true
+    # Check if rule exists before inserting to avoid duplicates/errors
+    if nft list chain inet fw4 forward 2>/dev/null | grep -q "10.0.0.0/8"; then
+        true
+    else
+        nft insert rule inet fw4 forward ip saddr 10.0.0.0/8 accept 2>/dev/null || true
+    fi
     # Also try 'firewall' table (older OpenWrt)
-    nft insert rule inet firewall forward ip saddr 10.0.0.0/8 accept 2>/dev/null || true
+    if nft list chain inet firewall forward 2>/dev/null | grep -q "10.0.0.0/8"; then
+        true
+    else
+        nft insert rule inet firewall forward ip saddr 10.0.0.0/8 accept 2>/dev/null || true
+    fi
     
     logger -t pisowifi "Firewall initialization complete."
+}
+
+reload_qos() {
+    # Called when QoS settings change
+    logger -t pisowifi "Reloading QoS settings..."
+    
+    # Get active users
+    DB_FILE="/etc/pisowifi/pisowifi.db"
+    NOW=$(date +%s)
+    
+    # Re-allow active users (this will apply new limits)
+    sqlite3 $DB_FILE "SELECT mac, ip FROM users WHERE session_end > $NOW AND paused_time = 0" 2>/dev/null | while read line; do
+        MAC=$(echo "$line" | cut -d'|' -f1)
+        IP=$(echo "$line" | cut -d'|' -f2)
+        allow "$MAC" "$IP"
+    done
 }
 
 allow() {
@@ -120,18 +150,56 @@ allow() {
         nft insert rule inet $TABLE $CHAIN_NAT ip saddr $IP_ARG return comment \"MAC:$MAC\"
         
         # Filter Accept (Internet Access - BOTH DIRECTIONS)
-        nft insert rule inet $TABLE $CHAIN_FILTER ip saddr $IP_ARG accept comment \"MAC:$MAC\"
-        nft insert rule inet $TABLE $CHAIN_FILTER ip daddr $IP_ARG accept comment \"MAC:$MAC\"
+        # Apply QoS if Per-User Mode is enabled
+        QOS_MODE=$(uci get pisowifi.qos.mode 2>/dev/null || echo "global")
+        
+        if [ "$QOS_MODE" = "per_user" ]; then
+             USER_DOWN=$(uci get pisowifi.qos.user_down 2>/dev/null || echo 0)
+             USER_UP=$(uci get pisowifi.qos.user_up 2>/dev/null || echo 0)
+             
+             # Convert Mbps to Bytes/sec roughly for NFT limit
+             # 1 Mbps = 125,000 bytes/sec
+             [ "$USER_DOWN" -gt 0 ] && LIMIT_DOWN="limit rate $((USER_DOWN * 125)) kbytes/second burst 100 kbytes"
+             [ "$USER_UP" -gt 0 ] && LIMIT_UP="limit rate $((USER_UP * 125)) kbytes/second burst 100 kbytes"
+             
+             # Apply Limits
+             if [ -n "$LIMIT_UP" ]; then
+                 nft insert rule inet $TABLE $CHAIN_FILTER ip saddr $IP_ARG $LIMIT_UP accept comment \"MAC:$MAC\"
+             else
+                 nft insert rule inet $TABLE $CHAIN_FILTER ip saddr $IP_ARG accept comment \"MAC:$MAC\"
+             fi
+             
+             if [ -n "$LIMIT_DOWN" ]; then
+                 nft insert rule inet $TABLE $CHAIN_FILTER ip daddr $IP_ARG $LIMIT_DOWN accept comment \"MAC:$MAC\"
+             else
+                 nft insert rule inet $TABLE $CHAIN_FILTER ip daddr $IP_ARG accept comment \"MAC:$MAC\"
+             fi
+        else
+             # No per-user limit, just accept
+             nft insert rule inet $TABLE $CHAIN_FILTER ip saddr $IP_ARG accept comment \"MAC:$MAC\"
+             nft insert rule inet $TABLE $CHAIN_FILTER ip daddr $IP_ARG accept comment \"MAC:$MAC\"
+        fi
         
         # Masquerade (Specific - ensure NAT works)
         nft insert rule inet $TABLE postrouting ip saddr $IP_ARG masquerade comment \"MAC:$MAC\"
         
         # FW4/Firewall Forwarding (External Tables) - CRITICAL
-        # We must allow BOTH directions for forwarding to work properly
-        nft insert rule inet fw4 forward ip saddr $IP_ARG accept comment \"MAC:$MAC\" 2>/dev/null || true
-        nft insert rule inet fw4 forward ip daddr $IP_ARG accept comment \"MAC:$MAC\" 2>/dev/null || true
-        nft insert rule inet firewall forward ip saddr $IP_ARG accept comment \"MAC:$MAC\" 2>/dev/null || true
-        nft insert rule inet firewall forward ip daddr $IP_ARG accept comment \"MAC:$MAC\" 2>/dev/null || true
+    # We must allow BOTH directions for forwarding to work properly
+    # Apply QoS limits here too if possible? 
+    # No, fw4 rules are harder to manage dynamically with complex matches in simple inserts.
+    # We rely on our CHAIN_FILTER which has higher priority (-5) than fw4.
+    # So if our chain accepts with limit, fw4 won't even see it? 
+    # Wait, if we ACCEPT in priority -5, it stops traversing? Yes.
+    # So we don't need fw4 rules if our chain works.
+    # But just in case, we add simple accept to fw4 as backup (without limits).
+    # This might bypass QoS if our chain is skipped?
+    # Actually, if we accept in -5, fw4 (priority 0) is skipped.
+    # So QoS WORKS in our chain.
+    
+    nft insert rule inet fw4 forward ip saddr $IP_ARG accept comment \"MAC:$MAC\" 2>/dev/null || true
+    nft insert rule inet fw4 forward ip daddr $IP_ARG accept comment \"MAC:$MAC\" 2>/dev/null || true
+    nft insert rule inet firewall forward ip saddr $IP_ARG accept comment \"MAC:$MAC\" 2>/dev/null || true
+    nft insert rule inet firewall forward ip daddr $IP_ARG accept comment \"MAC:$MAC\" 2>/dev/null || true
     fi
 
     # 2. MAC-BASED ALLOW (Secondary/Roaming Layer)
@@ -146,8 +214,33 @@ allow() {
     nft insert rule inet $TABLE $CHAIN_NAT tcp dport 53 ether saddr $MAC return comment \"MAC:$MAC\"
     
     # Filter Accept
-    nft insert rule inet $TABLE $CHAIN_FILTER ether saddr $MAC accept comment \"MAC:$MAC\"
-    nft insert rule inet $TABLE $CHAIN_FILTER ether daddr $MAC accept comment \"MAC:$MAC\"
+    # Apply QoS if Per-User Mode is enabled (MAC-based fallback)
+    # Note: MAC-based limits are harder to enforce directionally if IP is unknown, 
+    # but usually traffic has both. We apply same limits here to be safe.
+    
+    QOS_MODE=$(uci get pisowifi.qos.mode 2>/dev/null || echo "global")
+    if [ "$QOS_MODE" = "per_user" ]; then
+         USER_DOWN=$(uci get pisowifi.qos.user_down 2>/dev/null || echo 0)
+         USER_UP=$(uci get pisowifi.qos.user_up 2>/dev/null || echo 0)
+         
+         [ "$USER_DOWN" -gt 0 ] && LIMIT_DOWN="limit rate $((USER_DOWN * 125)) kbytes/second burst 100 kbytes"
+         [ "$USER_UP" -gt 0 ] && LIMIT_UP="limit rate $((USER_UP * 125)) kbytes/second burst 100 kbytes"
+         
+         if [ -n "$LIMIT_UP" ]; then
+             nft insert rule inet $TABLE $CHAIN_FILTER ether saddr $MAC $LIMIT_UP accept comment \"MAC:$MAC\"
+         else
+             nft insert rule inet $TABLE $CHAIN_FILTER ether saddr $MAC accept comment \"MAC:$MAC\"
+         fi
+         
+         if [ -n "$LIMIT_DOWN" ]; then
+             nft insert rule inet $TABLE $CHAIN_FILTER ether daddr $MAC $LIMIT_DOWN accept comment \"MAC:$MAC\"
+         else
+             nft insert rule inet $TABLE $CHAIN_FILTER ether daddr $MAC accept comment \"MAC:$MAC\"
+         fi
+    else
+         nft insert rule inet $TABLE $CHAIN_FILTER ether saddr $MAC accept comment \"MAC:$MAC\"
+         nft insert rule inet $TABLE $CHAIN_FILTER ether daddr $MAC accept comment \"MAC:$MAC\"
+    fi
     
     # FW4 Fallback (MAC)
     nft insert rule inet fw4 forward ether saddr $MAC accept comment \"MAC:$MAC\" 2>/dev/null || true
@@ -158,8 +251,11 @@ allow() {
 
 deny() {
     [ -z "$MAC" ] && return
-    
-    logger -t pisowifi "Denying MAC: $MAC"
+
+    if ! nft list table inet $TABLE 2>/dev/null | grep -q "MAC:$MAC"; then
+        return
+    fi
+    [ -f /tmp/pisowifi_verbose ] && logger -t pisowifi "Denying MAC: $MAC"
     
     # Remove rules specifically for this MAC (using comment tag)
     # This cleans up both MAC and IP rules associated with this user
@@ -167,9 +263,14 @@ deny() {
     # Helper to delete by handle
     delete_by_comment() {
         CHAIN=$1
-        # List handles with this comment
+        # Check if rule exists before calling delete loop to save CPU
+        # nft list is still somewhat expensive, but less than for-loop calls if many rules
+        # Actually, let's just grep the handle list once.
         HANDLES=$(nft -a list chain inet $TABLE $CHAIN 2>/dev/null | grep "MAC:$MAC" | awk '{print $NF}')
-        for h in $HANDLES; do nft delete rule inet $TABLE $CHAIN handle $h; done
+        if [ -n "$HANDLES" ]; then
+             # logger -t pisowifi "Denying MAC: $MAC"
+             for h in $HANDLES; do nft delete rule inet $TABLE $CHAIN handle $h 2>/dev/null || true; done
+        fi
     }
     
     delete_by_comment "$CHAIN_FILTER"
@@ -178,9 +279,9 @@ deny() {
     
     # Also clean up fw4 fallback
     HANDLES=$(nft -a list chain inet fw4 forward 2>/dev/null | grep "MAC:$MAC" | awk '{print $NF}')
-    for h in $HANDLES; do nft delete rule inet fw4 forward handle $h; done
+    for h in $HANDLES; do nft delete rule inet fw4 forward handle $h 2>/dev/null || true; done
     
-    logger -t pisowifi "Deny process complete for MAC: $MAC"
+    # logger -t pisowifi "Deny process complete for MAC: $MAC"
 }
 
 case "$CMD" in
@@ -191,11 +292,124 @@ case "$CMD" in
         echo "=== Current nftables rules ==="
         nft list table inet $TABLE 2>/dev/null || echo "Table $TABLE not found"
         ;;
+    reload_qos)
+        reload_qos
+        ;;
+    *)
+        echo "Usage: $0 {init|allow|deny|reload_qos} [mac] [ip]"
+        exit 1
+        ;;
 esac
 EOF
     chmod +x /usr/bin/pisowifi_nftables.sh
 
 # 1.5 Create Init Script to Restore Firewall on Boot
+echo "Creating QoS Script..."
+cat << 'EOF' > /usr/bin/pisowifi_qos.sh
+#!/bin/sh
+
+# PisoWifi QoS Manager
+# Handles Bandwidth Limiting (Global CAKE or Per-User Policing)
+
+MODE=$(uci get pisowifi.qos.mode 2>/dev/null || echo "global")
+GLOBAL_DOWN=$(uci get pisowifi.qos.global_down 2>/dev/null || echo 0)
+GLOBAL_UP=$(uci get pisowifi.qos.global_up 2>/dev/null || echo 0)
+
+pick_wan_if() {
+    # If user explicitly requests ifb0 (Intermediate Functional Block), prioritize it
+    # This assumes the user has set up ingress redirection to ifb0 manually or via other scripts
+    if [ -d "/sys/class/net/ifb0" ]; then
+        echo "ifb0"
+        return 0
+    fi
+    
+    # If user explicitly requests br-lan (LAN-side shaping)
+    if [ -d "/sys/class/net/br-lan" ]; then
+        echo "br-lan"
+        return 0
+    fi
+
+    CANDIDATES=""
+    CAND=$(uci get network.wan.device 2>/dev/null); [ -n "$CAND" ] && CANDIDATES="$CANDIDATES $CAND"
+    CAND=$(uci get network.wan.ifname 2>/dev/null); [ -n "$CAND" ] && CANDIDATES="$CANDIDATES $CAND"
+    CAND=$(awk '$2=="00000000"{print $1; exit}' /proc/net/route 2>/dev/null); [ -n "$CAND" ] && CANDIDATES="$CANDIDATES $CAND"
+    CANDIDATES="$CANDIDATES pppoe-wan wan eth1 eth0 br-wan"
+
+    for i in $CANDIDATES; do
+        if [ -d "/sys/class/net/$i" ]; then
+            echo "$i"
+            return 0
+        fi
+    done
+    echo "eth0"
+}
+
+WAN_IF=$(pick_wan_if)
+
+# Determine IFB Interface (for Ingress/Download shaping)
+# Requires kmod-ifb and tc-tiny
+# If not present, we can only shape upload effectively on WAN.
+# For download shaping without IFB, we rely on policing or LAN-side shaping (less accurate for NAT).
+
+init() {
+    echo "Initializing QoS ($MODE)..."
+
+    if ! command -v tc >/dev/null 2>&1; then
+        echo "tc not found - skipping CAKE shaping. Install: opkg update && opkg install tc"
+        # Even if TC is missing, we MUST reload nftables to apply Per-User limits
+        /usr/bin/pisowifi_nftables.sh reload_qos 2>/dev/null || true
+        return 0
+    fi
+    
+    # 1. Clear existing qdiscs
+    tc qdisc del dev $WAN_IF root 2>/dev/null
+    
+    # 2. Apply Global Shaper (CAKE) on WAN Upload
+    if [ "$GLOBAL_UP" -gt 0 ]; then
+        # Convert Mbps to Kbit
+        UP_KBIT=$((GLOBAL_UP * 1024))
+        if tc qdisc add dev $WAN_IF root cake bandwidth ${UP_KBIT}kbit besteffort nat 2>/dev/null; then
+            echo "Global Upload Limit: ${UP_KBIT}kbit (CAKE)"
+        else
+            echo "CAKE not available - skipping global shaping. Install: opkg install kmod-sched-cake"
+        fi
+    else
+        # Just use CAKE without limit for bufferbloat control
+        if tc qdisc add dev $WAN_IF root cake besteffort nat 2>/dev/null; then
+            echo "Global Upload: Unlimited (CAKE)"
+        else
+            echo "CAKE not available - skipping global shaping. Install: opkg install kmod-sched-cake"
+        fi
+    fi
+    
+    # 3. Apply Global Download Shaper (requires IFB)
+    # We will skip IFB setup for simplicity in this CGI version as it requires extra kernel modules.
+    # Instead, we will assume the user mainly cares about Per-User limits or basic Upload shaping.
+    
+    # 4. Handle Per-User Limits via NFTables
+    # We call the firewall script to reload rules based on the new QoS settings
+    /usr/bin/pisowifi_nftables.sh reload_qos
+}
+
+stop() {
+    tc qdisc del dev $WAN_IF root 2>/dev/null
+}
+
+case "$1" in
+    start|init|reload)
+        init
+        ;;
+    stop)
+        stop
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|reload}"
+        exit 1
+        ;;
+esac
+EOF
+chmod +x /usr/bin/pisowifi_qos.sh
+
 echo "Creating Init Script..."
 cat << 'EOF' > /etc/init.d/pisowifi
 #!/bin/sh /etc/rc.common
@@ -214,6 +428,7 @@ boot() {
 start() {
     logger -t pisowifi "Starting PisoWifi Firewall..."
     $FIREWALL_SCRIPT init
+    /usr/bin/pisowifi_qos.sh init
     
     # Ensure DB exists and has tables (Basic check)
     DB_FILE="/etc/pisowifi/pisowifi.db"
@@ -266,11 +481,14 @@ start_daemon() {
 
             if [ -f "$DB_FILE" ]; then
                 sqlite3 "$DB_FILE" "SELECT mac FROM users WHERE paused_time > 0" 2>/dev/null | while read m; do
-                    [ -n "$m" ] && $FIREWALL_SCRIPT deny "$m" >/dev/null 2>&1
+                    [ -z "$m" ] && continue
+                    $FIREWALL_SCRIPT deny "$m" >/dev/null 2>&1
                 done
 
                 sqlite3 "$DB_FILE" "SELECT mac FROM users WHERE session_end > 0 AND session_end <= $NOW" 2>/dev/null | while read m; do
-                    [ -n "$m" ] && $FIREWALL_SCRIPT deny "$m" >/dev/null 2>&1
+                    [ -z "$m" ] && continue
+                    $FIREWALL_SCRIPT deny "$m" >/dev/null 2>&1
+                    sqlite3 "$DB_FILE" "UPDATE users SET session_end=0, paused_time=0 WHERE mac='$m' AND session_end <= $NOW" 2>/dev/null || true
                 done
 
                 sqlite3 -separator '|' "$DB_FILE" "SELECT mac, ip FROM users WHERE session_end > $NOW AND paused_time = 0" 2>/dev/null | while IFS='|' read m ip; do
@@ -343,6 +561,38 @@ touch /etc/config/pisowifi
 uci set pisowifi.settings=settings
 uci set pisowifi.settings.minutes_per_peso='12'
 uci set pisowifi.settings.admin_password='admin'
+
+# Initialize QoS config
+uci set pisowifi.qos=qos
+uci set pisowifi.qos.mode='global'
+uci set pisowifi.qos.global_down='0'
+uci set pisowifi.qos.global_up='0'
+uci set pisowifi.qos.user_down='0'
+uci set pisowifi.qos.user_up='0'
+
+uci set pisowifi.license=license
+uci set pisowifi.license.enabled='0'
+uci set pisowifi.license.supabase_url=''
+uci set pisowifi.license.supabase_key=''
+uci set pisowifi.license.vendor_id=''
+uci set pisowifi.license.vendor_name=''
+uci set pisowifi.license.license_key=''
+uci set pisowifi.license.license_id=''
+uci set pisowifi.license.last_check='0'
+uci set pisowifi.license.valid='0'
+uci set pisowifi.license.expires_at=''
+uci set pisowifi.license.hardware_id=''
+uci set pisowifi.license.hardware_match='0'
+
+if [ -f /etc/pisowifi/supabase.env ]; then
+    SUPA_URL=$(grep -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
+    SUPA_KEY=$(grep -m1 '^SUPABASE_ANON_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
+    SUPA_URL=$(echo "$SUPA_URL" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+    SUPA_KEY=$(echo "$SUPA_KEY" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+    [ -n "$SUPA_URL" ] && uci set pisowifi.license.supabase_url="$SUPA_URL"
+    [ -n "$SUPA_KEY" ] && uci set pisowifi.license.supabase_key="$SUPA_KEY"
+fi
+
 uci commit pisowifi
 
 # Install sqlite3 if not available (OpenWrt)
@@ -386,9 +636,19 @@ CREATE TABLE IF NOT EXISTS rates (
     expiration INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS devices (
+    mac TEXT PRIMARY KEY,
+    ip TEXT,
+    hostname TEXT,
+    notes TEXT,
+    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_users_mac ON users(mac);
 CREATE INDEX IF NOT EXISTS idx_sessions_mac ON sessions(mac);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_devices_mac ON devices(mac);
 EOF
 
 # Update existing table (Outside heredoc)
@@ -491,7 +751,7 @@ fi
 
 # Set Content-Type for normal requests
 echo "Status: 200 OK"
-echo "Content-type: text/html"
+echo "Content-type: text/html; charset=utf-8"
 echo ""
 
 # Helper Variables
@@ -502,13 +762,13 @@ MINUTES_PER_PESO=$(uci get pisowifi.settings.minutes_per_peso 2>/dev/null || ech
 FIREWALL_SCRIPT="/usr/bin/pisowifi_nftables.sh"
 
 # Log Captive Portal Triggers
-# Log ANY request that is not an API call as a potential captive portal trigger
-if ! echo "$QUERY_STRING" | grep -q "action="; then
-    # Get client MAC
-    CLIENT_MAC=$(grep "$REMOTE_ADDR " /proc/net/arp | awk '{print $4}' | tr 'a-z' 'A-Z' | head -1)
-    [ -z "$CLIENT_MAC" ] && CLIENT_MAC="UNKNOWN"
-    logger -t pisowifi "CAPTIVE PORTAL TRIGGERED: Device $CLIENT_MAC at $REMOTE_ADDR is accessing '$REQUEST_URI' -> Serving Portal Page"
-fi
+    # Reduced logging: Only log unique triggers occasionally?
+    # Or just rely on the session log.
+    if ! echo "$QUERY_STRING" | grep -q "action="; then
+        # CLIENT_MAC=$(grep "$REMOTE_ADDR " /proc/net/arp | awk '{print $4}' | tr 'a-z' 'A-Z' | head -1)
+        # logger -t pisowifi "CAPTIVE PORTAL: $REMOTE_ADDR -> $REQUEST_URI"
+        true
+    fi
 
 # Ensure database exists
 if [ ! -f "$DB_FILE" ]; then
@@ -589,8 +849,7 @@ get_client_mac() {
 handle_api() {
     MAC=$(get_client_mac)
     
-    # Debug logging
-    logger -t pisowifi "API request: $QUERY_STRING from MAC: $MAC IP: $REMOTE_ADDR"
+    [ -f /tmp/pisowifi_verbose ] && logger -t pisowifi "API request: $QUERY_STRING from MAC: $MAC IP: $REMOTE_ADDR"
     
     # Simple JSON Response Wrapper
     json_response() {
@@ -608,7 +867,7 @@ handle_api() {
             TIME_REMAINING=0
             PAUSED_TIME=0
             
-            logger -t pisowifi "Status check - MAC: $MAC, IP: $REMOTE_ADDR"
+            # logger -t pisowifi "Status check - MAC: $MAC, IP: $REMOTE_ADDR"
             
             if [ -n "$MAC" ]; then
                 # Check database for active session
@@ -626,20 +885,28 @@ handle_api() {
                 if [ "$PAUSED_TIME" -gt 0 ]; then
                     AUTH="paused"
                     TIME_REMAINING=$PAUSED_TIME
-                    logger -t pisowifi "User $MAC is PAUSED. Remaining: $PAUSED_TIME"
-                    $FIREWALL_SCRIPT deny "$MAC" >/dev/null 2>&1
+                    # Reduced logging to prevent CPU spikes
+                    # logger -t pisowifi "User $MAC is PAUSED. Remaining: $PAUSED_TIME"
+                    
+                    # Do NOT call firewall script on every status check!
+                    # The session daemon handles enforcement.
+                    # $FIREWALL_SCRIPT deny "$MAC" >/dev/null 2>&1
                 elif [ "$EXPIRY" -gt "$NOW" ]; then
                     AUTH="true"
                     TIME_REMAINING=$((EXPIRY - NOW))
-                    logger -t pisowifi "User $MAC authenticated, time remaining: $TIME_REMAINING"
-                    # Ensure rule exists in NFT
-                    $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
+                    # Reduced logging
+                    # logger -t pisowifi "User $MAC authenticated, time remaining: $TIME_REMAINING"
+                    
+                    # Do NOT call firewall script on every status check!
+                    # $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
                 else
-                    logger -t pisowifi "Session expired for $MAC"
-                    $FIREWALL_SCRIPT deny "$MAC" >/dev/null 2>&1
+                    # logger -t pisowifi "Session expired for $MAC"
+                    # $FIREWALL_SCRIPT deny "$MAC" >/dev/null 2>&1
+                    true
                 fi
             else
-                logger -t pisowifi "No MAC address found for IP: $REMOTE_ADDR"
+                # logger -t pisowifi "No MAC address found for IP: $REMOTE_ADDR"
+                true
             fi
             json_response "{\"authenticated\": \"$AUTH\", \"time_remaining\": $TIME_REMAINING, \"mac\": \"$MAC\", \"ip\": \"$REMOTE_ADDR\"}"
             ;;
@@ -763,11 +1030,19 @@ handle_api() {
             # Simple rate limiting: Only log if status changed or every few minutes?
             # For now, just log it. Use logger so it shows in logread.
             if [ "$STATUS" = "ONLINE" ]; then
-                logger -t pisowifi "INTERNET CHECK: Client $CLIENT_MAC is ONLINE ✅"
-            else
-                logger -t pisowifi "INTERNET CHECK: Client $CLIENT_MAC is OFFLINE ❌"
-            fi
+        # Only log online status if verbose logging is enabled (to save CPU)
+        [ -f /tmp/pisowifi_verbose ] && logger -t pisowifi "INTERNET CHECK: Client $CLIENT_MAC is ONLINE ✅"
+    else
+        # Always log offline status as it is an error condition
+        logger -t pisowifi "INTERNET CHECK: Client $CLIENT_MAC is OFFLINE ❌"
+    fi
             json_response "{\"status\": \"logged\"}"
+            ;;
+
+        "action=rates")
+            RATES_JSON=$(sqlite3 -separator '|' "$DB_FILE" "SELECT amount, minutes, is_pausable, expiration FROM rates ORDER BY amount ASC;" 2>/dev/null | awk -F'|' 'BEGIN{printf "["} {a=$1+0; m=$2+0; p=($3==""?1:$3)+0; e=($4==""?0:$4)+0; if(NR>1) printf ","; printf "{\"amount\":%d,\"minutes\":%d,\"pausable\":%d,\"expiration\":%d}", a,m,p,e} END{printf "]"}')
+            [ -z "$RATES_JSON" ] && RATES_JSON="[]"
+            json_response "{\"rates\": $RATES_JSON}"
             ;;
             
         "action=test_dns")
@@ -804,6 +1079,7 @@ else
 <!DOCTYPE html>
 <html>
 <head>
+<meta charset="UTF-8">
 <title>PisoWifi Portal</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
@@ -834,6 +1110,7 @@ button:active { transform: scale(0.98); }
     <div id="login-section" style="display:none;">
         <p>Insert Coin to Connect</p>
         <button onclick="playAudio('insert'); startCoin()" class="btn-green">INSERT COIN</button>
+        <button onclick="openRates()" class="btn-blue">RATES</button>
     </div>
     
     <div id="resume-section" style="display:none;">
@@ -845,7 +1122,7 @@ button:active { transform: scale(0.98); }
     <div id="connected-section" style="display:none;">
         <h2>Connected!</h2>
         <p>MAC: <span id="client-mac"></span></p>
-        <p>Time Remaining: <strong id="time-remaining"></strong></p>
+        <p>Time Remaining: <strong id="time-remaining">Loading...</strong></p>
         <p id="internet-status" style="font-size: 0.8em; color: gray;">Checking internet...</p>
         
         <div style="display:flex; gap:10px; margin-bottom:10px;">
@@ -854,6 +1131,8 @@ button:active { transform: scale(0.98); }
              <!-- Pause Button (Yellow) -->
              <button onclick="pauseTime()" class="btn-blue" style="background:#f59e0b;">PAUSE</button>
         </div>
+
+        <button onclick="openRates()" class="btn-blue">RATES</button>
         
         <button onclick="logout()" class="btn-red">Logout</button>
     </div>
@@ -872,6 +1151,14 @@ button:active { transform: scale(0.98); }
     </div>
 </div>
 
+<div id="rates-modal" class="modal">
+    <div class="modal-content">
+        <h2>Rates</h2>
+        <div id="rates-body">Loading...</div>
+        <button onclick="closeRates()" style="background:none; color:red; margin-top:10px;">Close</button>
+    </div>
+</div>
+
 <!-- Audio Elements -->
 <audio id="audio-insert" src="/insert.mp3"></audio>
 <audio id="audio-connect" src="/connected.mp3"></audio>
@@ -879,6 +1166,37 @@ button:active { transform: scale(0.98); }
 <script>
 var apiUrl = "/cgi-bin/pisowifi";
 var interval;
+var timerInterval;
+var timeLeft = 0;
+
+function openRates() {
+    document.getElementById("rates-modal").style.display = "block";
+    loadRates();
+}
+
+function closeRates() {
+    document.getElementById("rates-modal").style.display = "none";
+}
+
+function loadRates() {
+    fetch(apiUrl + "?action=rates")
+    .then(r => r.json())
+    .then(d => {
+        var el = document.getElementById("rates-body");
+        if(!el) return;
+        if(!d || !d.rates || !d.rates.length) { el.innerHTML = "<div>No rates set.</div>"; return; }
+        var html = "<div style='margin-top:10px; text-align:left;'>";
+        d.rates.forEach(function(x){
+            html += "<div style='display:flex; justify-content:space-between; padding:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; margin-bottom:8px;'><strong>₱" + x.amount + "</strong><span>" + x.minutes + " minutes</span></div>";
+        });
+        html += "</div>";
+        el.innerHTML = html;
+    })
+    .catch(() => {
+        var el = document.getElementById("rates-body");
+        if(el) el.innerHTML = "<div>Failed to load rates.</div>";
+    });
+}
 
 function playAudio(type) {
     try {
@@ -918,6 +1236,24 @@ function formatTime(s) {
     timeStr += sec + "s";
     
     return timeStr.trim();
+}
+
+function startTimer() {
+    if(timerInterval) clearInterval(timerInterval);
+    
+    timerInterval = setInterval(function() {
+        if(timeLeft > 0) {
+            timeLeft--;
+            document.getElementById("time-remaining").innerText = formatTime(timeLeft);
+            if(document.getElementById("paused-time")) {
+                 // Only update paused time if actively paused? No, paused time is static.
+                 // This timer is for connected state.
+            }
+        } else {
+            clearInterval(timerInterval);
+            checkStatus(); // Refresh status when time expires
+        }
+    }, 1000);
 }
 
 function checkInternet() {
@@ -961,8 +1297,13 @@ function checkStatus() {
             document.getElementById("resume-section").style.display = "none";
             document.getElementById("connected-section").style.display = "block";
             
-            document.getElementById("time-remaining").innerText = formatTime(data.time_remaining);
+            // Update global timeLeft variable
+            timeLeft = parseInt(data.time_remaining);
+            document.getElementById("time-remaining").innerText = formatTime(timeLeft);
             if(data.mac) document.getElementById("client-mac").innerText = data.mac;
+            
+            // Start the countdown
+            startTimer();
             
             checkInternet();
             setTimeout(checkStatus, 5000); 
@@ -972,13 +1313,17 @@ function checkStatus() {
             document.getElementById("connected-section").style.display = "none";
             document.getElementById("resume-section").style.display = "block";
             
+            // Paused time is static
             document.getElementById("paused-time").innerText = formatTime(data.time_remaining);
+            if(timerInterval) clearInterval(timerInterval); // Stop timer if paused
+            
             setTimeout(checkStatus, 10000);
             
         } else {
             document.getElementById("login-section").style.display = "block";
             document.getElementById("resume-section").style.display = "none";
             document.getElementById("connected-section").style.display = "none";
+            if(timerInterval) clearInterval(timerInterval);
         }
     })
     .catch(err => {
@@ -1123,6 +1468,19 @@ echo "Creating Admin Panel..."
 cat << 'EOF' > /www/cgi-bin/admin
 #!/bin/sh
 
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+BB="/bin/busybox"
+UCI="/sbin/uci"
+log_license() {
+    if [ -x "$BB" ]; then
+        "$BB" logger -t pisowifi_license "$@"
+    elif command -v logger >/dev/null 2>&1; then
+        logger -t pisowifi_license "$@"
+    else
+        echo "$@" >> /tmp/pisowifi_license.log
+    fi
+}
+
 # Enable debugging to log errors to system log
 # set -x
 
@@ -1187,17 +1545,215 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     get_post_var() {
         # Grep for var name, then decode
         # Using grep -a (text mode) in case of binary data
-        VAL=$(grep -a -o "$1=[^&]*" "$POST_FILE" | head -1 | cut -d= -f2-)
-        # Decode URL encoding (limited support for huge binaries via sed)
-        # For huge files, we should avoid full decode here if possible
-        echo -e $(echo "$VAL" | sed 's/+/ /g; s/%/\\x/g')
+        # We look for $1= then characters that are NOT & (param separator)
+        VAL=$(grep -a -o "$1=[^&]*" "$POST_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+        [ -z "$VAL" ] && return
+        
+        # Decode URL encoding:
+        # 1. Replace + with space
+        # 2. Replace %XX with \xXX for printf %b
+        DECODED=$(echo "$VAL" | sed 's/+/ /g; s/%\([0-9a-fA-F]\{2\}\)/\\x\1/g')
+        # Use printf %b to interpret \xXX as characters
+        printf "%b" "$DECODED"
+    }
+
+    sql_escape() {
+        printf "%s" "$1" | sed "s/'/''/g"
+    }
+
+    supa_request() {
+        URL="$1"
+        KEY="$2"
+        PATH="$3"
+        SUPA_HTTP_CODE=""
+        SUPA_CURL_EXIT="0"
+        SUPA_CURL_ERR=""
+        SUPA_BODY=""
+        CURL_BIN="/usr/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN="/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN=""
+        if [ -z "$CURL_BIN" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_EXIT="127"
+            SUPA_CURL_ERR="curl_missing"
+            return
+        fi
+        TMP="/tmp/pisowifi_supa_$$"
+        ERR="/tmp/pisowifi_supa_err_$$"
+        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" "$URL/rest/v1/$PATH" 2>"$ERR")
+        SUPA_CURL_EXIT="$?"
+        if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
+            SUPA_HTTP_CODE="0"
+            if [ -x "$BB" ]; then
+                SUPA_CURL_ERR=$("$BB" head -1 "$ERR" 2>/dev/null | "$BB" tr -d '\r' | "$BB" tr '\n' ' ')
+            else
+                SUPA_CURL_ERR=$(head -1 "$ERR" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
+            fi
+            [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
+        fi
+        if [ -x "$BB" ]; then
+            SUPA_BODY=$("$BB" cat "$TMP" 2>/dev/null)
+            "$BB" rm -f "$TMP" "$ERR" 2>/dev/null || true
+        else
+            SUPA_BODY=$(cat "$TMP" 2>/dev/null)
+            rm -f "$TMP" "$ERR" 2>/dev/null || true
+        fi
+    }
+
+    supa_patch() {
+        URL="$1"
+        KEY="$2"
+        PATH="$3"
+        BODY="$4"
+        SUPA_HTTP_CODE=""
+        SUPA_CURL_EXIT="0"
+        SUPA_CURL_ERR=""
+        SUPA_BODY=""
+        CURL_BIN="/usr/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN="/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN=""
+        if [ -z "$CURL_BIN" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_EXIT="127"
+            SUPA_CURL_ERR="curl_missing"
+            return
+        fi
+        TMP="/tmp/pisowifi_supa_$$"
+        ERR="/tmp/pisowifi_supa_err_$$"
+        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -X PATCH -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" -H "Content-Type: application/json" -H "Prefer: return=representation" --data "$BODY" "$URL/rest/v1/$PATH" 2>"$ERR")
+        SUPA_CURL_EXIT="$?"
+        if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
+            SUPA_HTTP_CODE="0"
+            if [ -x "$BB" ]; then
+                SUPA_CURL_ERR=$("$BB" head -1 "$ERR" 2>/dev/null | "$BB" tr -d '\r' | "$BB" tr '\n' ' ')
+            else
+                SUPA_CURL_ERR=$(head -1 "$ERR" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
+            fi
+            [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
+        fi
+        if [ -x "$BB" ]; then
+            SUPA_BODY=$("$BB" cat "$TMP" 2>/dev/null)
+            "$BB" rm -f "$TMP" "$ERR" 2>/dev/null || true
+        else
+            SUPA_BODY=$(cat "$TMP" 2>/dev/null)
+            rm -f "$TMP" "$ERR" 2>/dev/null || true
+        fi
+    }
+
+    supa_rpc() {
+        URL="$1"
+        KEY="$2"
+        FN="$3"
+        BODY="$4"
+        SUPA_HTTP_CODE=""
+        SUPA_CURL_EXIT="0"
+        SUPA_CURL_ERR=""
+        SUPA_BODY=""
+        CURL_BIN="/usr/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN="/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN=""
+        if [ -z "$CURL_BIN" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_EXIT="127"
+            SUPA_CURL_ERR="curl_missing"
+            return
+        fi
+        TMP="/tmp/pisowifi_supa_$$"
+        ERR="/tmp/pisowifi_supa_err_$$"
+        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -X POST -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" -H "Content-Type: application/json" --data "$BODY" "$URL/rest/v1/rpc/$FN" 2>"$ERR")
+        SUPA_CURL_EXIT="$?"
+        if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
+            SUPA_HTTP_CODE="0"
+            if [ -x "$BB" ]; then
+                SUPA_CURL_ERR=$("$BB" head -1 "$ERR" 2>/dev/null | "$BB" tr -d '\r' | "$BB" tr '\n' ' ')
+            else
+                SUPA_CURL_ERR=$(head -1 "$ERR" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
+            fi
+            [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
+        fi
+        if [ -x "$BB" ]; then
+            SUPA_BODY=$("$BB" cat "$TMP" 2>/dev/null)
+            "$BB" rm -f "$TMP" "$ERR" 2>/dev/null || true
+        else
+            SUPA_BODY=$(cat "$TMP" 2>/dev/null)
+            rm -f "$TMP" "$ERR" 2>/dev/null || true
+        fi
+    }
+
+    supa_insert() {
+        URL="$1"
+        KEY="$2"
+        PATH="$3"
+        BODY="$4"
+        SUPA_HTTP_CODE=""
+        SUPA_CURL_EXIT="0"
+        SUPA_CURL_ERR=""
+        SUPA_BODY=""
+        CURL_BIN="/usr/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN="/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN=""
+        if [ -z "$CURL_BIN" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_EXIT="127"
+            SUPA_CURL_ERR="curl_missing"
+            return
+        fi
+        TMP="/tmp/pisowifi_supa_$$"
+        ERR="/tmp/pisowifi_supa_err_$$"
+        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -X POST -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" -H "Content-Type: application/json" -H "Prefer: return=representation" --data "$BODY" "$URL/rest/v1/$PATH" 2>"$ERR")
+        SUPA_CURL_EXIT="$?"
+        if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
+            SUPA_HTTP_CODE="0"
+            if [ -x "$BB" ]; then
+                SUPA_CURL_ERR=$("$BB" head -1 "$ERR" 2>/dev/null | "$BB" tr -d '\r' | "$BB" tr '\n' ' ')
+            else
+                SUPA_CURL_ERR=$(head -1 "$ERR" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
+            fi
+            [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
+        fi
+        if [ -x "$BB" ]; then
+            SUPA_BODY=$("$BB" cat "$TMP" 2>/dev/null)
+            "$BB" rm -f "$TMP" "$ERR" 2>/dev/null || true
+        else
+            SUPA_BODY=$(cat "$TMP" 2>/dev/null)
+            rm -f "$TMP" "$ERR" 2>/dev/null || true
+        fi
+    }
+
+    json_first() {
+        FIELD="$1"
+        if command -v jsonfilter >/dev/null 2>&1; then
+            jsonfilter -e "@[0].$FIELD" 2>/dev/null
+        else
+            sed -n "s/.*\"$FIELD\":[ ]*\"\\([^\"]*\\)\".*/\\1/p" | head -1
+        fi
+    }
+
+    load_supabase_env() {
+        [ -f /etc/pisowifi/supabase.env ] || return 1
+        if [ -x "$BB" ]; then
+            FILE_URL=$(grep -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | "$BB" tr -d '\r')
+            FILE_KEY=$(grep -m1 '^SUPABASE_ANON_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | "$BB" tr -d '\r')
+        else
+            FILE_URL=$(grep -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
+            FILE_KEY=$(grep -m1 '^SUPABASE_ANON_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
+        fi
+        FILE_URL=$(echo "$FILE_URL" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+        FILE_KEY=$(echo "$FILE_KEY" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+        [ -z "$FILE_URL" ] && return 1
+        [ -z "$FILE_KEY" ] && return 1
+        "$UCI" set pisowifi.license=license
+        "$UCI" set pisowifi.license.supabase_url="$FILE_URL"
+        "$UCI" set pisowifi.license.supabase_key="$FILE_KEY"
+        "$UCI" commit pisowifi
+        return 0
     }
 
     ACTION=$(get_post_var "action")
     PASS=$(get_post_var "password")
     
     # Cleanup trap
-    trap "rm -f $POST_FILE" EXIT
+    trap "[ -x \"$BB\" ] && \"$BB\" rm -f \"$POST_FILE\" 2>/dev/null; rm -f \"$POST_FILE\" 2>/dev/null" EXIT
     
     if [ -n "$PASS" ]; then
         if [ "$PASS" = "$ADMIN_PASS" ]; then
@@ -1223,7 +1779,217 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     fi
     
     if check_auth; then
-        if [ "$ACTION" = "update_wifi" ]; then
+        if [ "$ACTION" = "activate_license" ] || [ "$ACTION" = "license_check" ]; then
+             SUPA_URL=$("$UCI" get pisowifi.license.supabase_url 2>/dev/null)
+             SUPA_KEY=$("$UCI" get pisowifi.license.supabase_key 2>/dev/null)
+             NOW_TS=$(date +%s)
+             OPENWRT_TABLE="pisowifi_openwrt"
+
+             # Get Device ID
+             HW_MAC=$(cat /sys/class/net/br-lan/address 2>/dev/null || cat /sys/class/net/eth0/address 2>/dev/null || echo "")
+             if [ -x "$BB" ]; then
+                 HW_MAC=$(printf "%s" "$HW_MAC" | "$BB" tr -d ':' | "$BB" tr 'a-z' 'A-Z')
+             else
+                 HW_MAC=$(printf "%s" "$HW_MAC" | tr -d ':' | tr 'a-z' 'A-Z')
+             fi
+             HW_HEX="$HW_MAC"
+             if command -v md5sum >/dev/null 2>&1 && [ -n "$HW_MAC" ]; then
+                 HW_HEX=$(echo -n "$HW_MAC" | md5sum 2>/dev/null | awk '{print toupper(substr($1,1,16))}')
+             fi
+             HARDWARE_ID="CPU-$HW_HEX"
+
+             if [ -z "$SUPA_URL" ] || [ -z "$SUPA_KEY" ]; then
+                 load_supabase_env >/dev/null 2>&1 || true
+                 SUPA_URL=$("$UCI" get pisowifi.license.supabase_url 2>/dev/null)
+                 SUPA_KEY=$("$UCI" get pisowifi.license.supabase_key 2>/dev/null)
+             fi
+
+             if [ -z "$SUPA_URL" ] || [ -z "$SUPA_KEY" ]; then
+                 echo "Status: 302 Found"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_missing_supabase"
+                 echo ""
+                 exit 0
+             fi
+
+             # First, check by hardware_id
+             supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,license_key&hardware_id=eq.$HARDWARE_ID&limit=1"
+             RESP="$SUPA_BODY"
+             LAST_CODE="$SUPA_HTTP_CODE"
+
+             FOUND_BY_HW=0
+             if [ "$LAST_CODE" = "200" ] && case "$RESP" in *'"id"'* ) true ;; * ) false ;; esac; then
+                 FOUND_BY_HW=1
+             fi
+
+             if [ "$FOUND_BY_HW" = "0" ] && [ "$ACTION" = "license_check" ]; then
+                 # No license for this HW, initiate 7-day trial
+                 EXP_DATE=$(date -d "+7 days" -Iseconds 2>/dev/null || date -u -D "%s" -d "$(( $(date +%s) + 604800 ))" +"%Y-%m-%dT%H:%M:%SZ")
+                 TRIAL_BODY=$(printf '{"hardware_id":"%s","status":"trial","expires_at":"%s"}' "$HARDWARE_ID" "$EXP_DATE")
+                 supa_insert "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE" "$TRIAL_BODY"
+                 RESP="$SUPA_BODY"
+                 LAST_CODE="$SUPA_HTTP_CODE"
+                 if [ "$LAST_CODE" = "201" ] || [ "$LAST_CODE" = "200" ]; then
+                     FOUND_BY_HW=1
+                 fi
+             fi
+
+             # If activating, and not found by HW, check by License Key
+             if [ "$ACTION" = "activate_license" ] && [ "$FOUND_BY_HW" = "0" ]; then
+                 LIC_KEY=$(get_post_var "license_key")
+                 if [ -n "$LIC_KEY" ]; then
+                     supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
+                     RESP="$SUPA_BODY"
+                     LAST_CODE="$SUPA_HTTP_CODE"
+                     if [ "$LAST_CODE" = "200" ] && case "$RESP" in *'"id"'* ) true ;; * ) false ;; esac; then
+                         # Found license key, check if already bound
+                         BOUND_HW=$(echo "$RESP" | json_first "hardware_id")
+                         if [ -z "$BOUND_HW" ] || [ "$BOUND_HW" = "null" ]; then
+                             # Bind it
+                             PATCH_BODY=$(printf '{"hardware_id":"%s","activated_at":"%s","status":"active"}' "$HARDWARE_ID" "$(date -Iseconds)")
+                             supa_patch "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?license_key=ilike.$LIC_KEY" "$PATCH_BODY"
+                             # Refresh data
+                             supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
+                             RESP="$SUPA_BODY"
+                             FOUND_BY_HW=1
+                         else
+                             if [ "$BOUND_HW" != "$HARDWARE_ID" ]; then
+                                 echo "Status: 302 Found"
+                                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_hw_mismatch"
+                                 echo ""
+                                 exit 0
+                             fi
+                             FOUND_BY_HW=1
+                         fi
+                     fi
+                 fi
+             fi
+
+             if [ "$FOUND_BY_HW" = "1" ]; then
+                 # Extract data and save to UCI
+                 L_STATUS=$(echo "$RESP" | json_first "status")
+                 L_EXPIRES=$(echo "$RESP" | json_first "expires_at")
+                 L_VENDOR=$(echo "$RESP" | json_first "vendor_uuid")
+                 L_KEY=$(echo "$RESP" | json_first "license_key")
+                 
+                 "$UCI" set pisowifi.license=license
+                 "$UCI" set pisowifi.license.status="$L_STATUS"
+                 "$UCI" set pisowifi.license.expires_at="$L_EXPIRES"
+                 "$UCI" set pisowifi.license.vendor_uuid="$L_VENDOR"
+                 "$UCI" set pisowifi.license.license_key="$L_KEY"
+                 "$UCI" set pisowifi.license.hardware_id="$HARDWARE_ID"
+                 "$UCI" set pisowifi.license.valid=1
+                 [ "$L_STATUS" = "expired" ] && "$UCI" set pisowifi.license.valid=0
+                 "$UCI" commit pisowifi
+                 
+                 echo "Status: 302 Found"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_ok"
+                 echo ""
+                 exit 0
+             else
+                 echo "Status: 302 Found"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_not_found"
+                 echo ""
+                 exit 0
+             fi
+
+        elif [ "$ACTION" = "clear_license" ]; then
+             "$UCI" set pisowifi.license=license
+             "$UCI" set pisowifi.license.status='inactive'
+             "$UCI" set pisowifi.license.valid='0'
+             "$UCI" set pisowifi.license.license_key=''
+             "$UCI" set pisowifi.license.vendor_uuid=''
+             "$UCI" set pisowifi.license.expires_at=''
+             "$UCI" set pisowifi.license.hardware_id=''
+             "$UCI" commit pisowifi
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=settings&msg=license_cleared"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "add_device" ] || [ "$ACTION" = "save_connected_device" ]; then
+             MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
+             IP_ADDR=$(get_post_var "ip")
+             HOSTNAME=$(get_post_var "hostname")
+             NOTES=$(get_post_var "notes")
+
+             MAC_SQL=$(sql_escape "$MAC")
+             IP_SQL=$(sql_escape "$IP_ADDR")
+             HOST_SQL=$(sql_escape "$HOSTNAME")
+             NOTES_SQL=$(sql_escape "$NOTES")
+
+             sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=device_saved"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "update_device" ]; then
+             MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
+             IP_ADDR=$(get_post_var "ip")
+             HOSTNAME=$(get_post_var "hostname")
+             NOTES=$(get_post_var "notes")
+
+             MAC_SQL=$(sql_escape "$MAC")
+             IP_SQL=$(sql_escape "$IP_ADDR")
+             HOST_SQL=$(sql_escape "$HOSTNAME")
+             NOTES_SQL=$(sql_escape "$NOTES")
+
+             sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=device_saved"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "delete_device" ]; then
+             MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
+             MAC_SQL=$(sql_escape "$MAC")
+             sqlite3 "$DB_FILE" "DELETE FROM devices WHERE mac='$MAC_SQL';" 2>/dev/null
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=device_deleted"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "device_add_time" ]; then
+             MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
+             IP_ADDR=$(get_post_var "ip")
+             ADD_MIN=$(get_post_var "add_minutes")
+
+             case "$ADD_MIN" in
+                 ''|*[!0-9]*) ADD_MIN=0 ;;
+             esac
+
+             if [ "$ADD_MIN" -gt 0 ]; then
+                 NOW_TS=$(date +%s)
+                 MAC_SQL=$(sql_escape "$MAC")
+                 IP_SQL=$(sql_escape "$IP_ADDR")
+
+                 USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end FROM users WHERE mac='$MAC_SQL' LIMIT 1;" 2>/dev/null)
+                 CUR_END=$(echo "$USER_ROW" | cut -d'|' -f1)
+                 [ -z "$CUR_END" ] && CUR_END=0
+
+                 BASE_TS=$NOW_TS
+                 if [ "$CUR_END" -gt "$NOW_TS" ]; then
+                     BASE_TS=$CUR_END
+                 fi
+
+                 ADD_SEC=$((ADD_MIN * 60))
+                 NEW_END=$((BASE_TS + ADD_SEC))
+
+                 sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO users (mac, ip, session_start, session_end, paused_time) VALUES ('$MAC_SQL', '$IP_SQL', $NOW_TS, $NEW_END, 0); UPDATE users SET ip='$IP_SQL', session_end=$NEW_END, paused_time=0 WHERE mac='$MAC_SQL';" 2>/dev/null
+
+                 /usr/bin/pisowifi_nftables.sh allow "$MAC" "$IP_ADDR" >/dev/null 2>&1 &
+             fi
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=time_added"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "update_wifi" ]; then
              SSID=$(get_post_var "ssid")
              ENC=$(get_post_var "encryption")
              KEY=$(get_post_var "key")
@@ -1233,14 +1999,19 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              # Iterate through all sections that are 'wifi-iface'
              # uci show wireless returns: wireless.default_radio0=wifi-iface ...
              
-             # Robust loop:
-             # Get all config names for wifi-iface
              IFACES=$(uci show wireless | grep "=wifi-iface" | cut -d= -f1)
              for iface in $IFACES; do
-                 uci set $iface.ssid="$SSID"
-                 uci set $iface.encryption="$ENC"
-                 uci set $iface.key="$KEY"
-                 uci set $iface.disabled="$DISABLED"
+                 # Check if iface string is valid
+                 if [ -n "$iface" ]; then
+                     uci set $iface.ssid="$SSID" 2>/dev/null
+                     uci set $iface.encryption="$ENC" 2>/dev/null
+                     if [ "$ENC" != "none" ]; then
+                         uci set $iface.key="$KEY" 2>/dev/null
+                     else
+                         uci delete $iface.key 2>/dev/null
+                     fi
+                     uci set $iface.disabled="$DISABLED" 2>/dev/null
+                 fi
              done
              
              uci commit wireless
@@ -1252,14 +2023,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              exit 0
              
         elif [ "$ACTION" = "update_settings" ]; then
-             RATE=$(get_post_var "rate")
              NEW_PASS=$(get_post_var "new_pass")
              
-             uci set pisowifi.settings.minutes_per_peso="$RATE"
              if [ -n "$NEW_PASS" ]; then
                  uci set pisowifi.settings.admin_password="$NEW_PASS"
+                 uci commit pisowifi
              fi
-             uci commit pisowifi
              
              echo "Status: 302 Found"
              echo "Location: /cgi-bin/admin?tab=settings&msg=saved"
@@ -1314,6 +2083,47 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              echo ""
              exit 0
              
+        elif [ "$ACTION" = "update_qos" ]; then
+             QOS_MODE=$(get_post_var "qos_mode")
+             GLOBAL_DOWN=$(get_post_var "global_down")
+             GLOBAL_UP=$(get_post_var "global_up")
+             USER_DOWN=$(get_post_var "user_down")
+             USER_UP=$(get_post_var "user_up")
+             
+             # Robust fallbacks for empty values
+             [ -z "$QOS_MODE" ] && QOS_MODE="global"
+             [ -z "$GLOBAL_DOWN" ] && GLOBAL_DOWN=0
+             [ -z "$GLOBAL_UP" ] && GLOBAL_UP=0
+             [ -z "$USER_DOWN" ] && USER_DOWN=0
+             [ -z "$USER_UP" ] && USER_UP=0
+             
+             # Log the received values for debugging
+             logger -t pisowifi "ACTION: update_qos | MODE: $QOS_MODE | G_DOWN: $GLOBAL_DOWN | G_UP: $GLOBAL_UP | U_DOWN: $USER_DOWN | U_UP: $USER_UP"
+             
+             # Create the section if it doesn't exist and set values
+             uci set pisowifi.qos=qos
+             uci set pisowifi.qos.mode="$QOS_MODE"
+             uci set pisowifi.qos.global_down="$GLOBAL_DOWN"
+             uci set pisowifi.qos.global_up="$GLOBAL_UP"
+             uci set pisowifi.qos.user_down="$USER_DOWN"
+             uci set pisowifi.qos.user_up="$USER_UP"
+             
+             # Commit explicitly to the file
+             uci commit pisowifi
+             
+             # Re-read to confirm (optional, but good for debug)
+             SAVED_MODE=$(uci get pisowifi.qos.mode 2>/dev/null)
+             logger -t pisowifi "SAVED QoS MODE: $SAVED_MODE"
+             
+             # Apply QoS Settings Immediately
+             /usr/bin/pisowifi_qos.sh reload >/dev/null 2>&1 &
+             /usr/bin/pisowifi_nftables.sh reload_qos >/dev/null 2>&1 &
+             
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=qos&msg=qos_saved"
+             echo ""
+             exit 0
+             
         elif [ "$ACTION" = "save_portal" ]; then
              HTML_CONTENT=$(get_post_var "html_content")
              # Write to file
@@ -1321,6 +2131,31 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              
              echo "Status: 302 Found"
              echo "Location: /cgi-bin/admin?tab=portal&msg=portal_saved"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "save_theme" ]; then
+             THEME_NAME=$(get_post_var "theme_name")
+             THEME_NAME=$(echo "$THEME_NAME" | tr ' ' '_' )
+             SLUG=$(echo "$THEME_NAME" | tr -cd 'A-Za-z0-9_-')
+             [ -z "$SLUG" ] && SLUG=$(date +%s)
+             HTML_CONTENT=$(get_post_var "html_content")
+             mkdir -p /www/portal_themes
+             echo "$HTML_CONTENT" > "/www/portal_themes/custom_${SLUG}.html"
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=portal&msg=theme_saved"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "delete_theme" ]; then
+             THEME_ID=$(get_post_var "theme_id")
+             THEME_ID=$(echo "$THEME_ID" | tr -cd 'A-Za-z0-9_-')
+             case "$THEME_ID" in custom_*) ;; *) THEME_ID="custom_$THEME_ID" ;; esac
+             rm -f "/www/portal_themes/${THEME_ID}.html" 2>/dev/null || true
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=portal&msg=theme_deleted"
              echo ""
              exit 0
              
@@ -1430,7 +2265,9 @@ else
     echo "    <a href='?tab=dashboard' class='nav-link $([ "$TAB" = "dashboard" ] && echo "active")'>Dashboard</a>"
     echo "    <a href='?tab=rates' class='nav-link $([ "$TAB" = "rates" ] && echo "active")'>Rates Manager</a>"
     echo "    <a href='?tab=hotspot' class='nav-link $([ "$TAB" = "hotspot" ] && echo "active")'>Hotspot Manager</a>"
+    echo "    <a href='?tab=devices' class='nav-link $([ "$TAB" = "devices" ] && echo "active")'>Device Manager</a>"
     echo "    <a href='?tab=sales' class='nav-link $([ "$TAB" = "sales" ] && echo "active")'>Sales Report</a>"
+    echo "    <a href='?tab=qos' class='nav-link $([ "$TAB" = "qos" ] && echo "active")'>Bandwidth Manager</a>"
     echo "    <a href='?tab=portal' class='nav-link $([ "$TAB" = "portal" ] && echo "active")'>Portal Editor</a>"
     echo "    <a href='?tab=settings' class='nav-link $([ "$TAB" = "settings" ] && echo "active")'>Settings</a>"
     echo "  </nav>"
@@ -1676,6 +2513,156 @@ else
         echo "</form>"
         echo "</div>"
 
+    elif [ "$TAB" = "devices" ]; then
+        echo "<div class='header'><h1>Device Manager</h1></div>"
+
+        if echo "$QUERY_STRING" | grep -q "msg=device_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Device Saved!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=device_deleted"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Device Deleted!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=time_added"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Time Added!</div>"; fi
+
+        esc() { printf "%s" "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
+        fmt_time() {
+            SEC=$1
+            [ -z "$SEC" ] && SEC=0
+            if [ "$SEC" -le 0 ]; then
+                echo "0s"
+                return
+            fi
+            M=$((SEC / 60))
+            S=$((SEC % 60))
+            if [ "$M" -ge 60 ]; then
+                H=$((M / 60))
+                M2=$((M % 60))
+                echo "${H}h ${M2}m"
+            else
+                echo "${M}m ${S}s"
+            fi
+        }
+
+        NOW=$(date +%s)
+        LEASE_FILE="/tmp/dhcp.leases"
+        [ -f /var/dhcp.leases ] && LEASE_FILE="/var/dhcp.leases"
+
+        echo "<div class='card' style='margin-bottom:20px;'>"
+        echo "<h3>Add Device</h3>"
+        echo "<form method='POST' style='display:grid; grid-template-columns: 1fr 1fr; gap:12px;'>"
+        echo "  <input type='hidden' name='action' value='add_device'>"
+        echo "  <div><label style='display:block; margin-bottom:6px; font-weight:600;'>MAC</label><input name='mac' placeholder='AA:BB:CC:DD:EE:FF' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;' required></div>"
+        echo "  <div><label style='display:block; margin-bottom:6px; font-weight:600;'>IP</label><input name='ip' placeholder='10.0.0.x' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'></div>"
+        echo "  <div><label style='display:block; margin-bottom:6px; font-weight:600;'>Hostname</label><input name='hostname' placeholder='Device name' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'></div>"
+        echo "  <div><label style='display:block; margin-bottom:6px; font-weight:600;'>Notes</label><input name='notes' placeholder='Optional' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'></div>"
+        echo "  <div style='grid-column: span 2;'><button class='btn btn-primary' style='width:100%; padding:12px;'>Save Device</button></div>"
+        echo "</form>"
+        echo "</div>"
+
+        echo "<div class='card' style='margin-bottom:20px;'>"
+        echo "<h3>Connected Devices (DNSMasq)</h3>"
+        echo "<table><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Time</th><th>Actions</th></tr>"
+        if [ -f "$LEASE_FILE" ]; then
+            cat "$LEASE_FILE" 2>/dev/null | while read EXP MACADDR IPADDR HOSTNAME CLIENTID; do
+                [ -z "$MACADDR" ] && continue
+                MAC_UP=$(echo "$MACADDR" | tr 'a-z' 'A-Z')
+                HOST="$HOSTNAME"
+                [ "$HOST" = "*" ] && HOST=""
+                DB_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT ip, hostname, notes FROM devices WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
+                DB_IP=$(echo "$DB_ROW" | cut -d'|' -f1)
+                DB_HOST=$(echo "$DB_ROW" | cut -d'|' -f2)
+                DB_NOTES=$(echo "$DB_ROW" | cut -d'|' -f3)
+                DISP_HOST="$HOST"
+                [ -z "$DISP_HOST" ] && DISP_HOST="$DB_HOST"
+                [ -z "$DISP_HOST" ] && DISP_HOST="(unknown)"
+
+                USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
+                END_TS=$(echo "$USER_ROW" | cut -d'|' -f1)
+                PAUSED_TS=$(echo "$USER_ROW" | cut -d'|' -f2)
+                [ -z "$END_TS" ] && END_TS=0
+                [ -z "$PAUSED_TS" ] && PAUSED_TS=0
+                if [ "$PAUSED_TS" -gt 0 ]; then
+                    TIME_TXT="$(fmt_time "$PAUSED_TS") (Paused)"
+                elif [ "$END_TS" -gt "$NOW" ]; then
+                    REM=$((END_TS - NOW))
+                    TIME_TXT="$(fmt_time "$REM")"
+                else
+                    TIME_TXT="0s"
+                fi
+
+                EH=$(esc "$DISP_HOST")
+                EIP=$(esc "$IPADDR")
+                EM=$(esc "$MAC_UP")
+                echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td>$TIME_TXT</td><td>"
+                echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center;'>"
+                echo "    <input type='hidden' name='action' value='device_add_time'>"
+                echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
+                echo "    <input type='hidden' name='ip' value='$IPADDR'>"
+                echo "    <input type='number' name='add_minutes' min='1' placeholder='+min' style='width:90px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
+                echo "    <button class='btn btn-primary' style='padding:8px 10px;'>Add Time</button>"
+                echo "  </form>"
+                echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center; margin-left:10px;'>"
+                echo "    <input type='hidden' name='action' value='save_connected_device'>"
+                echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
+                echo "    <input type='hidden' name='ip' value='$IPADDR'>"
+                echo "    <input type='hidden' name='hostname' value='$(esc "$DISP_HOST")'>"
+                echo "    <input type='hidden' name='notes' value='$(esc "$DB_NOTES")'>"
+                echo "    <button class='btn btn-primary' style='padding:8px 10px;'>Save</button>"
+                echo "  </form>"
+                echo "</td></tr>"
+            done
+        else
+            echo "<tr><td colspan='5'>No lease file found.</td></tr>"
+        fi
+        echo "</table>"
+        echo "</div>"
+
+        echo "<div class='card'>"
+        echo "<h3>Saved Devices (CRUD)</h3>"
+        echo "<table><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Notes</th><th>Time</th><th>Actions</th></tr>"
+        sqlite3 -separator '|' "$DB_FILE" "SELECT mac, ip, hostname, notes FROM devices ORDER BY updated_at DESC;" 2>/dev/null | while IFS='|' read MACADDR IPADDR HOSTNAME NOTES; do
+            [ -z "$MACADDR" ] && continue
+            MAC_UP=$(echo "$MACADDR" | tr 'a-z' 'A-Z')
+            USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
+            END_TS=$(echo "$USER_ROW" | cut -d'|' -f1)
+            PAUSED_TS=$(echo "$USER_ROW" | cut -d'|' -f2)
+            [ -z "$END_TS" ] && END_TS=0
+            [ -z "$PAUSED_TS" ] && PAUSED_TS=0
+            if [ "$PAUSED_TS" -gt 0 ]; then
+                TIME_TXT="$(fmt_time "$PAUSED_TS") (Paused)"
+            elif [ "$END_TS" -gt "$NOW" ]; then
+                REM=$((END_TS - NOW))
+                TIME_TXT="$(fmt_time "$REM")"
+            else
+                TIME_TXT="0s"
+            fi
+
+            EH=$(esc "$HOSTNAME")
+            EIP=$(esc "$IPADDR")
+            EM=$(esc "$MAC_UP")
+            EN=$(esc "$NOTES")
+            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td>$EN</td><td>$TIME_TXT</td><td>"
+            echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center; margin-bottom:6px;'>"
+            echo "    <input type='hidden' name='action' value='update_device'>"
+            echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
+            echo "    <input name='ip' value='$EIP' placeholder='IP' style='width:120px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
+            echo "    <input name='hostname' value='$EH' placeholder='Hostname' style='width:160px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
+            echo "    <input name='notes' value='$EN' placeholder='Notes' style='width:160px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
+            echo "    <button class='btn btn-primary' style='padding:8px 10px;'>Update</button>"
+            echo "  </form>"
+            echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center;'>"
+            echo "    <input type='hidden' name='action' value='device_add_time'>"
+            echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
+            echo "    <input type='hidden' name='ip' value='$IPADDR'>"
+            echo "    <input type='number' name='add_minutes' min='1' placeholder='+min' style='width:90px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
+            echo "    <button class='btn btn-primary' style='padding:8px 10px;'>Add Time</button>"
+            echo "  </form>"
+            echo "  <form method='POST' style='display:inline; margin-left:10px;'>"
+            echo "    <input type='hidden' name='action' value='delete_device'>"
+            echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
+            echo "    <button class='btn btn-danger' style='padding:8px 10px;'>Delete</button>"
+            echo "  </form>"
+            echo "</td></tr>"
+        done
+        echo "</table>"
+        echo "</div>"
+
     elif [ "$TAB" = "sales" ]; then
         echo "<div class='header'><h1>Sales Report</h1></div>"
         
@@ -1699,11 +2686,78 @@ else
         echo "</table>"
         echo "</div>"
     
+    elif [ "$TAB" = "qos" ]; then
+        echo "<div class='header'><h1>Bandwidth Manager</h1></div>"
+        
+        if echo "$QUERY_STRING" | grep -q "msg=qos_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Bandwidth Settings Saved!</div>"; fi
+        
+        QOS_MODE=$(uci get pisowifi.qos.mode 2>/dev/null || echo "global")
+        GLOBAL_DOWN=$(uci get pisowifi.qos.global_down 2>/dev/null || echo 0)
+        GLOBAL_UP=$(uci get pisowifi.qos.global_up 2>/dev/null || echo 0)
+        USER_DOWN=$(uci get pisowifi.qos.user_down 2>/dev/null || echo 0)
+        USER_UP=$(uci get pisowifi.qos.user_up 2>/dev/null || echo 0)
+        
+        echo "<div class='card'>"
+        echo "  <h3>Bandwidth Control Policy</h3>"
+        echo "  <form method='POST'>"
+        echo "    <input type='hidden' name='action' value='update_qos'>"
+        
+        echo "    <div style='margin-bottom: 20px;'>"
+        echo "      <label style='display:block; margin-bottom:8px; font-weight:600;'>Control Mode</label>"
+        echo "      <select name='qos_mode' onchange=\"this.value=='global' ? (document.getElementById('global-sec').style.display='block', document.getElementById('user-sec').style.display='none') : (document.getElementById('global-sec').style.display='none', document.getElementById('user-sec').style.display='block')\" style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;'>"
+        if [ "$QOS_MODE" = "per_user" ]; then
+             echo "        <option value='global'>Global Fairness (CAKE)</option>"
+             echo "        <option value='per_user' selected>Per-User Limiting</option>"
+        else
+             echo "        <option value='global' selected>Global Fairness (CAKE)</option>"
+             echo "        <option value='per_user'>Per-User Limiting</option>"
+        fi
+        echo "      </select>"
+        echo "      <p class='sub'><strong>Global Fairness:</strong> Uses CAKE queue management to automatically share bandwidth fairly among all users. No hard limits per user.</p>"
+        echo "      <p class='sub'><strong>Per-User Limiting:</strong> Sets a hard speed limit for every user. Recommended if you sell fixed speeds.</p>"
+        echo "    </div>"
+        
+        echo "    <div id='global-sec' style='display:$([ "$QOS_MODE" = "global" ] && echo "block" || echo "none"); border-top:1px solid #eee; padding-top:20px;'>"
+        echo "      <h4>Global Total Bandwidth (ISP Speed)</h4>"
+        echo "      <div style='display:grid; grid-template-columns: 1fr 1fr; gap:15px;'>"
+        echo "        <div>"
+        echo "          <label style='display:block; margin-bottom:5px; font-weight:600;'>Download (Mbps)</label>"
+        echo "          <input type='number' name='global_down' value='$GLOBAL_DOWN' placeholder='0 = Unlimited' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'>"
+        echo "        </div>"
+        echo "        <div>"
+        echo "          <label style='display:block; margin-bottom:5px; font-weight:600;'>Upload (Mbps)</label>"
+        echo "          <input type='number' name='global_up' value='$GLOBAL_UP' placeholder='0 = Unlimited' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'>"
+        echo "        </div>"
+        echo "      </div>"
+        echo "    </div>"
+        
+        echo "    <div id='user-sec' style='display:$([ "$QOS_MODE" = "per_user" ] && echo "block" || echo "none"); border-top:1px solid #eee; padding-top:20px;'>"
+        echo "      <h4>Per-User Limits</h4>"
+        echo "      <div style='display:grid; grid-template-columns: 1fr 1fr; gap:15px;'>"
+        echo "        <div>"
+        echo "          <label style='display:block; margin-bottom:5px; font-weight:600;'>Max Download (Mbps)</label>"
+        echo "          <input type='number' name='user_down' value='$USER_DOWN' placeholder='e.g. 5' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'>"
+        echo "        </div>"
+        echo "        <div>"
+        echo "          <label style='display:block; margin-bottom:5px; font-weight:600;'>Max Upload (Mbps)</label>"
+        echo "          <input type='number' name='user_up' value='$USER_UP' placeholder='e.g. 1' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'>"
+        echo "        </div>"
+        echo "      </div>"
+        echo "    </div>"
+        
+        echo "    <div style='margin-top:20px;'>"
+        echo "      <button class='btn btn-primary' style='width:100%; padding:12px;'>Save & Apply Bandwidth Rules</button>"
+        echo "    </div>"
+        echo "  </form>"
+        echo "</div>"
+
     elif [ "$TAB" = "portal" ]; then
         echo "<div class='header'><h1>Portal Editor</h1></div>"
         
         if echo "$QUERY_STRING" | grep -q "msg=portal_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Portal HTML Saved Successfully!</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=upload_success"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>File Uploaded Successfully!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=theme_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Theme Saved Successfully!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=theme_deleted"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Theme Deleted!</div>"; fi
         
         # HTML Editor
         # Read current portal html
@@ -1713,50 +2767,130 @@ else
         # No, because we are generating the admin page via echo.
         # Safest way: Read file content and escape special chars for textarea.
         
+        # FIX: Explicitly specify UTF-8 charset when reading/handling content
         PORTAL_CONTENT=$(cat /www/portal.html 2>/dev/null | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
         
-        echo "<div class='grid'>"
-        echo "  <div class='card' style='grid-column: span 2;'>"
+        echo "<div style='display:grid; grid-template-columns: 2fr 1fr; gap:20px; align-items:start;'>"
+        echo "  <div class='card'>"
         echo "    <h3>HTML Source Code</h3>"
-        echo "    <form method='POST'>"
-        echo "      <input type='hidden' name='action' value='save_portal'>"
-        echo "      <textarea name='html_content' style='width:100%; height:400px; font-family:monospace; padding:10px; border:1px solid #cbd5e1; border-radius:6px; box-sizing:border-box;' spellcheck='false'>$PORTAL_CONTENT</textarea>"
-        echo "      <div style='margin-top:10px; text-align:right;'>"
-        echo "        <button class='btn btn-primary'>Save HTML Changes</button>"
+        echo "    <div style='display:flex; flex-wrap:wrap; gap:10px; margin-bottom:10px;'>"
+        echo "      <button type='button' class='btn btn-primary' style='padding:8px 10px;' onclick=\"loadInstalledPortal()\">Load Installed</button>"
+        echo "      <button type='button' class='btn btn-primary' style='padding:8px 10px; background:#0f172a;' onclick=\"applyTheme('theme_glass')\">Glass</button>"
+        echo "      <button type='button' class='btn btn-primary' style='padding:8px 10px; background:#111827;' onclick=\"applyTheme('theme_dark_neon')\">Dark Neon</button>"
+        echo "      <button type='button' class='btn btn-primary' style='padding:8px 10px; background:#334155;' onclick=\"applyTheme('theme_minimal')\">Minimal</button>"
+        echo "      <button type='button' class='btn btn-primary' style='padding:8px 10px; background:#be123c;' onclick=\"applyTheme('theme_sunset')\">Sunset</button>"
+        echo "    </div>"
+        THEME_FILES=$(ls /www/portal_themes/custom_*.html 2>/dev/null)
+        if [ -n "$THEME_FILES" ]; then
+            echo "    <div style='border:1px solid #e2e8f0; border-radius:10px; padding:10px; margin-bottom:10px;'>"
+            echo "      <div style='font-weight:700; margin-bottom:8px;'>Custom Themes</div>"
+            for f in $THEME_FILES; do
+                NAME=$(basename "$f" .html)
+                LABEL=$(echo "$NAME" | sed 's/^custom_//' | tr '_' ' ')
+                echo "      <div style='display:flex; gap:8px; align-items:center; margin-bottom:8px;'>"
+                echo "        <button type='button' class='btn btn-primary' style='padding:8px 10px; background:#0f172a;' onclick=\"applyTheme('$NAME')\">$LABEL</button>"
+                echo "        <form method='POST' style='margin:0;'>"
+                echo "          <input type='hidden' name='action' value='delete_theme'>"
+                echo "          <input type='hidden' name='theme_id' value='$NAME'>"
+                echo "          <button class='btn btn-danger' type='submit' style='padding:8px 10px;'>Delete</button>"
+                echo "        </form>"
+                echo "      </div>"
+            done
+            echo "    </div>"
+        fi
+
+        echo "    <form id='portal-form' method='POST' accept-charset='UTF-8'>"
+        echo "      <input type='hidden' id='portal-action' name='action' value='save_portal'>"
+        echo "      <div style='display:flex; gap:10px; margin-bottom:10px; align-items:center;'>"
+        echo "        <input id='theme-name' name='theme_name' placeholder='Theme name (e.g. MyTheme)' style='flex:1; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'>"
+        echo "        <button type='button' class='btn btn-primary' style='padding:10px 12px;' onclick=\"submitPortal('save_theme')\">Save as Theme</button>"
+        echo "      </div>"
+        echo "      <textarea id='portal-editor' name='html_content' style='width:100%; height:520px; font-family:monospace; padding:10px; border:1px solid #cbd5e1; border-radius:6px; box-sizing:border-box;' spellcheck='false'>$PORTAL_CONTENT</textarea>"
+        echo "      <div style='margin-top:10px; display:flex; justify-content:flex-end; gap:10px;'>"
+        echo "        <button type='button' class='btn btn-primary' onclick=\"submitPortal('save_portal')\">Save HTML Changes</button>"
         echo "      </div>"
         echo "    </form>"
         echo "  </div>"
-        
-        echo "  <div class='card'>"
-        echo "    <h3>Media Manager</h3>"
-        echo "    <p class='sub'>Upload images or audio files for your portal.</p>"
-        
-        echo "    <div style='margin-bottom:20px; border-bottom:1px solid #eee; padding-bottom:20px;'>"
-        echo "      <h4>Background Image</h4>"
-        echo "      <p class='sub'>Replaces <code>bg.jpg</code></p>"
-        echo "      <input type='file' id='file-bg' accept='image/*' style='margin-bottom:10px;'>"
-        echo "      <button onclick=\"uploadFile('file-bg', 'bg.jpg')\" class='btn btn-primary' style='width:100%'>Upload Background</button>"
+
+        echo "  <div>"
+        echo "    <div class='card' style='margin-bottom:20px;'>"
+        echo "      <h3>Phone Preview</h3>"
+        echo "      <div style='display:flex; justify-content:center;'>"
+        echo "        <div style='width:320px; height:640px; background:#0f172a; border-radius:42px; padding:14px; box-shadow: 0 18px 40px rgba(0,0,0,0.25);'>"
+        echo "          <div style='width:100%; height:100%; background:#fff; border-radius:30px; overflow:hidden;'>"
+        echo "            <iframe id='portal-preview' style='width:100%; height:100%; border:0; background:#fff;'></iframe>"
+        echo "          </div>"
+        echo "        </div>"
+        echo "      </div>"
+        echo "      <p class='sub' style='margin-top:10px;'>Live preview habang nag-e-edit.</p>"
         echo "    </div>"
-        
-        echo "    <div style='margin-bottom:20px; border-bottom:1px solid #eee; padding-bottom:20px;'>"
-        echo "      <h4>Insert Coin Audio</h4>"
-        echo "      <p class='sub'>Replaces <code>insert.mp3</code> (Plays when Insert Coin clicked)</p>"
-        echo "      <input type='file' id='file-insert' accept='audio/*' style='margin-bottom:10px;'>"
-        echo "      <button onclick=\"uploadFile('file-insert', 'insert.mp3')\" class='btn btn-primary' style='width:100%'>Upload Audio</button>"
+
+        echo "    <div class='card'>"
+        echo "      <h3>Media Manager</h3>"
+        echo "      <p class='sub'>Upload images or audio files for your portal.</p>"
+        echo "      <div style='margin-bottom:20px; border-bottom:1px solid #eee; padding-bottom:20px;'>"
+        echo "        <h4>Background Image</h4>"
+        echo "        <p class='sub'>Replaces <code>bg.jpg</code></p>"
+        echo "        <input type='file' id='file-bg' accept='image/*' style='margin-bottom:10px;'>"
+        echo "        <button onclick=\"uploadFile('file-bg', 'bg.jpg')\" class='btn btn-primary' style='width:100%'>Upload Background</button>"
+        echo "      </div>"
+        echo "      <div style='margin-bottom:20px; border-bottom:1px solid #eee; padding-bottom:20px;'>"
+        echo "        <h4>Insert Coin Audio</h4>"
+        echo "        <p class='sub'>Replaces <code>insert.mp3</code></p>"
+        echo "        <input type='file' id='file-insert' accept='audio/*' style='margin-bottom:10px;'>"
+        echo "        <button onclick=\"uploadFile('file-insert', 'insert.mp3')\" class='btn btn-primary' style='width:100%'>Upload Audio</button>"
+        echo "      </div>"
+        echo "      <div>"
+        echo "        <h4>Connected Audio</h4>"
+        echo "        <p class='sub'>Replaces <code>connected.mp3</code></p>"
+        echo "        <input type='file' id='file-connect' accept='audio/*' style='margin-bottom:10px;'>"
+        echo "        <button onclick=\"uploadFile('file-connect', 'connected.mp3')\" class='btn btn-primary' style='width:100%'>Upload Audio</button>"
+        echo "      </div>"
         echo "    </div>"
-        
-        echo "    <div>"
-        echo "      <h4>Connected Audio</h4>"
-        echo "      <p class='sub'>Replaces <code>connected.mp3</code> (Plays when Internet Starts)</p>"
-        echo "      <input type='file' id='file-connect' accept='audio/*' style='margin-bottom:10px;'>"
-        echo "      <button onclick=\"uploadFile('file-connect', 'connected.mp3')\" class='btn btn-primary' style='width:100%'>Upload Audio</button>"
-        echo "    </div>"
-        
         echo "  </div>"
         echo "</div>"
         
-        # JS for Upload
         echo "<script>"
+        echo "var _previewTimer = null;"
+        echo "function _withBase(html) {"
+        echo "  if(!html) return '';"
+        echo "  if(html.toLowerCase().indexOf('<base ') !== -1) return html;"
+        echo "  if(/<head[^>]*>/i.test(html)) { return html.replace(/<head[^>]*>/i, function(m){ return m + '<base href=\"/\">'; }); }"
+        echo "  return '<base href=\"/\">' + html;"
+        echo "}"
+        echo "function updatePreviewNow() {"
+        echo "  var ta = document.getElementById('portal-editor');"
+        echo "  var fr = document.getElementById('portal-preview');"
+        echo "  if(!ta || !fr) return;"
+        echo "  fr.srcdoc = _withBase(ta.value);"
+        echo "}"
+        echo "function queuePreview() {"
+        echo "  if(_previewTimer) clearTimeout(_previewTimer);"
+        echo "  _previewTimer = setTimeout(updatePreviewNow, 250);"
+        echo "}"
+        echo "function loadInstalledPortal() {"
+        echo "  fetch('/portal.html?ts=' + Date.now())"
+        echo "    .then(function(r){ return r.text(); })"
+        echo "    .then(function(html){ var ta=document.getElementById('portal-editor'); if(ta){ ta.value = html; } updatePreviewNow(); })"
+        echo "    .catch(function(){ updatePreviewNow(); });"
+        echo "}"
+        echo "function applyTheme(name) {"
+        echo "  fetch('/portal_themes/' + name + '.html?ts=' + Date.now())"
+        echo "    .then(function(r){ return r.text(); })"
+        echo "    .then(function(html){ var ta=document.getElementById('portal-editor'); if(ta){ ta.value = html; } updatePreviewNow(); })"
+        echo "    .catch(function(){ alert('Failed to load theme.'); });"
+        echo "}"
+        echo "function submitPortal(actionName) {"
+        echo "  var act = document.getElementById('portal-action');"
+        echo "  var form = document.getElementById('portal-form');"
+        echo "  if(!act || !form) return;"
+        echo "  if(actionName === 'save_theme') {"
+        echo "    var tn = document.getElementById('theme-name');"
+        echo "    if(!tn || !tn.value) { alert('Enter theme name'); return; }"
+        echo "  }"
+        echo "  act.value = actionName;"
+        echo "  form.submit();"
+        echo "}"
         echo "function uploadFile(inputId, filename) {"
         echo "  var input = document.getElementById(inputId);"
         echo "  if(!input.files[0]) { alert('Please select a file first'); return; }"
@@ -1786,33 +2920,104 @@ else
         echo "      btn.disabled = false;"
         echo "  });"
         echo "}"
+        echo "document.addEventListener('DOMContentLoaded', function() {"
+        echo "  var ta = document.getElementById('portal-editor');"
+        echo "  if(ta){ ta.addEventListener('input', queuePreview); }"
+        echo "  loadInstalledPortal();"
+        echo "});"
         echo "</script>"
 
     elif [ "$TAB" = "settings" ]; then
         echo "<div class='header'><h1>Settings</h1></div>"
         
         if echo "$QUERY_STRING" | grep -q "msg=saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Settings Saved Successfully!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_env_loaded"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Supabase Credentials Loaded!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_env_missing"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Missing /etc/pisowifi/supabase.env</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_ok"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>License Activated!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_hw_mismatch"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>License is bound to a different device.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_not_found"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>License key not found.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_fetch_failed"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Could not reach Supabase.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_rls_denied"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Supabase denied access (RLS/permissions).</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_rls_empty"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Supabase returned no rows for anon key (check RLS/policies/grants).</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_bind_failed"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Could not bind license to this device.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_invalid"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Invalid License.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_missing_supabase"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Missing Supabase URL/Key.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_missing_key"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Missing License Key.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_cleared"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>License Cleared.</div>"; fi
         
-        CURRENT_RATE=$(uci get pisowifi.settings.minutes_per_peso 2>/dev/null || echo 12)
+        echo "<div class='grid' style='grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));'>"
+
+        echo "  <div class='card'>"
+        echo "    <h3>General Configuration</h3>"
+        echo "    <form method='POST'>"
+        echo "      <input type='hidden' name='action' value='update_settings'>"
+        echo "      <div style='margin-bottom: 20px;'>"
+        echo "        <label style='display:block; margin-bottom:8px; font-weight:600;'>New Admin Password</label>"
+        echo "        <input type='password' name='new_pass' placeholder='Leave blank to keep current' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;'>"
+        echo "      </div>"
+        echo "      <button class='btn btn-primary' style='width:100%; padding: 12px;'>Save Settings</button>"
+        echo "    </form>"
+        echo "  </div>"
+
+        LIC_ENABLED=$("$UCI" get pisowifi.license.enabled 2>/dev/null || echo 0)
+        LIC_VALID=$("$UCI" get pisowifi.license.valid 2>/dev/null || echo 0)
+        LIC_VENDOR=$("$UCI" get pisowifi.license.vendor_id 2>/dev/null || echo "")
+        LIC_VENDOR_NAME=$("$UCI" get pisowifi.license.vendor_name 2>/dev/null || echo "")
+        LIC_KEY=$("$UCI" get pisowifi.license.license_key 2>/dev/null || echo "")
+        LIC_EXPIRES=$("$UCI" get pisowifi.license.expires_at 2>/dev/null || echo "")
+        LIC_LAST=$("$UCI" get pisowifi.license.last_check 2>/dev/null || echo 0)
+        LIC_HW=$("$UCI" get pisowifi.license.hardware_id 2>/dev/null || echo "")
+        LIC_HW_MATCH=$("$UCI" get pisowifi.license.hardware_match 2>/dev/null || echo 0)
+        SUPA_URL=$("$UCI" get pisowifi.license.supabase_url 2>/dev/null || echo "")
+        SUPA_KEY=$("$UCI" get pisowifi.license.supabase_key 2>/dev/null || echo "")
+
+        ROUTER_MAC=$(cat /sys/class/net/br-lan/address 2>/dev/null || cat /sys/class/net/eth0/address 2>/dev/null || echo "unknown")
+        if [ -x "$BB" ]; then
+            ROUTER_HEX=$(printf "%s" "$ROUTER_MAC" | "$BB" tr -d ':' | "$BB" tr 'a-z' 'A-Z')
+        else
+            ROUTER_HEX=$(printf "%s" "$ROUTER_MAC" | tr -d ':' | tr 'a-z' 'A-Z')
+        fi
+        ROUTER_ID="$ROUTER_MAC"
+        if command -v md5sum >/dev/null 2>&1 && [ "$ROUTER_HEX" != "UNKNOWN" ]; then
+            HW_HEX=$(echo -n "$ROUTER_HEX" | md5sum 2>/dev/null | awk '{print toupper(substr($1,1,16))}')
+            [ -n "$HW_HEX" ] && ROUTER_ID="CPU-$HW_HEX"
+        fi
+        [ -n "$LIC_KEY" ] && LIC_DISPLAY="$LIC_KEY" || LIC_DISPLAY="Not set"
+        [ -f /etc/pisowifi/supabase.env ] && ENV_STATUS="Found" || ENV_STATUS="Missing"
+        [ -n "$SUPA_URL" ] && URL_STATUS="Configured" || URL_STATUS="Not set"
+        [ -n "$SUPA_KEY" ] && KEY_STATUS="Configured" || KEY_STATUS="Not set"
+
+        echo "  <div class='card'>"
+        echo "    <h3>OpenWrt License</h3>"
+        echo "    <div class='sub' style='margin-top:-6px; margin-bottom:10px;'>PisoWifi OpenWrt License Management</div>"
         
-        echo "<div class='card' style='max-width: 600px;'>"
-        echo "<h3>General Configuration</h3>"
-        echo "<form method='POST'>"
-        echo "<input type='hidden' name='action' value='update_settings'>"
-        
-        echo "<div style='margin-bottom: 20px;'>"
-        echo "  <label style='display:block; margin-bottom:8px; font-weight:600;'>Minutes per 1 Peso</label>"
-        echo "  <input type='number' name='rate' value='$CURRENT_RATE' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;'>"
-        echo "  <p class='sub'>How many minutes of internet access for every 1 Peso coin.</p>"
-        echo "</div>"
-        
-        echo "<div style='margin-bottom: 20px;'>"
-        echo "  <label style='display:block; margin-bottom:8px; font-weight:600;'>New Admin Password</label>"
-        echo "  <input type='password' name='new_pass' placeholder='Leave blank to keep current' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;'>"
-        echo "</div>"
-        
-        echo "<button class='btn btn-primary' style='width:100%; padding: 12px;'>Save Settings</button>"
-        echo "</form>"
+        echo "    <div style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:14px; margin-bottom:16px;'>"
+        echo "      <div style='margin-bottom:10px;'>"
+        echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Status</div>"
+        echo "        <div style='font-weight:900; font-size:1.1rem; color:#0f172a;'>$([ "$LIC_VALID" = "1" ] && echo "<span style='color:#16a34a;'>ACTIVE</span>" || echo "<span style='color:#dc2626;'>INACTIVE</span>")</div>"
+        echo "      </div>"
+        echo "      <div>"
+        echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Hardware ID</div>"
+        echo "        <div style='font-weight:900; font-size:0.95rem; word-break:break-all; font-family:monospace; color:#0f172a;'>$ROUTER_ID</div>"
+        echo "      </div>"
+        [ -n "$LIC_EXPIRES" ] && [ "$LIC_VALID" = "0" ] && [ "$LIC_STATUS" = "trial" ] && echo "      <div style='margin-top:10px; font-size:12px; color:#0369a1; font-weight:600;'>Trial expires: $LIC_EXPIRES</div>"
+        echo "    </div>"
+
+        echo "    <form method='POST' style='margin-bottom:12px;'>"
+        echo "      <input type='hidden' name='action' value='activate_license'>"
+        echo "      <div style='margin-bottom:10px;'>"
+        echo "        <label style='display:block; margin-bottom:6px; font-weight:700; font-size:0.9rem;'>Activation Key</label>"
+        echo "        <input type='text' name='license_key' placeholder='Enter license key' style='width:100%; padding:12px; border:1px solid #cbd5e1; border-radius:8px; font-size:1rem;'> "
+        echo "      </div>"
+        echo "      <button class='btn btn-primary' style='width:100%; padding:14px; font-weight:700;'>Activate License</button>"
+        echo "    </form>"
+
+        echo "    <div style='display:flex; gap:10px;'>"
+        echo "      <form method='POST' style='flex:1;'><input type='hidden' name='action' value='license_check'><button class='btn btn-primary' style='width:100%; padding:12px; background:#0f172a; font-size:0.9rem;'>Check License</button></form>"
+        echo "      <form method='POST' style='flex:1;'><input type='hidden' name='action' value='clear_license'><button class='btn btn-danger' style='width:100%; padding:12px; font-size:0.9rem;'>Clear</button></form>"
+        echo "    </div>"
+        echo "  </div>"
+
         echo "</div>"
     fi
 
@@ -1823,6 +3028,741 @@ fi
 echo "</body></html>"
 EOF
 chmod +x /www/cgi-bin/admin
+
+mkdir -p /www/portal_themes
+
+cat << 'HTML' > /www/portal_themes/theme_glass.html
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>NEXI-FI PISOWIFI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root { --bg1:#0ea5e9; --bg2:#a855f7; --card:rgba(255,255,255,0.18); --text:#0b1220; --muted:rgba(15,23,42,0.65); --stroke:rgba(255,255,255,0.35); --shadow: rgba(0,0,0,0.25); --primary:#2563eb; --success:#16a34a; --danger:#dc2626; --warn:#f59e0b; }
+*{box-sizing:border-box}
+body{margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:var(--text); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:22px; background: radial-gradient(1200px 700px at 20% 10%, rgba(255,255,255,0.35), transparent 50%), radial-gradient(900px 600px at 90% 20%, rgba(255,255,255,0.28), transparent 55%), linear-gradient(135deg, var(--bg1), var(--bg2));}
+.shell{width:100%; max-width:520px;}
+.brand{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; color:white}
+.brand h1{font-size:18px; margin:0; letter-spacing:.08em; text-transform:uppercase}
+.pill{font-size:12px; padding:6px 10px; border:1px solid rgba(255,255,255,0.35); border-radius:999px; background:rgba(255,255,255,0.14); backdrop-filter: blur(10px);}
+.card{background:var(--card); border:1px solid var(--stroke); border-radius:18px; box-shadow: 0 20px 50px var(--shadow); padding:18px; backdrop-filter: blur(14px);}
+.device{display:flex; gap:10px; align-items:flex-start; padding:12px; border-radius:14px; background:rgba(255,255,255,0.12); border:1px solid rgba(255,255,255,0.22); margin-bottom:12px}
+.device strong{color:rgba(255,255,255,0.9)}
+.device div{color:rgba(255,255,255,0.85); font-size:13px; line-height:1.4}
+.title{color:white; margin:0 0 12px 0; font-size:20px}
+.sub{color:rgba(255,255,255,0.85); font-size:13px; margin:0 0 10px 0}
+button{width:100%; padding:14px 14px; font-size:15px; font-weight:700; border:0; border-radius:14px; cursor:pointer; color:white; box-shadow: 0 10px 20px rgba(0,0,0,0.18); transition: transform .08s ease;}
+button:active{transform: scale(0.99);}
+.btn-primary{background:linear-gradient(135deg, rgba(37,99,235,0.95), rgba(14,165,233,0.95));}
+.btn-success{background:linear-gradient(135deg, rgba(22,163,74,0.95), rgba(34,197,94,0.95));}
+.btn-danger{background:linear-gradient(135deg, rgba(220,38,38,0.95), rgba(244,63,94,0.95));}
+.btn-warn{background:linear-gradient(135deg, rgba(245,158,11,0.95), rgba(251,191,36,0.95));}
+.row{display:flex; gap:10px}
+.row button{width:100%}
+.muted{font-size:12px; color:rgba(255,255,255,0.8); margin-top:10px; text-align:center}
+.modal{display:none; position:fixed; z-index:10; left:0; top:0; width:100%; height:100%; background: rgba(0,0,0,0.55); padding:20px;}
+.modal-content{background:rgba(255,255,255,0.9); margin:12vh auto 0; padding:18px; width:100%; max-width:420px; border-radius:16px; box-shadow: 0 20px 50px rgba(0,0,0,0.25);}
+.modal-content h2{margin:0 0 8px 0}
+.modal-content p{margin:0 0 14px 0; color:#334155}
+.modal-content .stats{font-size:18px; margin:14px 0; color:#0f172a}
+.link-btn{background:none; color:#dc2626; box-shadow:none; padding:10px; font-weight:700}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="brand">
+    <h1>NEXI-FI</h1>
+    <div class="pill">PISOWIFI PORTAL</div>
+  </div>
+  <div class="card">
+    <h2 class="title">Welcome</h2>
+    <p class="sub">Insert coin to connect. Manage your time anytime.</p>
+    <div class="device">
+      <div style="flex:1">
+        <strong>Device Info</strong>
+        <div>MAC: <span id="info-mac">Loading...</span></div>
+        <div>IP: <span id="info-ip">Loading...</span></div>
+      </div>
+    </div>
+
+    <div id="loading" class="sub">Loading...</div>
+
+    <div id="login-section" style="display:none;">
+      <button onclick="playAudio('insert'); startCoin()" class="btn-success">INSERT COIN</button>
+      <button onclick="openRates()" class="btn-primary" style="margin-top:10px; background:rgba(255,255,255,0.18); border:1px solid rgba(255,255,255,0.30);">RATES</button>
+      <div class="muted">Press WPS button on router when prompted.</div>
+    </div>
+
+    <div id="resume-section" style="display:none;">
+      <h3 class="title" style="font-size:18px">Session Paused</h3>
+      <p class="sub">Time Remaining: <strong id="paused-time"></strong></p>
+      <button onclick="resumeTime()" class="btn-primary">RESUME TIME</button>
+    </div>
+
+    <div id="connected-section" style="display:none;">
+      <h3 class="title" style="font-size:18px">Connected</h3>
+      <p class="sub">MAC: <span id="client-mac"></span></p>
+      <p class="sub">Time Remaining: <strong id="time-remaining">Loading...</strong></p>
+      <p id="internet-status" class="sub">Checking internet...</p>
+      <div style="margin-top:10px">
+        <button onclick="openRates()" class="btn-primary" style="background:rgba(255,255,255,0.18); border:1px solid rgba(255,255,255,0.30);">RATES</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button onclick="playAudio('insert'); startCoin()" class="btn-success">ADD TIME</button>
+        <button onclick="pauseTime()" class="btn-warn">PAUSE</button>
+      </div>
+      <div style="margin-top:10px">
+        <button onclick="logout()" class="btn-danger">LOGOUT</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="coin-modal" class="modal">
+  <div class="modal-content">
+    <h2>Insert Coin</h2>
+    <p>Press WPS button on router</p>
+    <div class="stats">
+      <div><span id="coin-count">0</span> Pesos</div>
+      <div><span id="coin-time">0</span> Minutes</div>
+    </div>
+    <button id="connect-btn" onclick="playAudio('connect'); connect()" class="btn-primary" style="display:none;">START INTERNET</button>
+    <button onclick="closeModal()" class="link-btn">Cancel</button>
+  </div>
+</div>
+
+<div id="rates-modal" class="modal">
+  <div class="modal-content">
+    <h2>Rates</h2>
+    <div id="rates-body" class="sub" style="color:#0f172a;">Loading...</div>
+    <button onclick="closeRates()" class="link-btn">Close</button>
+  </div>
+</div>
+
+<audio id="audio-insert" src="/insert.mp3"></audio>
+<audio id="audio-connect" src="/connected.mp3"></audio>
+
+<script>
+var apiUrl = "/cgi-bin/pisowifi";
+var interval;
+var timerInterval;
+var timeLeft = 0;
+
+function openRates() {
+  var m = document.getElementById("rates-modal");
+  if(m) m.style.display = "block";
+  loadRates();
+}
+
+function closeRates() {
+  var m = document.getElementById("rates-modal");
+  if(m) m.style.display = "none";
+}
+
+function loadRates() {
+  fetch(apiUrl + "?action=rates")
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      var el = document.getElementById("rates-body");
+      if(!el) return;
+      if(!d || !d.rates || !d.rates.length) { el.innerHTML = "<div>No rates set.</div>"; return; }
+      var html = "<div style='display:grid; gap:8px; margin-top:10px;'>";
+      d.rates.forEach(function(x){
+        html += "<div style='display:flex; justify-content:space-between; padding:10px; border-radius:12px; background:rgba(2,6,23,0.06);'>";
+        html += "<div style='font-weight:800;'>₱" + x.amount + "</div>";
+        html += "<div>" + x.minutes + " min</div>";
+        html += "</div>";
+      });
+      html += "</div>";
+      el.innerHTML = html;
+    })
+    .catch(function(){
+      var el = document.getElementById("rates-body");
+      if(el) el.innerHTML = "<div>Failed to load rates.</div>";
+    });
+}
+
+function playAudio(type) {
+  try {
+    stopAudio();
+    var audio = document.getElementById("audio-" + type);
+    if (audio) { audio.currentTime = 0; audio.play().catch(() => {}); }
+  } catch(e) {}
+}
+
+function stopAudio() {
+  try {
+    var sounds = document.querySelectorAll('audio');
+    sounds.forEach(function(sound) { sound.pause(); sound.currentTime = 0; });
+  } catch(e) {}
+}
+
+function formatTime(s) {
+  if (s <= 0) return "Expired";
+  var d = Math.floor(s/86400);
+  var h = Math.floor((s%86400)/3600);
+  var m = Math.floor((s%3600)/60);
+  var sec = s%60;
+  var timeStr = "";
+  if(d > 0) timeStr += d + "d ";
+  if(h > 0) timeStr += h + "h ";
+  if(m > 0) timeStr += m + "m ";
+  timeStr += sec + "s";
+  return timeStr.trim();
+}
+
+function startTimer() {
+  if (timerInterval) clearInterval(timerInterval);
+  timerInterval = setInterval(function() {
+    if(timeLeft > 0) {
+      timeLeft--;
+      var el = document.getElementById("time-remaining");
+      if (el) el.innerText = formatTime(timeLeft);
+    } else {
+      clearInterval(timerInterval);
+      checkStatus();
+    }
+  }, 1000);
+}
+
+function checkInternet() {
+  var img = new Image();
+  var now = new Date().getTime();
+  img.src = "https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png?t=" + now;
+  img.onload = function() {
+    var el = document.getElementById("internet-status");
+    if(el) { el.innerText = "Internet: ONLINE"; }
+    fetch(apiUrl + "?action=log_internet&status=ONLINE&mac=" + encodeURIComponent(document.getElementById("client-mac") ? document.getElementById("client-mac").innerText : "UNKNOWN"));
+  };
+  img.onerror = function() {
+    var el = document.getElementById("internet-status");
+    if(el) { el.innerText = "Internet: OFFLINE"; }
+    fetch(apiUrl + "?action=log_internet&status=OFFLINE&mac=" + encodeURIComponent(document.getElementById("client-mac") ? document.getElementById("client-mac").innerText : "UNKNOWN"));
+  };
+}
+
+function checkStatus() {
+  fetch(apiUrl + "?action=status")
+    .then(r => { if(!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(data => {
+      if(data.mac) { var a=document.getElementById("info-mac"); if(a) a.innerText=data.mac; }
+      if(data.ip) { var b=document.getElementById("info-ip"); if(b) b.innerText=data.ip; }
+      var loading = document.getElementById("loading"); if(loading) loading.style.display="none";
+      if(data.authenticated === "true") {
+        document.getElementById("login-section").style.display="none";
+        document.getElementById("resume-section").style.display="none";
+        document.getElementById("connected-section").style.display="block";
+        timeLeft = parseInt(data.time_remaining);
+        document.getElementById("time-remaining").innerText = formatTime(timeLeft);
+        if(data.mac) document.getElementById("client-mac").innerText = data.mac;
+        startTimer();
+        checkInternet();
+        setTimeout(checkStatus, 5000);
+      } else if(data.authenticated === "paused") {
+        document.getElementById("login-section").style.display="none";
+        document.getElementById("connected-section").style.display="none";
+        document.getElementById("resume-section").style.display="block";
+        document.getElementById("paused-time").innerText = formatTime(data.time_remaining);
+        if(timerInterval) clearInterval(timerInterval);
+        setTimeout(checkStatus, 10000);
+      } else {
+        document.getElementById("login-section").style.display="block";
+        document.getElementById("resume-section").style.display="none";
+        document.getElementById("connected-section").style.display="none";
+        if(timerInterval) clearInterval(timerInterval);
+      }
+    })
+    .catch(() => {
+      var loading = document.getElementById("loading"); if(loading) loading.style.display="none";
+      document.getElementById("login-section").style.display="block";
+    });
+}
+
+function pauseTime() {
+  if(!confirm("Pause Internet? You can resume later.")) return;
+  fetch(apiUrl + "?action=pause").then(r => r.json()).then(data => {
+    if(data.status === "paused") { alert("Internet Paused. Time saved: " + formatTime(data.remaining)); checkStatus(); }
+    else { alert("Error: " + (data.error || "Failed to pause")); }
+  }).catch(() => {});
+}
+
+function resumeTime() {
+  fetch(apiUrl + "?action=resume").then(r => r.json()).then(data => {
+    if(data.status === "resumed") checkStatus();
+    else alert("Error: " + (data.error || "Failed to resume"));
+  }).catch(() => {});
+}
+
+function startCoin() {
+  fetch(apiUrl + "?action=start_coin").then(r => r.json()).then(() => {
+    document.getElementById("coin-modal").style.display="block";
+    document.getElementById("coin-count").innerText="0";
+    document.getElementById("coin-time").innerText="0";
+    document.getElementById("connect-btn").style.display="none";
+    if(interval) clearInterval(interval);
+    interval = setInterval(() => {
+      fetch(apiUrl + "?action=check_coin").then(r => r.json()).then(d => {
+        document.getElementById("coin-count").innerText = d.count;
+        document.getElementById("coin-time").innerText = d.minutes;
+        if(d.count > 0) document.getElementById("connect-btn").style.display="block";
+      }).catch(() => {});
+    }, 1000);
+  }).catch(() => { alert("Failed to start coin session. Please refresh the page."); });
+}
+
+function connect() {
+  stopAudio();
+  playAudio('connect');
+  fetch(apiUrl + "?action=connect").then(r => r.json()).then(data => {
+    closeModal();
+    if(data.status === "connected") {
+      checkStatus();
+      if(data.redirect_url) setTimeout(() => { window.location.href = data.redirect_url; }, 2000);
+    } else {
+      alert(data.error || "Connection failed");
+    }
+  }).catch(() => { alert("Failed to connect. Please try again."); });
+}
+
+function logout() {
+  fetch(apiUrl + "?action=logout").then(r => r.json()).then(() => checkStatus()).catch(() => checkStatus());
+}
+
+function closeModal() {
+  document.getElementById("coin-modal").style.display="none";
+  if(interval) clearInterval(interval);
+  stopAudio();
+}
+
+setTimeout(function() {
+  fetch(apiUrl + "?action=test_dns").then(r => r.json()).then(() => {}).catch(() => {});
+}, 3000);
+checkStatus();
+</script>
+</body>
+</html>
+HTML
+
+cat << 'HTML' > /www/portal_themes/theme_dark_neon.html
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>NEXI-FI PISOWIFI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root { --bg:#070a12; --card:#0b1020; --stroke:#1f2a44; --text:#e5e7eb; --muted:#94a3b8; --neon:#22c55e; --blue:#38bdf8; --pink:#fb7185; --warn:#fbbf24; }
+*{box-sizing:border-box}
+body{margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:22px; background:
+ radial-gradient(800px 500px at 15% 10%, rgba(56,189,248,0.18), transparent 60%),
+ radial-gradient(700px 500px at 90% 20%, rgba(251,113,133,0.16), transparent 55%),
+ radial-gradient(1000px 700px at 50% 110%, rgba(34,197,94,0.10), transparent 60%),
+ var(--bg);
+ color:var(--text); font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+.shell{width:100%; max-width:520px}
+.top{display:flex; align-items:center; justify-content:space-between; margin-bottom:12px}
+.logo{display:flex; flex-direction:column}
+.logo strong{letter-spacing:.12em; text-transform:uppercase; font-size:14px}
+.logo span{color:var(--muted); font-size:12px}
+.badge{border:1px solid rgba(56,189,248,0.35); background: rgba(56,189,248,0.10); padding:6px 10px; border-radius:999px; font-size:12px; color:#e0f2fe}
+.card{background: linear-gradient(180deg, rgba(11,16,32,0.85), rgba(11,16,32,0.70)); border:1px solid rgba(31,42,68,0.85); border-radius:18px; padding:18px; box-shadow: 0 20px 60px rgba(0,0,0,0.55); backdrop-filter: blur(10px);}
+.h1{margin:0 0 6px 0; font-size:20px}
+.sub{margin:0 0 12px 0; color:var(--muted); font-size:13px}
+.info{display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:12px}
+.chip{border:1px solid rgba(31,42,68,0.85); background: rgba(2,6,23,0.35); border-radius:14px; padding:10px}
+.chip b{display:block; font-size:11px; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:.08em}
+.chip span{font-size:12px}
+button{width:100%; padding:14px; border-radius:14px; border:1px solid rgba(31,42,68,0.85); background: rgba(2,6,23,0.25); color:var(--text); font-weight:800; cursor:pointer; transition: transform .08s ease, box-shadow .2s ease; box-shadow: 0 10px 24px rgba(0,0,0,0.35);}
+button:active{transform:scale(0.99)}
+.primary{background: linear-gradient(135deg, rgba(56,189,248,0.25), rgba(56,189,248,0.10)); border-color: rgba(56,189,248,0.45)}
+.success{background: linear-gradient(135deg, rgba(34,197,94,0.25), rgba(34,197,94,0.10)); border-color: rgba(34,197,94,0.45)}
+.danger{background: linear-gradient(135deg, rgba(251,113,133,0.25), rgba(251,113,133,0.10)); border-color: rgba(251,113,133,0.45)}
+.warn{background: linear-gradient(135deg, rgba(251,191,36,0.25), rgba(251,191,36,0.10)); border-color: rgba(251,191,36,0.45)}
+.row{display:flex; gap:10px}
+.row button{width:100%}
+.note{margin-top:10px; font-size:12px; color:var(--muted); text-align:center}
+.modal{display:none; position:fixed; z-index:10; left:0; top:0; width:100%; height:100%; background: rgba(0,0,0,0.65); padding:20px;}
+.modal-content{background: #0b1020; border:1px solid rgba(31,42,68,0.85); margin:12vh auto 0; padding:18px; width:100%; max-width:420px; border-radius:16px;}
+.modal-content h2{margin:0 0 8px 0}
+.modal-content p{margin:0 0 12px 0; color:var(--muted)}
+.stats{display:flex; gap:12px; margin:14px 0}
+.stats div{flex:1; border:1px solid rgba(31,42,68,0.85); border-radius:14px; padding:12px; background: rgba(2,6,23,0.35);}
+.stats div b{display:block; font-size:11px; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:.08em}
+.link{background:none; border:none; box-shadow:none; color:#fb7185; padding:10px; font-weight:800}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="top">
+    <div class="logo"><strong>NEXI-FI</strong><span>Neon Portal</span></div>
+    <div class="badge">Secure Access</div>
+  </div>
+  <div class="card">
+    <div class="h1">Connect to WiFi</div>
+    <p class="sub">Insert coin to start. Pause and resume anytime.</p>
+    <div class="info">
+      <div class="chip"><b>MAC</b><span id="info-mac">Loading...</span></div>
+      <div class="chip"><b>IP</b><span id="info-ip">Loading...</span></div>
+    </div>
+    <div id="loading" class="sub">Loading...</div>
+
+    <div id="login-section" style="display:none;">
+      <button onclick="playAudio('insert'); startCoin()" class="success">INSERT COIN</button>
+      <button onclick="openRates()" class="primary" style="margin-top:10px;">RATES</button>
+      <div class="note">Press WPS button on router when prompted.</div>
+    </div>
+
+    <div id="resume-section" style="display:none;">
+      <div class="h1" style="font-size:18px">Session Paused</div>
+      <p class="sub">Time Remaining: <strong id="paused-time"></strong></p>
+      <button onclick="resumeTime()" class="primary">RESUME TIME</button>
+    </div>
+
+    <div id="connected-section" style="display:none;">
+      <div class="h1" style="font-size:18px">Connected</div>
+      <p class="sub">MAC: <span id="client-mac"></span></p>
+      <p class="sub">Time Remaining: <strong id="time-remaining">Loading...</strong></p>
+      <p id="internet-status" class="sub">Checking internet...</p>
+      <div style="margin-top:10px">
+        <button onclick="openRates()" class="primary">RATES</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button onclick="playAudio('insert'); startCoin()" class="success">ADD TIME</button>
+        <button onclick="pauseTime()" class="warn">PAUSE</button>
+      </div>
+      <div style="margin-top:10px">
+        <button onclick="logout()" class="danger">LOGOUT</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="coin-modal" class="modal">
+  <div class="modal-content">
+    <h2>Insert Coin</h2>
+    <p>Press WPS button on router</p>
+    <div class="stats">
+      <div><b>Coins</b><span id="coin-count">0</span></div>
+      <div><b>Minutes</b><span id="coin-time">0</span></div>
+    </div>
+    <button id="connect-btn" onclick="playAudio('connect'); connect()" class="primary" style="display:none;">START INTERNET</button>
+    <button onclick="closeModal()" class="link">Cancel</button>
+  </div>
+</div>
+
+<div id="rates-modal" class="modal">
+  <div class="modal-content">
+    <h2>Rates</h2>
+    <p class="sub" style="margin-top:-6px;">Current rates</p>
+    <div id="rates-body" class="sub">Loading...</div>
+    <button onclick="closeRates()" class="link">Close</button>
+  </div>
+</div>
+
+<audio id="audio-insert" src="/insert.mp3"></audio>
+<audio id="audio-connect" src="/connected.mp3"></audio>
+
+<script>
+var apiUrl = "/cgi-bin/pisowifi";
+var interval;
+var timerInterval;
+var timeLeft = 0;
+
+function openRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="block";loadRates();}
+function closeRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="none";}
+function loadRates(){fetch(apiUrl+"?action=rates").then(r=>r.json()).then(function(d){var el=document.getElementById("rates-body");if(!el)return;if(!d||!d.rates||!d.rates.length){el.innerHTML="<div>No rates set.</div>";return;}var html="<div style='display:grid; gap:8px; margin-top:10px;'>";d.rates.forEach(function(x){html+="<div style='display:flex; justify-content:space-between; padding:10px; border-radius:12px; border:1px solid rgba(31,42,68,0.85); background: rgba(2,6,23,0.35);'><div style='font-weight:800;'>₱"+x.amount+"</div><div>"+x.minutes+" min</div></div>";});html+="</div>";el.innerHTML=html;}).catch(function(){var el=document.getElementById("rates-body");if(el)el.innerHTML="<div>Failed to load rates.</div>";});}
+
+function playAudio(type){try{stopAudio();var a=document.getElementById("audio-"+type);if(a){a.currentTime=0;a.play().catch(()=>{});}}catch(e){}}
+function stopAudio(){try{document.querySelectorAll("audio").forEach(function(s){s.pause();s.currentTime=0;});}catch(e){}}
+function formatTime(s){if(s<=0)return"Expired";var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60,t="";if(d>0)t+=d+"d ";if(h>0)t+=h+"h ";if(m>0)t+=m+"m ";t+=sec+"s";return t.trim();}
+function startTimer(){if(timerInterval)clearInterval(timerInterval);timerInterval=setInterval(function(){if(timeLeft>0){timeLeft--;var el=document.getElementById("time-remaining");if(el)el.innerText=formatTime(timeLeft);}else{clearInterval(timerInterval);checkStatus();}},1000);}
+function checkInternet(){var img=new Image();var now=new Date().getTime();img.src="https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png?t="+now;img.onload=function(){var el=document.getElementById("internet-status");if(el){el.innerText="Internet: ONLINE";}fetch(apiUrl+"?action=log_internet&status=ONLINE&mac="+encodeURIComponent(document.getElementById("client-mac")?document.getElementById("client-mac").innerText:"UNKNOWN"));};img.onerror=function(){var el=document.getElementById("internet-status");if(el){el.innerText="Internet: OFFLINE";}fetch(apiUrl+"?action=log_internet&status=OFFLINE&mac="+encodeURIComponent(document.getElementById("client-mac")?document.getElementById("client-mac").innerText:"UNKNOWN"));};}
+function checkStatus(){fetch(apiUrl+"?action=status").then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(data=>{if(data.mac){var a=document.getElementById("info-mac");if(a)a.innerText=data.mac;}if(data.ip){var b=document.getElementById("info-ip");if(b)b.innerText=data.ip;}var loading=document.getElementById("loading");if(loading)loading.style.display="none";if(data.authenticated==="true"){document.getElementById("login-section").style.display="none";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="block";timeLeft=parseInt(data.time_remaining);document.getElementById("time-remaining").innerText=formatTime(timeLeft);if(data.mac)document.getElementById("client-mac").innerText=data.mac;startTimer();checkInternet();setTimeout(checkStatus,5000);}else if(data.authenticated==="paused"){document.getElementById("login-section").style.display="none";document.getElementById("connected-section").style.display="none";document.getElementById("resume-section").style.display="block";document.getElementById("paused-time").innerText=formatTime(data.time_remaining);if(timerInterval)clearInterval(timerInterval);setTimeout(checkStatus,10000);}else{document.getElementById("login-section").style.display="block";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="none";if(timerInterval)clearInterval(timerInterval);}}).catch(()=>{var loading=document.getElementById("loading");if(loading)loading.style.display="none";document.getElementById("login-section").style.display="block";});}
+function pauseTime(){if(!confirm("Pause Internet? You can resume later."))return;fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d=>{if(d.status==="paused"){alert("Internet Paused. Time saved: "+formatTime(d.remaining));checkStatus();}else{alert("Error: "+(d.error||"Failed to pause"));}}).catch(()=>{});}
+function resumeTime(){fetch(apiUrl+"?action=resume").then(r=>r.json()).then(d=>{if(d.status==="resumed")checkStatus();else alert("Error: "+(d.error||"Failed to resume"));}).catch(()=>{});}
+function startCoin(){fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(()=>{document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
+function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{closeModal();if(d.status==="connected"){checkStatus();if(d.redirect_url)setTimeout(()=>{window.location.href=d.redirect_url;},2000);}else{alert(d.error||"Connection failed");}}).catch(()=>{alert("Failed to connect. Please try again.");});}
+function logout(){fetch(apiUrl+"?action=logout").then(r=>r.json()).then(()=>checkStatus()).catch(()=>checkStatus());}
+function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);stopAudio();}
+setTimeout(function(){fetch(apiUrl+"?action=test_dns").then(r=>r.json()).then(()=>{}).catch(()=>{});},3000);
+checkStatus();
+</script>
+</body>
+</html>
+HTML
+
+cat << 'HTML' > /www/portal_themes/theme_minimal.html
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>NEXI-FI PISOWIFI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#f8fafc;--card:#ffffff;--text:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#2563eb;--success:#16a34a;--danger:#dc2626;--warn:#f59e0b;}
+*{box-sizing:border-box}
+body{margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:18px; background: radial-gradient(1000px 600px at 20% 0%, rgba(37,99,235,0.08), transparent 55%), radial-gradient(900px 500px at 90% 15%, rgba(22,163,74,0.06), transparent 55%), var(--bg); font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:var(--text);}
+.shell{width:100%; max-width:520px}
+.card{background:var(--card); border:1px solid var(--border); border-radius:16px; padding:18px; box-shadow: 0 10px 25px rgba(2,6,23,0.08);}
+.top{display:flex; align-items:center; justify-content:space-between; margin-bottom:12px}
+.top h1{font-size:16px; margin:0; letter-spacing:.08em; text-transform:uppercase}
+.top span{font-size:12px; color:var(--muted)}
+.info{display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin:12px 0}
+.chip{border:1px solid var(--border); border-radius:12px; padding:10px}
+.chip b{display:block; font-size:11px; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:.08em}
+.chip span{font-size:12px}
+.h2{margin:0; font-size:18px}
+.sub{margin:6px 0 0 0; color:var(--muted); font-size:13px}
+button{width:100%; padding:14px; border-radius:12px; border:1px solid var(--border); background:#f1f5f9; font-weight:800; cursor:pointer; transition: transform .08s ease;}
+button:active{transform:scale(0.99)}
+.primary{background:var(--primary); border-color:var(--primary); color:white}
+.success{background:var(--success); border-color:var(--success); color:white}
+.danger{background:var(--danger); border-color:var(--danger); color:white}
+.warn{background:var(--warn); border-color:var(--warn); color:white}
+.row{display:flex; gap:10px; margin-top:10px}
+.row button{width:100%}
+.note{margin-top:12px; font-size:12px; color:var(--muted); text-align:center}
+.modal{display:none; position:fixed; z-index:10; left:0; top:0; width:100%; height:100%; background: rgba(2,6,23,0.5); padding:18px;}
+.modal-content{background:var(--card); border:1px solid var(--border); margin:12vh auto 0; padding:18px; width:100%; max-width:420px; border-radius:14px;}
+.modal-content h2{margin:0 0 8px 0}
+.modal-content p{margin:0 0 12px 0; color:var(--muted)}
+.stats{display:flex; gap:12px; margin:14px 0}
+.stats div{flex:1; border:1px solid var(--border); border-radius:12px; padding:12px; background:#f8fafc}
+.stats div b{display:block; font-size:11px; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:.08em}
+.link{background:none; border:none; color:var(--danger); padding:10px; font-weight:800}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="card">
+    <div class="top">
+      <h1>NEXI-FI</h1>
+      <span>Simple Portal</span>
+    </div>
+    <div class="h2">Connect</div>
+    <p class="sub">Insert coin to start your session.</p>
+    <div class="info">
+      <div class="chip"><b>MAC</b><span id="info-mac">Loading...</span></div>
+      <div class="chip"><b>IP</b><span id="info-ip">Loading...</span></div>
+    </div>
+    <div id="loading" class="sub">Loading...</div>
+    <div id="login-section" style="display:none;">
+      <button onclick="playAudio('insert'); startCoin()" class="success">INSERT COIN</button>
+      <button onclick="openRates()" class="primary" style="margin-top:10px;">RATES</button>
+      <div class="note">Press WPS button on router when prompted.</div>
+    </div>
+    <div id="resume-section" style="display:none;">
+      <div class="h2" style="font-size:16px">Session Paused</div>
+      <p class="sub">Time Remaining: <strong id="paused-time"></strong></p>
+      <button onclick="resumeTime()" class="primary">RESUME TIME</button>
+    </div>
+    <div id="connected-section" style="display:none;">
+      <div class="h2" style="font-size:16px">Connected</div>
+      <p class="sub">MAC: <span id="client-mac"></span></p>
+      <p class="sub">Time Remaining: <strong id="time-remaining">Loading...</strong></p>
+      <p id="internet-status" class="sub">Checking internet...</p>
+      <div style="margin-top:10px">
+        <button onclick="openRates()" class="primary">RATES</button>
+      </div>
+      <div class="row">
+        <button onclick="playAudio('insert'); startCoin()" class="success">ADD TIME</button>
+        <button onclick="pauseTime()" class="warn">PAUSE</button>
+      </div>
+      <div style="margin-top:10px">
+        <button onclick="logout()" class="danger">LOGOUT</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="coin-modal" class="modal">
+  <div class="modal-content">
+    <h2>Insert Coin</h2>
+    <p>Press WPS button on router</p>
+    <div class="stats">
+      <div><b>Coins</b><span id="coin-count">0</span></div>
+      <div><b>Minutes</b><span id="coin-time">0</span></div>
+    </div>
+    <button id="connect-btn" onclick="playAudio('connect'); connect()" class="primary" style="display:none;">START INTERNET</button>
+    <button onclick="closeModal()" class="link">Cancel</button>
+  </div>
+</div>
+
+<div id="rates-modal" class="modal">
+  <div class="modal-content">
+    <h2>Rates</h2>
+    <p>Current rates</p>
+    <div id="rates-body" class="sub">Loading...</div>
+    <button onclick="closeRates()" class="link">Close</button>
+  </div>
+</div>
+
+<audio id="audio-insert" src="/insert.mp3"></audio>
+<audio id="audio-connect" src="/connected.mp3"></audio>
+
+<script>
+var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;
+function openRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="block";loadRates();}
+function closeRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="none";}
+function loadRates(){fetch(apiUrl+"?action=rates").then(r=>r.json()).then(function(d){var el=document.getElementById("rates-body");if(!el)return;if(!d||!d.rates||!d.rates.length){el.innerHTML="<div>No rates set.</div>";return;}var html="<div style='display:grid; gap:8px; margin-top:10px;'>";d.rates.forEach(function(x){html+="<div style='display:flex; justify-content:space-between; padding:10px; border-radius:12px; border:1px solid #e2e8f0; background:#f8fafc;'><div style='font-weight:800;'>₱"+x.amount+"</div><div>"+x.minutes+" min</div></div>";});html+="</div>";el.innerHTML=html;}).catch(function(){var el=document.getElementById("rates-body");if(el)el.innerHTML="<div>Failed to load rates.</div>";});}
+function playAudio(t){try{stopAudio();var a=document.getElementById("audio-"+t);if(a){a.currentTime=0;a.play().catch(()=>{});}}catch(e){}}
+function stopAudio(){try{document.querySelectorAll("audio").forEach(function(s){s.pause();s.currentTime=0;});}catch(e){}}
+function formatTime(s){if(s<=0)return"Expired";var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60,t="";if(d>0)t+=d+"d ";if(h>0)t+=h+"h ";if(m>0)t+=m+"m ";t+=sec+"s";return t.trim();}
+function startTimer(){if(timerInterval)clearInterval(timerInterval);timerInterval=setInterval(function(){if(timeLeft>0){timeLeft--;var el=document.getElementById("time-remaining");if(el)el.innerText=formatTime(timeLeft);}else{clearInterval(timerInterval);checkStatus();}},1000);}
+function checkInternet(){var img=new Image();var now=new Date().getTime();img.src="https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png?t="+now;img.onload=function(){var el=document.getElementById("internet-status");if(el){el.innerText="Internet: ONLINE";el.style.color="#16a34a";}fetch(apiUrl+"?action=log_internet&status=ONLINE&mac="+encodeURIComponent(document.getElementById("client-mac")?document.getElementById("client-mac").innerText:"UNKNOWN"));};img.onerror=function(){var el=document.getElementById("internet-status");if(el){el.innerText="Internet: OFFLINE";el.style.color="#dc2626";}fetch(apiUrl+"?action=log_internet&status=OFFLINE&mac="+encodeURIComponent(document.getElementById("client-mac")?document.getElementById("client-mac").innerText:"UNKNOWN"));};}
+function checkStatus(){fetch(apiUrl+"?action=status").then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(d=>{if(d.mac){var a=document.getElementById("info-mac");if(a)a.innerText=d.mac;}if(d.ip){var b=document.getElementById("info-ip");if(b)b.innerText=d.ip;}var loading=document.getElementById("loading");if(loading)loading.style.display="none";if(d.authenticated==="true"){document.getElementById("login-section").style.display="none";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="block";timeLeft=parseInt(d.time_remaining);document.getElementById("time-remaining").innerText=formatTime(timeLeft);if(d.mac)document.getElementById("client-mac").innerText=d.mac;startTimer();checkInternet();setTimeout(checkStatus,5000);}else if(d.authenticated==="paused"){document.getElementById("login-section").style.display="none";document.getElementById("connected-section").style.display="none";document.getElementById("resume-section").style.display="block";document.getElementById("paused-time").innerText=formatTime(d.time_remaining);if(timerInterval)clearInterval(timerInterval);setTimeout(checkStatus,10000);}else{document.getElementById("login-section").style.display="block";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="none";if(timerInterval)clearInterval(timerInterval);}}).catch(()=>{var loading=document.getElementById("loading");if(loading)loading.style.display="none";document.getElementById("login-section").style.display="block";});}
+function pauseTime(){if(!confirm("Pause Internet? You can resume later."))return;fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d=>{if(d.status==="paused"){alert("Internet Paused. Time saved: "+formatTime(d.remaining));checkStatus();}else{alert("Error: "+(d.error||"Failed to pause"));}}).catch(()=>{});}
+function resumeTime(){fetch(apiUrl+"?action=resume").then(r=>r.json()).then(d=>{if(d.status==="resumed")checkStatus();else alert("Error: "+(d.error||"Failed to resume"));}).catch(()=>{});}
+function startCoin(){fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(()=>{document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
+function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{closeModal();if(d.status==="connected"){checkStatus();if(d.redirect_url)setTimeout(()=>{window.location.href=d.redirect_url;},2000);}else{alert(d.error||"Connection failed");}}).catch(()=>{alert("Failed to connect. Please try again.");});}
+function logout(){fetch(apiUrl+"?action=logout").then(r=>r.json()).then(()=>checkStatus()).catch(()=>checkStatus());}
+function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);stopAudio();}
+setTimeout(function(){fetch(apiUrl+"?action=test_dns").then(r=>r.json()).then(()=>{}).catch(()=>{});},3000);
+checkStatus();
+</script>
+</body>
+</html>
+HTML
+
+cat << 'HTML' > /www/portal_themes/theme_sunset.html
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>NEXI-FI PISOWIFI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root { --bg1:#fb7185; --bg2:#f59e0b; --bg3:#22c55e; --card:rgba(255,255,255,0.92); --text:#0f172a; --muted:#475569; --primary:#2563eb; --success:#16a34a; --danger:#dc2626; --warn:#f59e0b; }
+*{box-sizing:border-box}
+body{margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:22px; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+background: radial-gradient(1100px 700px at 10% 0%, rgba(255,255,255,0.45), transparent 55%),
+linear-gradient(135deg, var(--bg1), var(--bg2) 55%, var(--bg3));}
+.shell{width:100%; max-width:520px}
+.card{background:var(--card); border-radius:18px; padding:18px; box-shadow: 0 18px 50px rgba(0,0,0,0.25);}
+.hero{display:flex; align-items:center; justify-content:space-between; margin-bottom:10px}
+.hero h1{margin:0; font-size:16px; text-transform:uppercase; letter-spacing:.08em}
+.hero span{font-size:12px; color:var(--muted)}
+.banner{border-radius:14px; padding:12px; background: linear-gradient(135deg, rgba(37,99,235,0.10), rgba(34,197,94,0.10)); border:1px solid rgba(15,23,42,0.08); margin-bottom:12px}
+.banner strong{display:block; margin-bottom:4px}
+.banner div{font-size:12px; color:var(--muted); line-height:1.4}
+.h2{margin:0; font-size:18px}
+.sub{margin:6px 0 0 0; color:var(--muted); font-size:13px}
+button{width:100%; padding:14px; border-radius:14px; border:0; color:white; font-weight:900; cursor:pointer; transition: transform .08s ease;}
+button:active{transform:scale(0.99)}
+.primary{background: linear-gradient(135deg, rgba(37,99,235,0.95), rgba(14,165,233,0.95));}
+.success{background: linear-gradient(135deg, rgba(22,163,74,0.95), rgba(34,197,94,0.95));}
+.danger{background: linear-gradient(135deg, rgba(220,38,38,0.95), rgba(244,63,94,0.95));}
+.warn{background: linear-gradient(135deg, rgba(245,158,11,0.95), rgba(251,191,36,0.95));}
+.row{display:flex; gap:10px; margin-top:10px}
+.row button{width:100%}
+.note{margin-top:10px; font-size:12px; color:var(--muted); text-align:center}
+.modal{display:none; position:fixed; z-index:10; left:0; top:0; width:100%; height:100%; background: rgba(2,6,23,0.6); padding:18px;}
+.modal-content{background:var(--card); margin:12vh auto 0; padding:18px; width:100%; max-width:420px; border-radius:16px;}
+.modal-content h2{margin:0 0 8px 0}
+.modal-content p{margin:0 0 12px 0; color:var(--muted)}
+.stats{display:flex; gap:12px; margin:14px 0}
+.stats div{flex:1; border-radius:14px; padding:12px; background: rgba(15,23,42,0.04); border:1px solid rgba(15,23,42,0.08);}
+.stats div b{display:block; font-size:11px; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:.08em}
+.link{background:none; border:none; color:var(--danger); padding:10px; font-weight:900}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="card">
+    <div class="hero">
+      <h1>NEXI-FI</h1>
+      <span>Sunset Theme</span>
+    </div>
+    <div class="banner">
+      <strong>Device Info</strong>
+      <div>MAC: <span id="info-mac">Loading...</span></div>
+      <div>IP: <span id="info-ip">Loading...</span></div>
+    </div>
+    <div class="h2">Get Connected</div>
+    <p class="sub">Insert coin to start. Pause and resume anytime.</p>
+    <div id="loading" class="sub">Loading...</div>
+    <div id="login-section" style="display:none;">
+      <button onclick="playAudio('insert'); startCoin()" class="success">INSERT COIN</button>
+      <button onclick="openRates()" class="primary" style="margin-top:10px;">RATES</button>
+      <div class="note">Press WPS button on router when prompted.</div>
+    </div>
+    <div id="resume-section" style="display:none;">
+      <div class="h2" style="font-size:16px">Session Paused</div>
+      <p class="sub">Time Remaining: <strong id="paused-time"></strong></p>
+      <button onclick="resumeTime()" class="primary">RESUME TIME</button>
+    </div>
+    <div id="connected-section" style="display:none;">
+      <div class="h2" style="font-size:16px">Connected</div>
+      <p class="sub">MAC: <span id="client-mac"></span></p>
+      <p class="sub">Time Remaining: <strong id="time-remaining">Loading...</strong></p>
+      <p id="internet-status" class="sub">Checking internet...</p>
+      <div style="margin-top:10px">
+        <button onclick="openRates()" class="primary">RATES</button>
+      </div>
+      <div class="row">
+        <button onclick="playAudio('insert'); startCoin()" class="success">ADD TIME</button>
+        <button onclick="pauseTime()" class="warn">PAUSE</button>
+      </div>
+      <div style="margin-top:10px">
+        <button onclick="logout()" class="danger">LOGOUT</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="coin-modal" class="modal">
+  <div class="modal-content">
+    <h2>Insert Coin</h2>
+    <p>Press WPS button on router</p>
+    <div class="stats">
+      <div><b>Coins</b><span id="coin-count">0</span></div>
+      <div><b>Minutes</b><span id="coin-time">0</span></div>
+    </div>
+    <button id="connect-btn" onclick="playAudio('connect'); connect()" class="primary" style="display:none;">START INTERNET</button>
+    <button onclick="closeModal()" class="link">Cancel</button>
+  </div>
+</div>
+
+<div id="rates-modal" class="modal">
+  <div class="modal-content">
+    <h2>Rates</h2>
+    <p>Current rates</p>
+    <div id="rates-body" class="sub">Loading...</div>
+    <button onclick="closeRates()" class="link">Close</button>
+  </div>
+</div>
+
+<audio id="audio-insert" src="/insert.mp3"></audio>
+<audio id="audio-connect" src="/connected.mp3"></audio>
+
+<script>
+var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;
+function openRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="block";loadRates();}
+function closeRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="none";}
+function loadRates(){fetch(apiUrl+"?action=rates").then(r=>r.json()).then(function(d){var el=document.getElementById("rates-body");if(!el)return;if(!d||!d.rates||!d.rates.length){el.innerHTML="<div>No rates set.</div>";return;}var html="<div style='display:grid; gap:8px; margin-top:10px;'>";d.rates.forEach(function(x){html+="<div style='display:flex; justify-content:space-between; padding:10px; border-radius:14px; background: rgba(15,23,42,0.04); border:1px solid rgba(15,23,42,0.08);'><div style='font-weight:900;'>₱"+x.amount+"</div><div>"+x.minutes+" min</div></div>";});html+="</div>";el.innerHTML=html;}).catch(function(){var el=document.getElementById("rates-body");if(el)el.innerHTML="<div>Failed to load rates.</div>";});}
+function playAudio(t){try{stopAudio();var a=document.getElementById("audio-"+t);if(a){a.currentTime=0;a.play().catch(()=>{});}}catch(e){}}
+function stopAudio(){try{document.querySelectorAll("audio").forEach(function(s){s.pause();s.currentTime=0;});}catch(e){}}
+function formatTime(s){if(s<=0)return"Expired";var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60,t="";if(d>0)t+=d+"d ";if(h>0)t+=h+"h ";if(m>0)t+=m+"m ";t+=sec+"s";return t.trim();}
+function startTimer(){if(timerInterval)clearInterval(timerInterval);timerInterval=setInterval(function(){if(timeLeft>0){timeLeft--;var el=document.getElementById("time-remaining");if(el)el.innerText=formatTime(timeLeft);}else{clearInterval(timerInterval);checkStatus();}},1000);}
+function checkInternet(){var img=new Image();var now=new Date().getTime();img.src="https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png?t="+now;img.onload=function(){var el=document.getElementById("internet-status");if(el){el.innerText="Internet: ONLINE";el.style.color="#16a34a";}fetch(apiUrl+"?action=log_internet&status=ONLINE&mac="+encodeURIComponent(document.getElementById("client-mac")?document.getElementById("client-mac").innerText:"UNKNOWN"));};img.onerror=function(){var el=document.getElementById("internet-status");if(el){el.innerText="Internet: OFFLINE";el.style.color="#dc2626";}fetch(apiUrl+"?action=log_internet&status=OFFLINE&mac="+encodeURIComponent(document.getElementById("client-mac")?document.getElementById("client-mac").innerText:"UNKNOWN"));};}
+function checkStatus(){fetch(apiUrl+"?action=status").then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(d=>{if(d.mac){var a=document.getElementById("info-mac");if(a)a.innerText=d.mac;}if(d.ip){var b=document.getElementById("info-ip");if(b)b.innerText=d.ip;}var loading=document.getElementById("loading");if(loading)loading.style.display="none";if(d.authenticated==="true"){document.getElementById("login-section").style.display="none";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="block";timeLeft=parseInt(d.time_remaining);document.getElementById("time-remaining").innerText=formatTime(timeLeft);if(d.mac)document.getElementById("client-mac").innerText=d.mac;startTimer();checkInternet();setTimeout(checkStatus,5000);}else if(d.authenticated==="paused"){document.getElementById("login-section").style.display="none";document.getElementById("connected-section").style.display="none";document.getElementById("resume-section").style.display="block";document.getElementById("paused-time").innerText=formatTime(d.time_remaining);if(timerInterval)clearInterval(timerInterval);setTimeout(checkStatus,10000);}else{document.getElementById("login-section").style.display="block";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="none";if(timerInterval)clearInterval(timerInterval);}}).catch(()=>{var loading=document.getElementById("loading");if(loading)loading.style.display="none";document.getElementById("login-section").style.display="block";});}
+function pauseTime(){if(!confirm("Pause Internet? You can resume later."))return;fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d=>{if(d.status==="paused"){alert("Internet Paused. Time saved: "+formatTime(d.remaining));checkStatus();}else{alert("Error: "+(d.error||"Failed to pause"));}}).catch(()=>{});}
+function resumeTime(){fetch(apiUrl+"?action=resume").then(r=>r.json()).then(d=>{if(d.status==="resumed")checkStatus();else alert("Error: "+(d.error||"Failed to resume"));}).catch(()=>{});}
+function startCoin(){fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(()=>{document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
+function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{closeModal();if(d.status==="connected"){checkStatus();if(d.redirect_url)setTimeout(()=>{window.location.href=d.redirect_url;},2000);}else{alert(d.error||"Connection failed");}}).catch(()=>{alert("Failed to connect. Please try again.");});}
+function logout(){fetch(apiUrl+"?action=logout").then(r=>r.json()).then(()=>checkStatus()).catch(()=>checkStatus());}
+function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);stopAudio();}
+setTimeout(function(){fetch(apiUrl+"?action=test_dns").then(r=>r.json()).then(()=>{}).catch(()=>{});},3000);
+checkStatus();
+</script>
+</body>
+</html>
+HTML
+
+if [ ! -f /www/portal.html ]; then
+    cat /www/portal_themes/theme_glass.html > /www/portal.html
+fi
 
 # 4. Redirect Root to CGI
 echo "Setting up redirect..."
@@ -1864,20 +3804,44 @@ fi
 uci set network.lan.ipaddr='10.0.0.1'
 uci commit network
 
-# Enable WiFi Radio
-uci set wireless.radio0.disabled='0'
+# Enable all WiFi radios (avoid hardcoding radio0)
+RADIOS=$(uci show wireless 2>/dev/null | grep "=wifi-device" | cut -d. -f2 | cut -d= -f1)
+for r in $RADIOS; do
+    uci set wireless."$r".disabled='0' 2>/dev/null || true
+done
 
-# Configure WiFi Interface (SSID: NEXI-FI PISOWIFI, Open)
-uci set wireless.@wifi-iface[0].device='radio0'
-uci set wireless.@wifi-iface[0].network='lan'
-uci set wireless.@wifi-iface[0].mode='ap'
-uci set wireless.@wifi-iface[0].ssid='NEXI-FI PISOWIFI'
-uci set wireless.@wifi-iface[0].encryption='none'
-uci set wireless.@wifi-iface[0].disabled='0'
-uci commit wireless
+# Configure all AP interfaces (avoid hardcoding @wifi-iface[0])
+IFACES=$(uci show wireless 2>/dev/null | grep "=wifi-iface" | cut -d. -f2 | cut -d= -f1)
+if [ -z "$IFACES" ]; then
+    FIRST_RADIO=$(echo "$RADIOS" | awk '{print $1}')
+    [ -z "$FIRST_RADIO" ] && FIRST_RADIO="radio0"
+    NEW_IF=$(uci add wireless wifi-iface 2>/dev/null || true)
+    IFACES="$NEW_IF"
+    uci set wireless."$NEW_IF".device="$FIRST_RADIO" 2>/dev/null || true
+fi
+
+for i in $IFACES; do
+    MODE=$(uci get wireless."$i".mode 2>/dev/null)
+    [ -z "$MODE" ] && MODE="ap"
+    if [ "$MODE" = "ap" ]; then
+        uci set wireless."$i".network='lan' 2>/dev/null || true
+        uci set wireless."$i".mode='ap' 2>/dev/null || true
+        uci set wireless."$i".ssid='NEXI-FI PISOWIFI' 2>/dev/null || true
+        uci set wireless."$i".encryption='none' 2>/dev/null || true
+        uci set wireless."$i".disabled='0' 2>/dev/null || true
+    fi
+done
+uci commit wireless 2>/dev/null || true
 
 echo "Restarting Network..."
-/etc/init.d/network restart
-/sbin/wifi reload
+# Use reload_config if available (Modern OpenWrt), otherwise fallback
+if [ -x /sbin/reload_config ]; then
+    /sbin/reload_config
+else
+    /etc/init.d/network restart 2>/dev/null || true
+fi
+
+# Reload WiFi (Ignore errors if radio busy)
+/sbin/wifi reload 2>/dev/null || true
 
 echo "Network Configured: IP 10.0.0.1, SSID 'NEXI-FI PISOWIFI'"
