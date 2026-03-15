@@ -1470,15 +1470,32 @@ cat << 'EOF' > /www/cgi-bin/admin
 
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 BB="/bin/busybox"
+[ -x "$BB" ] || BB=$(command -v busybox)
+
+# Define robust command aliases
+if [ -x "$BB" ]; then
+    HEAD="$BB head"
+    CUT="$BB cut"
+    GREP="$BB grep"
+    SED="$BB sed"
+    TR="$BB tr"
+    CAT="$BB cat"
+    DATE="$BB date"
+    LOGGER="$BB logger"
+else
+    HEAD="head"
+    CUT="cut"
+    GREP="grep"
+    SED="sed"
+    TR="tr"
+    CAT="cat"
+    DATE="date"
+    LOGGER="logger"
+fi
+
 UCI="/sbin/uci"
 log_license() {
-    if [ -x "$BB" ]; then
-        "$BB" logger -t pisowifi_license "$@"
-    elif command -v logger >/dev/null 2>&1; then
-        logger -t pisowifi_license "$@"
-    else
-        echo "$@" >> /tmp/pisowifi_license.log
-    fi
+    $LOGGER -t pisowifi_license "$@"
 }
 
 # Enable debugging to log errors to system log
@@ -1496,7 +1513,11 @@ if [ "$REQUEST_METHOD" = "POST" ] && echo "$QUERY_STRING" | grep -q "action=uplo
         # Stream stdin directly to file (Low RAM usage)
         if [ -n "$CONTENT_LENGTH" ]; then
             # If head -c is available (BusyBox usually has it)
-            head -c "$CONTENT_LENGTH" > "/www/$FILENAME" 2>/dev/null || cat > "/www/$FILENAME"
+            if [ -x "$BB" ]; then
+                "$BB" head -c "$CONTENT_LENGTH" > "/www/$FILENAME" 2>/dev/null || cat > "/www/$FILENAME"
+            else
+                head -c "$CONTENT_LENGTH" > "/www/$FILENAME" 2>/dev/null || cat > "/www/$FILENAME"
+            fi
         else
             cat > "/www/$FILENAME"
         fi
@@ -1520,6 +1541,10 @@ SESSION_COOKIE=$(echo "$HTTP_COOKIE" | grep -o "session=[^;]*" | cut -d= -f2)
 ADMIN_PASS=$(uci get pisowifi.settings.admin_password 2>/dev/null || echo "admin")
 DB_FILE="/etc/pisowifi/pisowifi.db"
 
+# Initialize SQLite Database Tables
+[ -d /etc/pisowifi ] || mkdir -p /etc/pisowifi
+sqlite3 "$DB_FILE" "CREATE TABLE IF NOT EXISTS license (id INTEGER PRIMARY KEY, status TEXT, license_key TEXT, expires_at TEXT, vendor_uuid TEXT, hardware_id TEXT, valid INTEGER, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);" 2>/dev/null
+
 # Simple Login Check
 check_auth() {
     if [ "$SESSION_COOKIE" != "logged_in_secret_token" ]; then
@@ -1535,7 +1560,11 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     
     if [ -n "$CONTENT_LENGTH" ]; then
         # Read exactly CONTENT_LENGTH bytes
-        head -c "$CONTENT_LENGTH" > "$POST_FILE"
+        if [ -x "$BB" ]; then
+            "$BB" head -c "$CONTENT_LENGTH" > "$POST_FILE"
+        else
+            head -c "$CONTENT_LENGTH" > "$POST_FILE"
+        fi
     else
         cat > "$POST_FILE"
     fi
@@ -1546,19 +1575,19 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         # Grep for var name, then decode
         # Using grep -a (text mode) in case of binary data
         # We look for $1= then characters that are NOT & (param separator)
-        VAL=$(grep -a -o "$1=[^&]*" "$POST_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+        VAL=$($GREP -a -o "$1=[^&]*" "$POST_FILE" 2>/dev/null | $HEAD -1 | $CUT -d= -f2-)
         [ -z "$VAL" ] && return
         
         # Decode URL encoding:
         # 1. Replace + with space
         # 2. Replace %XX with \xXX for printf %b
-        DECODED=$(echo "$VAL" | sed 's/+/ /g; s/%\([0-9a-fA-F]\{2\}\)/\\x\1/g')
+        DECODED=$(echo "$VAL" | $SED 's/+/ /g; s/%\([0-9a-fA-F]\{2\}\)/\\x\1/g')
         # Use printf %b to interpret \xXX as characters
         printf "%b" "$DECODED"
     }
 
     sql_escape() {
-        printf "%s" "$1" | sed "s/'/''/g"
+        printf "%s" "$1" | $SED "s/'/''/g"
     }
 
     supa_request() {
@@ -1584,20 +1613,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         SUPA_CURL_EXIT="$?"
         if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
             SUPA_HTTP_CODE="0"
-            if [ -x "$BB" ]; then
-                SUPA_CURL_ERR=$("$BB" head -1 "$ERR" 2>/dev/null | "$BB" tr -d '\r' | "$BB" tr '\n' ' ')
-            else
-                SUPA_CURL_ERR=$(head -1 "$ERR" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
-            fi
+            SUPA_CURL_ERR=$($HEAD -1 "$ERR" 2>/dev/null | $TR -d '\r' | $TR '\n' ' ')
             [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
         fi
-        if [ -x "$BB" ]; then
-            SUPA_BODY=$("$BB" cat "$TMP" 2>/dev/null)
-            "$BB" rm -f "$TMP" "$ERR" 2>/dev/null || true
-        else
-            SUPA_BODY=$(cat "$TMP" 2>/dev/null)
-            rm -f "$TMP" "$ERR" 2>/dev/null || true
-        fi
+        SUPA_BODY=$($CAT "$TMP" 2>/dev/null)
+        $CAT /dev/null > "$TMP" 2>/dev/null
+        rm -f "$TMP" "$ERR" 2>/dev/null || true
     }
 
     supa_patch() {
@@ -1624,20 +1645,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         SUPA_CURL_EXIT="$?"
         if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
             SUPA_HTTP_CODE="0"
-            if [ -x "$BB" ]; then
-                SUPA_CURL_ERR=$("$BB" head -1 "$ERR" 2>/dev/null | "$BB" tr -d '\r' | "$BB" tr '\n' ' ')
-            else
-                SUPA_CURL_ERR=$(head -1 "$ERR" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
-            fi
+            SUPA_CURL_ERR=$($HEAD -1 "$ERR" 2>/dev/null | $TR -d '\r' | $TR '\n' ' ')
             [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
         fi
-        if [ -x "$BB" ]; then
-            SUPA_BODY=$("$BB" cat "$TMP" 2>/dev/null)
-            "$BB" rm -f "$TMP" "$ERR" 2>/dev/null || true
-        else
-            SUPA_BODY=$(cat "$TMP" 2>/dev/null)
-            rm -f "$TMP" "$ERR" 2>/dev/null || true
-        fi
+        SUPA_BODY=$($CAT "$TMP" 2>/dev/null)
+        $CAT /dev/null > "$TMP" 2>/dev/null
+        rm -f "$TMP" "$ERR" 2>/dev/null || true
     }
 
     supa_rpc() {
@@ -1664,20 +1677,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         SUPA_CURL_EXIT="$?"
         if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
             SUPA_HTTP_CODE="0"
-            if [ -x "$BB" ]; then
-                SUPA_CURL_ERR=$("$BB" head -1 "$ERR" 2>/dev/null | "$BB" tr -d '\r' | "$BB" tr '\n' ' ')
-            else
-                SUPA_CURL_ERR=$(head -1 "$ERR" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
-            fi
+            SUPA_CURL_ERR=$($HEAD -1 "$ERR" 2>/dev/null | $TR -d '\r' | $TR '\n' ' ')
             [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
         fi
-        if [ -x "$BB" ]; then
-            SUPA_BODY=$("$BB" cat "$TMP" 2>/dev/null)
-            "$BB" rm -f "$TMP" "$ERR" 2>/dev/null || true
-        else
-            SUPA_BODY=$(cat "$TMP" 2>/dev/null)
-            rm -f "$TMP" "$ERR" 2>/dev/null || true
-        fi
+        SUPA_BODY=$($CAT "$TMP" 2>/dev/null)
+        $CAT /dev/null > "$TMP" 2>/dev/null
+        rm -f "$TMP" "$ERR" 2>/dev/null || true
     }
 
     supa_insert() {
@@ -1704,20 +1709,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         SUPA_CURL_EXIT="$?"
         if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
             SUPA_HTTP_CODE="0"
-            if [ -x "$BB" ]; then
-                SUPA_CURL_ERR=$("$BB" head -1 "$ERR" 2>/dev/null | "$BB" tr -d '\r' | "$BB" tr '\n' ' ')
-            else
-                SUPA_CURL_ERR=$(head -1 "$ERR" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
-            fi
+            SUPA_CURL_ERR=$($HEAD -1 "$ERR" 2>/dev/null | $TR -d '\r' | $TR '\n' ' ')
             [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
         fi
-        if [ -x "$BB" ]; then
-            SUPA_BODY=$("$BB" cat "$TMP" 2>/dev/null)
-            "$BB" rm -f "$TMP" "$ERR" 2>/dev/null || true
-        else
-            SUPA_BODY=$(cat "$TMP" 2>/dev/null)
-            rm -f "$TMP" "$ERR" 2>/dev/null || true
-        fi
+        SUPA_BODY=$($CAT "$TMP" 2>/dev/null)
+        $CAT /dev/null > "$TMP" 2>/dev/null
+        rm -f "$TMP" "$ERR" 2>/dev/null || true
     }
 
     json_first() {
@@ -1725,21 +1722,16 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         if command -v jsonfilter >/dev/null 2>&1; then
             jsonfilter -e "@[0].$FIELD" 2>/dev/null
         else
-            sed -n "s/.*\"$FIELD\":[ ]*\"\\([^\"]*\\)\".*/\\1/p" | head -1
+            $SED -n "s/.*\"$FIELD\":[ ]*\"\\([^\"]*\\)\".*/\\1/p" | $HEAD -1
         fi
     }
 
     load_supabase_env() {
         [ -f /etc/pisowifi/supabase.env ] || return 1
-        if [ -x "$BB" ]; then
-            FILE_URL=$(grep -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | "$BB" tr -d '\r')
-            FILE_KEY=$(grep -m1 '^SUPABASE_ANON_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | "$BB" tr -d '\r')
-        else
-            FILE_URL=$(grep -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
-            FILE_KEY=$(grep -m1 '^SUPABASE_ANON_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
-        fi
-        FILE_URL=$(echo "$FILE_URL" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
-        FILE_KEY=$(echo "$FILE_KEY" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+        FILE_URL=$($GREP -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | $CUT -d= -f2- | $TR -d '\r')
+        FILE_KEY=$($GREP -m1 '^SUPABASE_ANON_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | $CUT -d= -f2- | $TR -d '\r')
+        FILE_URL=$(echo "$FILE_URL" | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+        FILE_KEY=$(echo "$FILE_KEY" | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
         [ -z "$FILE_URL" ] && return 1
         [ -z "$FILE_KEY" ] && return 1
         "$UCI" set pisowifi.license=license
@@ -1782,16 +1774,13 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         if [ "$ACTION" = "activate_license" ] || [ "$ACTION" = "license_check" ]; then
              SUPA_URL=$("$UCI" get pisowifi.license.supabase_url 2>/dev/null)
              SUPA_KEY=$("$UCI" get pisowifi.license.supabase_key 2>/dev/null)
-             NOW_TS=$(date +%s)
+             NOW_TS=$($DATE +%s)
              OPENWRT_TABLE="pisowifi_openwrt"
 
              # Get Device ID
-             HW_MAC=$(cat /sys/class/net/br-lan/address 2>/dev/null || cat /sys/class/net/eth0/address 2>/dev/null || echo "")
-             if [ -x "$BB" ]; then
-                 HW_MAC=$(printf "%s" "$HW_MAC" | "$BB" tr -d ':' | "$BB" tr 'a-z' 'A-Z')
-             else
-                 HW_MAC=$(printf "%s" "$HW_MAC" | tr -d ':' | tr 'a-z' 'A-Z')
-             fi
+             HW_MAC=$($CAT /sys/class/net/br-lan/address 2>/dev/null || $CAT /sys/class/net/eth0/address 2>/dev/null || echo "")
+             HW_MAC=$(printf "%s" "$HW_MAC" | $TR -d ':' | $TR 'a-z' 'A-Z')
+             
              HW_HEX="$HW_MAC"
              if command -v md5sum >/dev/null 2>&1 && [ -n "$HW_MAC" ]; then
                  HW_HEX=$(echo -n "$HW_MAC" | md5sum 2>/dev/null | awk '{print toupper(substr($1,1,16))}')
@@ -1815,19 +1804,29 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,license_key&hardware_id=eq.$HARDWARE_ID&limit=1"
              RESP="$SUPA_BODY"
              LAST_CODE="$SUPA_HTTP_CODE"
+             log_license "Check HW: $HARDWARE_ID code=$LAST_CODE"
 
              FOUND_BY_HW=0
-             if [ "$LAST_CODE" = "200" ] && case "$RESP" in *'"id"'* ) true ;; * ) false ;; esac; then
+             if [ "$LAST_CODE" = "200" ] && echo "$RESP" | $GREP -q '"id"'; then
                  FOUND_BY_HW=1
+                 log_license "Found license for HW"
              fi
 
              if [ "$FOUND_BY_HW" = "0" ] && [ "$ACTION" = "license_check" ]; then
                  # No license for this HW, initiate 7-day trial
-                 EXP_DATE=$(date -d "+7 days" -Iseconds 2>/dev/null || date -u -D "%s" -d "$(( $(date +%s) + 604800 ))" +"%Y-%m-%dT%H:%M:%SZ")
+                 NOW_SEC=$($DATE +%s)
+                 EXP_SEC=$((NOW_SEC + 604800)) # 7 days
+                 EXP_DATE=$($DATE -u -d "@$EXP_SEC" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || $DATE -u -r "$EXP_SEC" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+                 
+                 # Fallback if date command fails to format
+                 [ -z "$EXP_DATE" ] && EXP_DATE=$(printf "%s" "$EXP_SEC")
+                 
                  TRIAL_BODY=$(printf '{"hardware_id":"%s","status":"trial","expires_at":"%s"}' "$HARDWARE_ID" "$EXP_DATE")
+                 log_license "Creating trial: $TRIAL_BODY"
                  supa_insert "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE" "$TRIAL_BODY"
                  RESP="$SUPA_BODY"
                  LAST_CODE="$SUPA_HTTP_CODE"
+                 log_license "Trial creation code: $LAST_CODE"
                  if [ "$LAST_CODE" = "201" ] || [ "$LAST_CODE" = "200" ]; then
                      FOUND_BY_HW=1
                  fi
@@ -1840,12 +1839,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                      supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
                      RESP="$SUPA_BODY"
                      LAST_CODE="$SUPA_HTTP_CODE"
-                     if [ "$LAST_CODE" = "200" ] && case "$RESP" in *'"id"'* ) true ;; * ) false ;; esac; then
+                     if [ "$LAST_CODE" = "200" ] && echo "$RESP" | $GREP -q '"id"'; then
                          # Found license key, check if already bound
                          BOUND_HW=$(echo "$RESP" | json_first "hardware_id")
                          if [ -z "$BOUND_HW" ] || [ "$BOUND_HW" = "null" ]; then
                              # Bind it
-                             PATCH_BODY=$(printf '{"hardware_id":"%s","activated_at":"%s","status":"active"}' "$HARDWARE_ID" "$(date -Iseconds)")
+                             PATCH_BODY=$(printf '{"hardware_id":"%s","activated_at":"%s","status":"active"}' "$HARDWARE_ID" "$($DATE -Iseconds 2>/dev/null || $DATE +%Y-%m-%dT%H:%M:%SZ)")
                              supa_patch "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?license_key=ilike.$LIC_KEY" "$PATCH_BODY"
                              # Refresh data
                              supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
@@ -1880,6 +1879,40 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  "$UCI" set pisowifi.license.valid=1
                  [ "$L_STATUS" = "expired" ] && "$UCI" set pisowifi.license.valid=0
                  "$UCI" commit pisowifi
+
+                 # Save to SQLite for persistence
+                 L_VALID_INT=1
+                 [ "$L_STATUS" = "expired" ] && L_VALID_INT=0
+                 sqlite3 "$DB_FILE" "DELETE FROM license; INSERT INTO license (status, license_key, expires_at, vendor_uuid, hardware_id, valid) VALUES ('$L_STATUS', '$L_KEY', '$L_EXPIRES', '$L_VENDOR', '$HARDWARE_ID', $L_VALID_INT);" 2>/dev/null
+
+                 # Update/Insert into vendors table in Supabase
+                 if [ "$L_STATUS" = "active" ]; then
+                     MACHINE_NAME=$(cat /tmp/sysinfo/model 2>/dev/null || echo "PisoWifi-Machine")
+                     
+                     # Ensure valid UUID for vendor_id, or send null
+                     V_ID_JSON="null"
+                     if [ -n "$L_VENDOR" ] && [ "$L_VENDOR" != "null" ]; then
+                         V_ID_JSON=$(printf "\"%s\"" "$L_VENDOR")
+                     fi
+
+                     VENDOR_BODY=$(printf '{"hardware_id":"%s","machine_name":"%s","vendor_id":%s,"license_key":"%s","is_licensed":true,"activated_at":"%s","status":"online"}' "$HARDWARE_ID" "$MACHINE_NAME" "$V_ID_JSON" "$L_KEY" "$($DATE -u +"%Y-%m-%dT%H:%M:%SZ")")
+                     
+                     log_license "Syncing to vendors: $VENDOR_BODY"
+                     
+                     # First check if exists
+                     supa_request "$SUPA_URL" "$SUPA_KEY" "vendors?select=id&hardware_id=eq.$HARDWARE_ID&limit=1"
+                     V_EXIST_RESP="$SUPA_BODY"
+                     V_EXIST_CODE="$SUPA_HTTP_CODE"
+                     
+                     if [ "$V_EXIST_CODE" = "200" ] && echo "$V_EXIST_RESP" | $GREP -q '"id"'; then
+                         log_license "Machine exists in vendors, patching..."
+                         supa_patch "$SUPA_URL" "$SUPA_KEY" "vendors?hardware_id=eq.$HARDWARE_ID" "$VENDOR_BODY"
+                     else
+                         log_license "Machine missing in vendors, inserting..."
+                         supa_insert "$SUPA_URL" "$SUPA_KEY" "vendors" "$VENDOR_BODY"
+                     fi
+                     log_license "Sync result code: $SUPA_HTTP_CODE"
+                 fi
                  
                  echo "Status: 302 Found"
                  echo "Location: /cgi-bin/admin?tab=settings&msg=license_ok"
@@ -1901,6 +1934,9 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              "$UCI" set pisowifi.license.expires_at=''
              "$UCI" set pisowifi.license.hardware_id=''
              "$UCI" commit pisowifi
+
+             # Clear SQLite
+             sqlite3 "$DB_FILE" "DELETE FROM license;" 2>/dev/null
 
              echo "Status: 302 Found"
              echo "Location: /cgi-bin/admin?tab=settings&msg=license_cleared"
@@ -1963,12 +1999,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              esac
 
              if [ "$ADD_MIN" -gt 0 ]; then
-                 NOW_TS=$(date +%s)
+                 NOW_TS=$($DATE +%s)
                  MAC_SQL=$(sql_escape "$MAC")
                  IP_SQL=$(sql_escape "$IP_ADDR")
 
                  USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end FROM users WHERE mac='$MAC_SQL' LIMIT 1;" 2>/dev/null)
-                 CUR_END=$(echo "$USER_ROW" | cut -d'|' -f1)
+                 CUR_END=$(echo "$USER_ROW" | $CUT -d'|' -f1)
                  [ -z "$CUR_END" ] && CUR_END=0
 
                  BASE_TS=$NOW_TS
@@ -2136,9 +2172,9 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
 
         elif [ "$ACTION" = "save_theme" ]; then
              THEME_NAME=$(get_post_var "theme_name")
-             THEME_NAME=$(echo "$THEME_NAME" | tr ' ' '_' )
-             SLUG=$(echo "$THEME_NAME" | tr -cd 'A-Za-z0-9_-')
-             [ -z "$SLUG" ] && SLUG=$(date +%s)
+             THEME_NAME=$(echo "$THEME_NAME" | $TR ' ' '_' )
+             SLUG=$(echo "$THEME_NAME" | $TR -cd 'A-Za-z0-9_-')
+             [ -z "$SLUG" ] && SLUG=$($DATE +%s)
              HTML_CONTENT=$(get_post_var "html_content")
              mkdir -p /www/portal_themes
              echo "$HTML_CONTENT" > "/www/portal_themes/custom_${SLUG}.html"
@@ -2150,7 +2186,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
 
         elif [ "$ACTION" = "delete_theme" ]; then
              THEME_ID=$(get_post_var "theme_id")
-             THEME_ID=$(echo "$THEME_ID" | tr -cd 'A-Za-z0-9_-')
+             THEME_ID=$(echo "$THEME_ID" | $TR -cd 'A-Za-z0-9_-')
              case "$THEME_ID" in custom_*) ;; *) THEME_ID="custom_$THEME_ID" ;; esac
              rm -f "/www/portal_themes/${THEME_ID}.html" 2>/dev/null || true
 
@@ -2172,7 +2208,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              if [ "$FILENAME" = "bg.jpg" ] || [ "$FILENAME" = "insert.mp3" ] || [ "$FILENAME" = "connected.mp3" ]; then
                  # Extract base64 content
                  # Warning: This sed might still be slow on huge files but better than var
-                 grep -a -o "filedata=[^&]*" "$POST_FILE" | cut -d= -f2- | sed 's/%2B/+/g; s/%2F/\//g; s/%3D/=/g' | base64 -d > "/www/$FILENAME"
+                 $GREP -a -o "filedata=[^&]*" "$POST_FILE" | $CUT -d= -f2- | $SED 's/%2B/+/g; s/%2F/\//g; s/%3D/=/g' | base64 -d > "/www/$FILENAME"
                  
                  echo "Status: 302 Found"
                  echo "Location: /cgi-bin/admin?tab=portal&msg=upload_success"
@@ -2185,24 +2221,56 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              exit 0
         fi
     fi
-fi
 
 
-# Handle API Actions (for Dashboard Charts/Stats)
-if [ "$QUERY_STRING" = "action=get_traffic" ]; then
-    check_auth || exit 0
+# Check Auth for View
+if ! check_auth; then
     echo "Status: 200 OK"
-    echo "Content-type: application/json"
+    echo "Content-type: text/html; charset=utf-8"
     echo ""
-    # Get RX/TX bytes for WAN interface (usually eth0 or eth1, we'll try to find it)
-    WAN_IF=$(uci get network.wan.device 2>/dev/null || uci get network.wan.ifname 2>/dev/null || echo "eth0")
-    RX=$(cat /sys/class/net/$WAN_IF/statistics/rx_bytes 2>/dev/null || echo 0)
-    TX=$(cat /sys/class/net/$WAN_IF/statistics/tx_bytes 2>/dev/null || echo 0)
-    echo "{\"rx\": $RX, \"tx\": $TX, \"time\": $(date +%s)}"
+    echo "<!DOCTYPE html><html><head><title>Admin Login</title>"
+    echo "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+    echo "<style>body{font-family:sans-serif; background:#f1f5f9; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;} .card{background:white; padding:30px; border-radius:12px; box-shadow:0 4px 6px rgba(0,0,0,0.1); width:100%; max-width:400px;} h1{text-align:center; color:#1e293b; margin-bottom:24px;} input{width:100%; padding:12px; margin-bottom:16px; border:1px solid #cbd5e1; border-radius:8px; box-sizing:border-box;} .btn{width:100%; padding:12px; background:#2563eb; color:white; border:none; border-radius:8px; font-weight:700; cursor:pointer;}</style></head><body>"
+    echo "<div class='card'>"
+    echo "<h1>Admin Login</h1>"
+    if echo "$QUERY_STRING" | grep -q "error=invalid"; then echo "<p style='color:red; text-align: center;'>Invalid Password</p>"; fi
+    echo "<form method='POST'><input type='password' name='password' placeholder='Password' required><button class='btn'>Login</button></form>"
+    echo "</div></body></html>"
     exit 0
 fi
 
-# Render Page
+# License Enforcement: Redirect to settings if license is not valid
+TAB=$(echo "$QUERY_STRING" | $GREP -o "tab=[^&]*" | $CUT -d= -f2)
+[ -z "$TAB" ] && TAB="dashboard"
+LIC_VALID=$($UCI get pisowifi.license.valid 2>/dev/null || echo 0)
+
+# SQLite Fallback: If UCI says invalid, check SQLite
+if [ "$LIC_VALID" != "1" ]; then
+    SQL_LIC=$(sqlite3 -separator '|' "$DB_FILE" "SELECT valid, status, license_key, expires_at, vendor_uuid, hardware_id FROM license LIMIT 1;" 2>/dev/null)
+    if [ -n "$SQL_LIC" ]; then
+        LIC_VALID=$(echo "$SQL_LIC" | $CUT -d'|' -f1)
+        # Restore to UCI for faster future access
+        if [ "$LIC_VALID" = "1" ]; then
+            "$UCI" set pisowifi.license=license
+            "$UCI" set pisowifi.license.valid=1
+            "$UCI" set pisowifi.license.status=$(echo "$SQL_LIC" | $CUT -d'|' -f2)
+            "$UCI" set pisowifi.license.license_key=$(echo "$SQL_LIC" | $CUT -d'|' -f3)
+            "$UCI" set pisowifi.license.expires_at=$(echo "$SQL_LIC" | $CUT -d'|' -f4)
+            "$UCI" set pisowifi.license.vendor_uuid=$(echo "$SQL_LIC" | $CUT -d'|' -f5)
+            "$UCI" set pisowifi.license.hardware_id=$(echo "$SQL_LIC" | $CUT -d'|' -f6)
+            "$UCI" commit pisowifi
+        fi
+    fi
+fi
+
+if [ "$LIC_VALID" != "1" ] && [ "$TAB" != "settings" ]; then
+    echo "Status: 302 Found"
+    echo "Location: /cgi-bin/admin?tab=settings&msg=license_required"
+    echo ""
+    exit 0
+fi
+
+# Render Page Headers
 echo "Status: 200 OK"
 echo "Content-type: text/html; charset=utf-8"
 echo ""
@@ -2245,23 +2313,25 @@ echo "</style>"
 echo "</head>"
 echo "<body>"
 
-# Check Auth for View
-if ! check_auth; then
-    echo "<div style='width: 100%; height: 100vh; display: flex; justify-content: center; align-items: center;'>"
-    echo "<div style='max-width: 400px; width: 100%;' class='card'>"
-    echo "<h1 style='text-align: center; margin-bottom: 20px;'>Admin Login</h1>"
-    if echo "$QUERY_STRING" | grep -q "error=invalid"; then echo "<p style='color:red; text-align: center;'>Invalid Password</p>"; fi
-    echo "<form method='POST'><input type='password' name='password' placeholder='Password' style='width:100%; padding:12px; margin:10px 0; border:1px solid #ddd; border-radius:6px; box-sizing: border-box;' required><button class='btn btn-primary' style='width:100%; padding: 12px;'>Login</button></form>"
-    echo "</div></div>"
-else
-    # Determine Active Tab
-    TAB=$(echo "$QUERY_STRING" | grep -o "tab=[^&]*" | cut -d= -f2)
-    [ -z "$TAB" ] && TAB="dashboard"
+# Handle API Actions (for Dashboard Charts/Stats)
+if [ "$QUERY_STRING" = "action=get_traffic" ]; then
+    check_auth || exit 0
+    echo "Status: 200 OK"
+    echo "Content-type: application/json"
+    echo ""
+    # Get RX/TX bytes for WAN interface (usually eth0 or eth1, we'll try to find it)
+    WAN_IF=$($UCI get network.wan.device 2>/dev/null || $UCI get network.wan.ifname 2>/dev/null || echo "eth0")
+    RX=$($CAT /sys/class/net/$WAN_IF/statistics/rx_bytes 2>/dev/null || echo 0)
+    TX=$($CAT /sys/class/net/$WAN_IF/statistics/tx_bytes 2>/dev/null || echo 0)
+    echo "{\"rx\": $RX, \"tx\": $TX, \"time\": $($DATE +%s)}"
+    exit 0
+fi
 
-    # Sidebar
-    echo "<div class='sidebar'>"
-    echo "  <h2>NEXI-FI ADMIN</h2>"
-    echo "  <nav>"
+# Sidebar
+echo "<div class='sidebar'>"
+echo "  <h2>NEXI-FI ADMIN</h2>"
+echo "  <nav>"
+if [ "$LIC_VALID" = "1" ]; then
     echo "    <a href='?tab=dashboard' class='nav-link $([ "$TAB" = "dashboard" ] && echo "active")'>Dashboard</a>"
     echo "    <a href='?tab=rates' class='nav-link $([ "$TAB" = "rates" ] && echo "active")'>Rates Manager</a>"
     echo "    <a href='?tab=hotspot' class='nav-link $([ "$TAB" = "hotspot" ] && echo "active")'>Hotspot Manager</a>"
@@ -2269,12 +2339,13 @@ else
     echo "    <a href='?tab=sales' class='nav-link $([ "$TAB" = "sales" ] && echo "active")'>Sales Report</a>"
     echo "    <a href='?tab=qos' class='nav-link $([ "$TAB" = "qos" ] && echo "active")'>Bandwidth Manager</a>"
     echo "    <a href='?tab=portal' class='nav-link $([ "$TAB" = "portal" ] && echo "active")'>Portal Editor</a>"
-    echo "    <a href='?tab=settings' class='nav-link $([ "$TAB" = "settings" ] && echo "active")'>Settings</a>"
-    echo "  </nav>"
-    echo "  <div style='margin-top: auto; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.1);'>"
-    echo "    <form method='POST'><input type='hidden' name='action' value='logout'><button class='btn btn-danger' style='width: 100%'>Logout</button></form>"
-    echo "  </div>"
-    echo "</div>"
+fi
+echo "    <a href='?tab=settings' class='nav-link $([ "$TAB" = "settings" ] && echo "active")'>Settings</a>"
+echo "  </nav>"
+echo "  <div style='margin-top: auto; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.1);'>"
+echo "    <form method='POST'><input type='hidden' name='action' value='logout'><button class='btn btn-danger' style='width: 100%'>Logout</button></form>"
+echo "  </div>"
+echo "</div>"
 
     echo "<div class='main-content'>"
     echo "<div class='container'>"
@@ -2294,7 +2365,7 @@ else
         OVERLAY_PCT=$(df /overlay | tail -1 | awk '{print $5}' | tr -d '%')
         
         # Users
-        NOW=$(date +%s)
+        NOW=$($DATE +%s)
         ACTIVE_USERS=$(sqlite3 $DB_FILE "SELECT COUNT(*) FROM users WHERE session_end > $NOW" 2>/dev/null || echo 0)
         TOTAL_USERS=$(sqlite3 $DB_FILE "SELECT COUNT(*) FROM users" 2>/dev/null || echo 0)
         DISCONNECTED_USERS=$((TOTAL_USERS - ACTIVE_USERS))
@@ -2539,7 +2610,7 @@ else
             fi
         }
 
-        NOW=$(date +%s)
+        NOW=$($DATE +%s)
         LEASE_FILE="/tmp/dhcp.leases"
         [ -f /var/dhcp.leases ] && LEASE_FILE="/var/dhcp.leases"
 
@@ -2559,22 +2630,22 @@ else
         echo "<h3>Connected Devices (DNSMasq)</h3>"
         echo "<table><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Time</th><th>Actions</th></tr>"
         if [ -f "$LEASE_FILE" ]; then
-            cat "$LEASE_FILE" 2>/dev/null | while read EXP MACADDR IPADDR HOSTNAME CLIENTID; do
+            $CAT "$LEASE_FILE" 2>/dev/null | while read EXP MACADDR IPADDR HOSTNAME CLIENTID; do
                 [ -z "$MACADDR" ] && continue
-                MAC_UP=$(echo "$MACADDR" | tr 'a-z' 'A-Z')
+                MAC_UP=$(echo "$MACADDR" | $TR 'a-z' 'A-Z')
                 HOST="$HOSTNAME"
                 [ "$HOST" = "*" ] && HOST=""
                 DB_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT ip, hostname, notes FROM devices WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
-                DB_IP=$(echo "$DB_ROW" | cut -d'|' -f1)
-                DB_HOST=$(echo "$DB_ROW" | cut -d'|' -f2)
-                DB_NOTES=$(echo "$DB_ROW" | cut -d'|' -f3)
+                DB_IP=$(echo "$DB_ROW" | $CUT -d'|' -f1)
+                DB_HOST=$(echo "$DB_ROW" | $CUT -d'|' -f2)
+                DB_NOTES=$(echo "$DB_ROW" | $CUT -d'|' -f3)
                 DISP_HOST="$HOST"
                 [ -z "$DISP_HOST" ] && DISP_HOST="$DB_HOST"
                 [ -z "$DISP_HOST" ] && DISP_HOST="(unknown)"
 
                 USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
-                END_TS=$(echo "$USER_ROW" | cut -d'|' -f1)
-                PAUSED_TS=$(echo "$USER_ROW" | cut -d'|' -f2)
+                END_TS=$(echo "$USER_ROW" | $CUT -d'|' -f1)
+                PAUSED_TS=$(echo "$USER_ROW" | $CUT -d'|' -f2)
                 [ -z "$END_TS" ] && END_TS=0
                 [ -z "$PAUSED_TS" ] && PAUSED_TS=0
                 if [ "$PAUSED_TS" -gt 0 ]; then
@@ -2930,7 +3001,11 @@ else
     elif [ "$TAB" = "settings" ]; then
         echo "<div class='header'><h1>Settings</h1></div>"
         
-        if echo "$QUERY_STRING" | grep -q "msg=saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Settings Saved Successfully!</div>"; fi
+        if echo "$QUERY_STRING" | $GREP -q "msg=license_required"; then 
+            echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px; font-weight:700;'>LICENSE REQUIRED: Access to other features is restricted until a valid license is activated.</div>"
+        fi
+
+        if echo "$QUERY_STRING" | $GREP -q "msg=saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Settings Saved Successfully!</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_env_loaded"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Supabase Credentials Loaded!</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_env_missing"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Missing /etc/pisowifi/supabase.env</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_ok"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>License Activated!</div>"; fi
