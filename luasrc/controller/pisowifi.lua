@@ -524,4 +524,36 @@ function action_sync_devices()
 	end
 end
 
+-- New License API endpoints
+function api_license_check()
+	local hardware_id = license_model.get_hardware_id()
+	local result = license_model.check_license(hardware_id)
+	http.prepare_content("application/json")
+	http.write_json(result)
+end
+
+function api_license_activate()
+	local hardware_id = license_model.get_hardware_id()
+	local license_key = http.formvalue("license_key")
+	local ip_address = http.getenv("REMOTE_ADDR")
+	
+	local result = license_model.activate_license(hardware_id, license_key, ip_address)
+	http.prepare_content("application/json")
+	http.write_json(result)
+end
+
+function api_license_status()
+	local hardware_id = license_model.get_hardware_id()
+	local license_data = license_model.get_license_status(hardware_id)
+	local is_valid, message = license_model.is_license_valid(license_data)
+	
+	http.prepare_content("application/json")
+	http.write_json({
+		status = is_valid and "valid" or (license_data and "invalid" or "no_license"),
+		message = message,
+		hardware_id = hardware_id,
+		license_data = license_data
+	})
+end
+
 _G.get_active_users = get_active_users

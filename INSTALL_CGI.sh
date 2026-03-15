@@ -558,6 +558,12 @@ DB_FILE="/etc/pisowifi/pisowifi.db"
 # 2.6 Setup Configuration (UCI)
 echo "Setting up configuration..."
 touch /etc/config/pisowifi
+
+# Define GREP command to use
+GREP="/bin/grep"
+[ -x "/usr/bin/grep" ] && GREP="/usr/bin/grep"
+[ -x "/bin/busybox" ] && GREP="/bin/busybox grep"
+
 uci set pisowifi.settings=settings
 uci set pisowifi.settings.minutes_per_peso='12'
 uci set pisowifi.settings.admin_password='admin'
@@ -584,19 +590,22 @@ uci set pisowifi.license.expires_at=''
 uci set pisowifi.license.hardware_id=''
 uci set pisowifi.license.hardware_match='0'
 
-if [ -f /etc/pisowifi/supabase.env ]; then
-    SUPA_URL=$(grep -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
-    SUPA_KEY=$(grep -m1 '^SUPABASE_ANON_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
-    SUPA_URL=$(echo "$SUPA_URL" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
-    SUPA_KEY=$(echo "$SUPA_KEY" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
-    [ -n "$SUPA_URL" ] && uci set pisowifi.license.supabase_url="$SUPA_URL"
-    [ -n "$SUPA_KEY" ] && uci set pisowifi.license.supabase_key="$SUPA_KEY"
-fi
+    if [ -f /etc/pisowifi/supabase.env ]; then
+        SUPA_URL=$($GREP -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
+        SUPA_KEY=$($GREP -m1 '^SUPABASE_ANON_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
+        SUPA_SERVICE_KEY=$($GREP -m1 '^SUPABASE_SERVICE_ROLE_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
+        SUPA_URL=$(echo "$SUPA_URL" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+        SUPA_KEY=$(echo "$SUPA_KEY" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+        SUPA_SERVICE_KEY=$(echo "$SUPA_SERVICE_KEY" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+        [ -n "$SUPA_URL" ] && uci set pisowifi.license.supabase_url="$SUPA_URL"
+        [ -n "$SUPA_KEY" ] && uci set pisowifi.license.supabase_key="$SUPA_KEY"
+        [ -n "$SUPA_SERVICE_KEY" ] && uci set pisowifi.license.supabase_service_key="$SUPA_SERVICE_KEY"
+    fi
 
 uci commit pisowifi
 
 # Install sqlite3 if not available (OpenWrt)
-opkg list-installed | grep -q sqlite3-cli || opkg install sqlite3-cli
+opkg list-installed | $GREP -q sqlite3-cli || opkg install sqlite3-cli
 
 # Create database schema
 cat << 'EOF' | sqlite3 $DB_FILE
@@ -893,6 +902,7 @@ handle_api() {
     # Supabase Config for Roaming
     SUPA_URL=$(uci get pisowifi.supabase.url 2>/dev/null)
     SUPA_KEY=$(uci get pisowifi.supabase.key 2>/dev/null)
+    SUPA_SERVICE_KEY=$(uci get pisowifi.license.supabase_service_key 2>/dev/null)
     
     [ -f /tmp/pisowifi_verbose ] && logger -t pisowifi "API request: $QUERY_STRING from MAC: $MAC IP: $REMOTE_ADDR SID: $SID"
     
@@ -2068,6 +2078,186 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              echo ""
              exit 0
 
+        elif [ "$ACTION" = "clear_centralized_license" ]; then
+             "$UCI" set pisowifi.license.centralized_key=''
+             "$UCI" set pisowifi.license.centralized_vendor_id=''
+             "$UCI" set pisowifi.license.centralized_status=''
+             "$UCI" commit pisowifi
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_cleared"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "activate_centralized_license" ]; then
+             SUPA_URL=$("$UCI" get pisowifi.license.supabase_url 2>/dev/null)
+             SUPA_KEY=$("$UCI" get pisowifi.license.supabase_key 2>/dev/null)
+             SUPA_SERVICE_KEY=$("$UCI" get pisowifi.license.supabase_service_key 2>/dev/null)
+             
+             # DEBUG LOGGING
+             echo "<!-- DEBUG: SUPA_URL=$SUPA_URL -->" >&2
+             echo "<!-- DEBUG: SUPA_KEY length=${#SUPA_KEY} -->" >&2
+             echo "<!-- DEBUG: SUPA_SERVICE_KEY available: $([ -n "$SUPA_SERVICE_KEY" ] && echo "YES" || echo "NO") -->" >&2
+             
+             HW_MAC=$($CAT /sys/class/net/br-lan/address 2>/dev/null || $CAT /sys/class/net/eth0/address 2>/dev/null || echo "")
+             HW_MAC=$(printf "%s" "$HW_MAC" | $TR -d ':' | $TR 'a-z' 'A-Z')
+             HW_HEX="$HW_MAC"
+             if command -v md5sum >/dev/null 2>&1 && [ -n "$HW_MAC" ]; then
+                 HW_HEX=$(echo -n "$HW_MAC" | md5sum 2>/dev/null | awk '{print toupper(substr($1,1,16))}')
+             fi
+             HARDWARE_ID="CPU-$HW_HEX"
+             
+             C_KEY=$(get_post_var "centralized_key")
+             
+             # DEBUG LOGGING
+             echo "<!-- DEBUG: Received C_KEY=$C_KEY -->" >&2
+             echo "<!-- DEBUG: HARDWARE_ID=$HARDWARE_ID -->" >&2
+             
+             if [ -n "$C_KEY" ]; then
+                 # DEBUG: Test the regex pattern
+                 echo "<!-- DEBUG: Testing regex pattern -->" >&2
+                 if echo "$C_KEY" | $GREP -Eqi "^CENTRAL-[a-fA-F0-9]+-[a-fA-F0-9]+$"; then
+                     echo "<!-- DEBUG: Regex MATCHED -->" >&2
+                     
+                     # DEBUG: Log the database query
+                     echo "<!-- DEBUG: Querying database with key: $C_KEY -->" >&2
+                     echo "<!-- DEBUG: SUPA_URL=$SUPA_URL -->" >&2
+                     echo "<!-- DEBUG: SUPA_KEY exists: $([ -n "$SUPA_KEY" ] && echo "YES" || echo "NO") -->" >&2
+                     
+                     # DEBUG: Show the exact REST API URL being called
+                     FULL_QUERY="centralized_keys?select=id,vendor_id,is_active&key_value=ilike.$C_KEY&limit=1"
+                     echo "<!-- DEBUG: FULL_QUERY=$FULL_QUERY -->" >&2
+                     echo "<!-- DEBUG: ENCODED_QUERY=$(echo "$FULL_QUERY" | sed 's/ /%20/g' | sed 's/:/%3A/g' | sed 's/?/%3F/g') -->" >&2
+                     
+                     supa_request "$SUPA_URL" "$SUPA_KEY" "centralized_keys?select=id,vendor_id,is_active&key_value=ilike.$C_KEY&limit=1"
+                     
+                     # DEBUG: Log the response
+                     echo "<!-- DEBUG: HTTP_CODE=$SUPA_HTTP_CODE -->" >&2
+                     echo "<!-- DEBUG: RESPONSE_BODY=$SUPA_BODY -->" >&2
+                     
+                     # If anon key fails, try with service role key (if available)
+                     if [ "$SUPA_HTTP_CODE" != "200" ] || ! echo "$SUPA_BODY" | $GREP -q '"id"'; then
+                         if [ -n "$SUPA_SERVICE_KEY" ]; then
+                             echo "<!-- DEBUG: Trying with service role key -->" >&2
+                             supa_request "$SUPA_URL" "$SUPA_SERVICE_KEY" "centralized_keys?select=id,vendor_id,is_active&key_value=ilike.$C_KEY&limit=1"
+                             echo "<!-- DEBUG: Service role HTTP_CODE=$SUPA_HTTP_CODE -->" >&2
+                             echo "<!-- DEBUG: Service role RESPONSE_BODY=$SUPA_BODY -->" >&2
+                         fi
+                     fi
+                     
+                     if [ "$SUPA_HTTP_CODE" = "200" ] && echo "$SUPA_BODY" | $GREP -q '"id"'; then
+                         C_VENDOR=$(echo "$SUPA_BODY" | json_first "vendor_id")
+                         C_ACTIVE=$(echo "$SUPA_BODY" | json_first "is_active")
+                         
+                         if [ "$C_ACTIVE" = "true" ]; then
+                             "$UCI" set pisowifi.license.centralized_key="$C_KEY"
+                             "$UCI" set pisowifi.license.centralized_vendor_id="$C_VENDOR"
+                             "$UCI" set pisowifi.license.centralized_status="active"
+                             "$UCI" commit pisowifi
+                             
+                             echo "Status: 302 Found"
+                             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_ok"
+                             echo ""
+                             exit 0
+                         else
+                             # DEBUG: Log why it failed
+                             echo "<!-- DEBUG: Key found but not active or invalid response -->" >&2
+                             echo "<!-- DEBUG: C_ACTIVE=$C_ACTIVE -->" >&2
+                             echo "Status: 302 Found"
+                             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_failed"
+                             echo ""
+                             exit 0
+                         fi
+                     else
+                         # DEBUG: Log database query failure
+                         echo "<!-- DEBUG: Primary database query failed -->" >&2
+                         echo "<!-- DEBUG: HTTP_CODE=$SUPA_HTTP_CODE -->" >&2
+                         echo "<!-- DEBUG: Checking fallback table... -->" >&2
+                         
+                         # DEBUG: Show fallback query
+                        FALLBACK_QUERY="pisowifi_openwrt?select=id,status,vendor_uuid&license_key=ilike.$C_KEY&limit=1"
+                        echo "<!-- DEBUG: FALLBACK_QUERY=$FALLBACK_QUERY -->" >&2
+                        
+                        # Fallback: check pisowifi_openwrt table just in case they used that for centralized keys
+                       supa_request "$SUPA_URL" "$SUPA_KEY" "pisowifi_openwrt?select=id,status,vendor_uuid&license_key=ilike.$C_KEY&limit=1"
+                       
+                       # DEBUG: Log fallback response
+                       echo "<!-- DEBUG: Fallback HTTP_CODE=$SUPA_HTTP_CODE -->" >&2
+                       echo "<!-- DEBUG: Fallback RESPONSE_BODY=$SUPA_BODY -->" >&2
+                       
+                       # If anon key fails, try with service role key (if available)
+                       if [ "$SUPA_HTTP_CODE" != "200" ] || ! echo "$SUPA_BODY" | $GREP -q '"id"'; then
+                           if [ -n "$SUPA_SERVICE_KEY" ]; then
+                               echo "<!-- DEBUG: Trying fallback with service role key -->" >&2
+                               supa_request "$SUPA_URL" "$SUPA_SERVICE_KEY" "pisowifi_openwrt?select=id,status,vendor_uuid&license_key=ilike.$C_KEY&limit=1"
+                               echo "<!-- DEBUG: Service role fallback HTTP_CODE=$SUPA_HTTP_CODE -->" >&2
+                               echo "<!-- DEBUG: Service role fallback RESPONSE_BODY=$SUPA_BODY -->" >&2
+                           fi
+                       fi
+                       
+                       # DEBUG: Test if we can get ANY records from the tables
+                       echo "<!-- DEBUG: Testing if tables exist... -->" >&2
+                       supa_request "$SUPA_URL" "$SUPA_KEY" "centralized_keys?select=id&limit=1"
+                       echo "<!-- DEBUG: centralized_keys test: HTTP_CODE=$SUPA_HTTP_CODE, BODY=$SUPA_BODY -->" >&2
+                       
+                       # If anon key fails for table test, try service role
+                       if [ "$SUPA_HTTP_CODE" != "200" ] && [ -n "$SUPA_SERVICE_KEY" ]; then
+                           echo "<!-- DEBUG: Testing centralized_keys with service role -->" >&2
+                           supa_request "$SUPA_URL" "$SUPA_SERVICE_KEY" "centralized_keys?select=id&limit=1"
+                           echo "<!-- DEBUG: centralized_keys service role test: HTTP_CODE=$SUPA_HTTP_CODE, BODY=$SUPA_BODY -->" >&2
+                       fi
+                       
+                       supa_request "$SUPA_URL" "$SUPA_KEY" "pisowifi_openwrt?select=id&limit=1"
+                       echo "<!-- DEBUG: pisowifi_openwrt test: HTTP_CODE=$SUPA_HTTP_CODE, BODY=$SUPA_BODY -->" >&2
+                       
+                       # If anon key fails for table test, try service role
+                       if [ "$SUPA_HTTP_CODE" != "200" ] && [ -n "$SUPA_SERVICE_KEY" ]; then
+                           echo "<!-- DEBUG: Testing pisowifi_openwrt with service role -->" >&2
+                           supa_request "$SUPA_URL" "$SUPA_SERVICE_KEY" "pisowifi_openwrt?select=id&limit=1"
+                           echo "<!-- DEBUG: pisowifi_openwrt service role test: HTTP_CODE=$SUPA_HTTP_CODE, BODY=$SUPA_BODY -->" >&2
+                       fi
+                        
+                         if [ "$SUPA_HTTP_CODE" = "200" ] && echo "$SUPA_BODY" | $GREP -q '"id"'; then
+                             C_VENDOR=$(echo "$SUPA_BODY" | json_first "vendor_uuid")
+                             C_STATUS=$(echo "$SUPA_BODY" | json_first "status")
+                             
+                             if [ "$C_STATUS" = "active" ]; then
+                                 "$UCI" set pisowifi.license.centralized_key="$C_KEY"
+                                 "$UCI" set pisowifi.license.centralized_vendor_id="$C_VENDOR"
+                                 "$UCI" set pisowifi.license.centralized_status="active"
+                                 "$UCI" commit pisowifi
+                                 
+                                 echo "Status: 302 Found"
+                                 echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_ok"
+                                 echo ""
+                                 exit 0
+                             fi
+                         fi
+                         
+                         # DEBUG: Log final failure
+                         echo "<!-- DEBUG: Both database queries failed -->" >&2
+                         echo "<!-- DEBUG: Final failure - key not found or connection error -->" >&2
+                         
+                         echo "Status: 302 Found"
+                         echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_failed"
+                         echo ""
+                         exit 0
+                     fi
+                 else
+                     echo "<!-- DEBUG: Regex FAILED for key: $C_KEY -->" >&2
+                     echo "<!-- DEBUG: Expected format: CENTRAL-XXXXXXXX-XXXXXXXX -->" >&2
+                     echo "Status: 302 Found"
+                     echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_format_error"
+                     echo ""
+                     exit 0
+                 fi
+             else
+                 echo "Status: 302 Found"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_invalid_format"
+                 echo ""
+                 exit 0
+             fi
+
         elif [ "$ACTION" = "add_device" ] || [ "$ACTION" = "save_connected_device" ]; then
              MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
              IP_ADDR=$(get_post_var "ip")
@@ -3126,6 +3316,11 @@ echo "<div class='main-content'><div class='container'>"
         if echo "$QUERY_STRING" | grep -q "msg=license_missing_supabase"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Missing Supabase URL/Key.</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_missing_key"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Missing License Key.</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_cleared"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>License Cleared.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=centralized_ok"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Centralized Key Activated Successfully!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=centralized_failed"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Failed to activate Centralized Key. Check format or connection.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=centralized_format_error"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Invalid Centralized Key Format. Must be CENTRAL-XXXXXXXX-XXXXXXXX.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=centralized_invalid_format"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Invalid Centralized Key Format. Must be CENTRAL-XXXXXXXX-XXXXXXXX.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=centralized_cleared"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Centralized Key Cleared.</div>"; fi
         
         echo "<div class='grid' style='grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));'>"
 
@@ -3206,6 +3401,54 @@ echo "<div class='main-content'><div class='container'>"
         echo "      <form method='POST' style='flex:1;'><input type='hidden' name='action' value='license_check'><button class='btn btn-primary' style='width:100%; padding:12px; background:#0f172a; font-size:0.9rem;'>Check License</button></form>"
         echo "      <form method='POST' style='flex:1;'><input type='hidden' name='action' value='clear_license'><button class='btn btn-danger' style='width:100%; padding:12px; font-size:0.9rem;'>Clear</button></form>"
         echo "    </div>"
+        echo "  </div>"
+
+        CENTRAL_KEY=$("$UCI" get pisowifi.license.centralized_key 2>/dev/null || echo "")
+        CENTRAL_VENDOR=$("$UCI" get pisowifi.license.centralized_vendor_id 2>/dev/null || echo "")
+        CENTRAL_STATUS=$("$UCI" get pisowifi.license.centralized_status 2>/dev/null || echo "")
+
+        echo "  <div class='card' id='centralized-card' style='display:block !important;'>"
+        echo "    <h3>Centralized Key</h3>"
+        echo "    <div class='sub' style='margin-top:-6px; margin-bottom:10px;'>Centralized License Management</div>"
+        
+        echo "    <div style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:14px; margin-bottom:16px;'>"
+        echo "      <div style='margin-bottom:10px;'>"
+        echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Status</div>"
+        if [ "$CENTRAL_STATUS" = "active" ]; then
+            echo "        <div style='font-weight:900; font-size:1.1rem; color:#16a34a;'>ACTIVE</div>"
+        else
+            echo "        <div style='font-weight:900; font-size:1.1rem; color:#dc2626;'>INACTIVE</div>"
+        fi
+        echo "      </div>"
+        echo "      <div>"
+        echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Centralized Key</div>"
+        if [ -n "$CENTRAL_KEY" ]; then
+            echo "        <div style='font-weight:900; font-size:0.95rem; word-break:break-all; font-family:monospace; color:#0f172a;'>$CENTRAL_KEY</div>"
+        else
+            echo "        <div style='font-weight:900; font-size:0.95rem; word-break:break-all; font-family:monospace; color:#64748b;'>Not Assigned</div>"
+        fi
+        echo "      </div>"
+        if [ -n "$CENTRAL_VENDOR" ]; then
+            echo "      <div style='margin-top:10px;'>"
+            echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Vendor UUID</div>"
+            echo "        <div style='font-weight:700; font-size:0.85rem; word-break:break-all; font-family:monospace; color:#475569;'>$CENTRAL_VENDOR</div>"
+            echo "      </div>"
+        fi
+        echo "    </div>"
+
+        echo "    <form method='POST' style='margin-bottom:12px;'>"
+        echo "      <input type='hidden' name='action' value='activate_centralized_license'>"
+        echo "      <div style='margin-bottom:10px;'>"
+        echo "        <label style='display:block; margin-bottom:6px; font-weight:700; font-size:0.9rem;'>Centralized Key</label>"
+        echo "        <input type='text' name='centralized_key' placeholder='CENTRAL-XXXXXXXX-XXXXXXXX' style='width:100%; padding:12px; border:1px solid #cbd5e1; border-radius:8px; font-size:1rem;'> "
+        echo "      </div>"
+        echo "      <button class='btn btn-primary' style='width:100%; padding:14px; font-weight:700; background:linear-gradient(135deg, #8b5cf6, #d946ef); border:none;'>Activate Centralized Key</button>"
+        echo "    </form>"
+        
+        echo "    <div style='display:flex; gap:10px;'>"
+        echo "      <form method='POST' style='flex:1;'><input type='hidden' name='action' value='clear_centralized_license'><button class='btn btn-danger' style='width:100%; padding:12px; font-size:0.9rem;'>Clear Centralized Key</button></form>"
+        echo "    </div>"
+        
         echo "  </div>"
 
         echo "</div>"

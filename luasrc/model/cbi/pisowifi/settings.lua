@@ -122,6 +122,30 @@ document.addEventListener('DOMContentLoaded', function() {
 </script>
 ]]
 
+-- Centralized Key Input and Buttons (Raw HTML to bypass CBI form submission)
+o = s3:option(DummyValue, "centralized_key_controls", "")
+o.rawhtml = true
+o.value = [[
+<div class="cbi-value">
+    <label class="cbi-value-title">Centralized Key</label>
+    <div class="cbi-value-field">
+        <input type="text" class="cbi-input-text" id="centralized_key_input_field" placeholder="CENTRAL-XXXXXXXX-XXXXXXXXX" style="width: 300px;">
+        <div class="cbi-value-description">
+            <span class="cbi-value-helpicon"><img src="/luci-static/resources/cbi/help.gif" alt="help"></span>
+            Enter your Centralized License Key here (format: CENTRAL-XXXXXXXX-XXXXXXXX)
+        </div>
+    </div>
+</div>
+<div class="cbi-value">
+    <div class="cbi-value-field">
+        <input type="button" class="cbi-button cbi-button-apply" value="Activate Centralized Key" onclick="activateCentralizedKey(this); return false;">
+        <input type="button" class="cbi-button cbi-button-remove" value="Clear Centralized Key" onclick="clearCentralizedKey(this); return false;">
+    </div>
+</div>
+]]
+
+-- Note: Removed CBI Value/Button objects to prevent accidental form submission loops
+
 -- License Management Section (Original)
 s2 = m:section(TypedSection, "license", "License Management")
 s2.anonymous = true
@@ -266,209 +290,287 @@ o = s3:option(DummyValue, "license_script", "")
 o.rawhtml = true
 o.value = [[
 <script type="text/javascript">
-(function() {
+// Define functions globally so they can be called from onclick handlers
+window.formatDate = function(dateString) {
+    if (!dateString) return "N/A";
+    var date = new Date(dateString);
+    return date.toLocaleString();
+};
+
+window.formatDaysRemaining = function(expiresAt) {
+    if (!expiresAt) return "";
+    var expires = new Date(expiresAt);
+    var now = new Date();
+    var diffTime = expires - now;
+    var diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    
+    if (diffDays > 0) {
+        return "Days remaining: " + diffDays;
+    } else {
+        return "Trial has expired";
+    }
+};
+
+window.checkLicenseStatus = function() {
+    console.log('Centralized Key Card: Checking license status...');
     var apiUrl = "/cgi-bin/luci/pisowifi/api";
-    
-    function formatDate(dateString) {
-        if (!dateString) return "N/A";
-        var date = new Date(dateString);
-        return date.toLocaleString();
-    }
-    
-    function formatDaysRemaining(expiresAt) {
-        if (!expiresAt) return "";
-        var expires = new Date(expiresAt);
-        var now = new Date();
-        var diffTime = expires - now;
-        var diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-        
-        if (diffDays > 0) {
-            return "Days remaining: " + diffDays;
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', apiUrl + '/license_status', true);
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            var data = JSON.parse(xhr.responseText);
+            console.log('Centralized Key Card: License data received', data);
+            displayLicenseStatus(data);
         } else {
-            return "Trial has expired";
+            console.log('Centralized Key Card: Error checking license');
+            document.getElementById('license-status-display').innerHTML = '<span style="color: red;">Error checking license</span>';
         }
-    }
+    };
+    xhr.onerror = function() {
+        console.log('Centralized Key Card: Network error checking license');
+        document.getElementById('license-status-display').innerHTML = '<span style="color: red;">Network error</span>';
+    };
+    xhr.send();
+};
+
+window.displayLicenseStatus = function(data) {
+    // ... (keep implementation same as before)
+    console.log('Centralized Key Card: Displaying license status', data);
+    document.getElementById('hardware-id-display').innerText = data.hardware_id || 'Unknown';
     
-    function checkLicenseStatus() {
-        console.log('Centralized Key Card: Checking license status...');
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', apiUrl + '/license_status', true);
-        xhr.onload = function() {
-            if (xhr.status === 200) {
-                var data = JSON.parse(xhr.responseText);
-                console.log('Centralized Key Card: License data received', data);
-                displayLicenseStatus(data);
-            } else {
-                console.log('Centralized Key Card: Error checking license');
-                document.getElementById('license-status-display').innerHTML = '<span style="color: red;">Error checking license</span>';
-            }
-        };
-        xhr.onerror = function() {
-            console.log('Centralized Key Card: Network error checking license');
-            document.getElementById('license-status-display').innerHTML = '<span style="color: red;">Network error</span>';
-        };
-        xhr.send();
-    }
-    
-    function displayLicenseStatus(data) {
-        console.log('Centralized Key Card: Displaying license status', data);
-        document.getElementById('hardware-id-display').innerText = data.hardware_id || 'Unknown';
-        
-        // Update centralized key card
-            if (data.license_data) {
-                console.log('Centralized Key Card: License data found', data.license_data);
-                if (data.license_data.vendor_uuid) {
-                    document.getElementById('centralized-vendor-id').innerText = data.license_data.vendor_uuid;
-                    // Display the actual centralized key format
-                    if (data.license_data.license_key && data.license_data.license_key.startsWith('CENTRAL-')) {
-                        document.getElementById('centralized-key-display').innerText = data.license_data.license_key;
-                    } else {
-                        document.getElementById('centralized-key-display').innerText = 'ACTIVE';
-                    }
-                    document.getElementById('centralized-activation-status').innerHTML = '<span style="color: #4ade80;">✓ Activated</span>';
-                } else {
-                    document.getElementById('centralized-vendor-id').innerText = 'Not Assigned';
-                    document.getElementById('centralized-key-display').innerText = 'PENDING';
-                    document.getElementById('centralized-activation-status').innerHTML = '<span style="color: #fbbf24;">⏳ Pending</span>';
+    // Update centralized key card
+    if (data.license_data) {
+        console.log('Centralized Key Card: License data found', data.license_data);
+        if (data.license_data.vendor_uuid) {
+            document.getElementById('centralized-vendor-id').innerText = data.license_data.vendor_uuid;
+            // Display the actual centralized key format
+            if (data.license_data.license_key && data.license_data.license_key.startsWith('CENTRAL-')) {
+                document.getElementById('centralized-key-display').innerText = data.license_data.license_key;
+                
+                // Populate the input field if empty
+                var input = document.getElementById('centralized_key_input_field');
+                if (input && !input.value) {
+                    input.value = data.license_data.license_key;
                 }
-            
-            if (data.license_data.status === 'trial') {
-                document.getElementById('centralized-status').innerText = 'You are using a 7-day trial license';
-                document.getElementById('centralized-key-display').innerText = 'TRIAL';
-                document.getElementById('centralized-activation-status').innerHTML = '<span style="color: #60a5fa;">🕒 Trial</span>';
-            } else if (data.license_data.status === 'active') {
-                document.getElementById('centralized-status').innerText = 'Centralized license is active and verified';
-                // Show the actual centralized key format if available
-                if (data.license_data.license_key && data.license_data.license_key.startsWith('CENTRAL-')) {
-                    document.getElementById('centralized-key-display').innerText = data.license_data.license_key;
-                }
-            } else if (data.license_data.status === 'expired') {
-                document.getElementById('centralized-status').innerText = 'License has expired - please renew';
-                document.getElementById('centralized-key-display').innerText = 'EXPIRED';
-                document.getElementById('centralized-activation-status').innerHTML = '<span style="color: #ef4444;">✗ Expired</span>';
-            }
-            
-            // Show device sync status if available
-            if (data.devices_synced) {
-                document.getElementById('centralized-devices-count').innerText = data.devices_synced;
             } else {
-                document.getElementById('centralized-devices-count').innerText = '0';
+                document.getElementById('centralized-key-display').innerText = 'ACTIVE';
             }
+            document.getElementById('centralized-activation-status').innerHTML = '<span style="color: #4ade80;">✓ Activated</span>';
         } else {
-            console.log('Centralized Key Card: No license data found');
-            document.getElementById('centralized-status').innerText = 'No centralized license data available';
-            document.getElementById('centralized-vendor-id').innerText = 'Not Available';
-            document.getElementById('centralized-key-display').innerText = 'NONE';
-            document.getElementById('centralized-activation-status').innerHTML = '<span style="color: #6b7280;">⚪ None</span>';
+            document.getElementById('centralized-vendor-id').innerText = 'Not Assigned';
+            document.getElementById('centralized-key-display').innerText = 'PENDING';
+            document.getElementById('centralized-activation-status').innerHTML = '<span style="color: #fbbf24;">⏳ Pending</span>';
+        }
+    
+        if (data.license_data.status === 'trial') {
+            document.getElementById('centralized-status').innerText = 'You are using a 7-day trial license';
+            document.getElementById('centralized-key-display').innerText = 'TRIAL';
+            document.getElementById('centralized-activation-status').innerHTML = '<span style="color: #60a5fa;">🕒 Trial</span>';
+        } else if (data.license_data.status === 'active') {
+            document.getElementById('centralized-status').innerText = 'Centralized license is active and verified';
+            // Show the actual centralized key format if available
+            if (data.license_data.license_key && data.license_data.license_key.startsWith('CENTRAL-')) {
+                document.getElementById('centralized-key-display').innerText = data.license_data.license_key;
+            }
+        } else if (data.license_data.status === 'expired') {
+            document.getElementById('centralized-status').innerText = 'License has expired - please renew';
+            document.getElementById('centralized-key-display').innerText = 'EXPIRED';
+            document.getElementById('centralized-activation-status').innerHTML = '<span style="color: #ef4444;">✗ Expired</span>';
+        }
+        
+        // Show device sync status if available
+        if (data.devices_synced) {
+            document.getElementById('centralized-devices-count').innerText = data.devices_synced;
+        } else {
             document.getElementById('centralized-devices-count').innerText = '0';
         }
-        
-        if (data.status === 'valid') {
-            document.getElementById('license-status-display').innerHTML = '<span style="color: green;">✓ Valid</span>';
-            
-            if (data.license_data) {
-                if (data.license_data.status === 'trial') {
-                    document.getElementById('trial-info-display').innerHTML = 'You are using a 7-day trial. ' + formatDaysRemaining(data.license_data.expires_at);
-                    // Show license key input for activation
-                    document.querySelector('[data-name="license_key"]').parentElement.style.display = 'block';
-                    document.querySelector('[data-name="activate_license"]').parentElement.style.display = 'block';
-                } else if (data.license_data.status === 'active') {
-                    document.getElementById('license-status-display').innerHTML = '<span style="color: green;">✓ Active License</span>';
-                    document.getElementById('vendor-uuid-display').innerText = data.license_data.vendor_uuid || 'N/A';
-                    if (data.license_data.license_key) {
-                        document.querySelector('[data-name="license_key"]').value = data.license_data.license_key;
-                    }
-                    // Hide activation controls
-                    document.querySelector('[data-name="license_key"]').parentElement.style.display = 'none';
-                    document.querySelector('[data-name="activate_license"]').parentElement.style.display = 'none';
-                }
-            }
-        } else if (data.status === 'no_license') {
-            document.getElementById('license-status-display').innerHTML = '<span style="color: orange;">No license found</span>';
-            document.getElementById('trial-info-display').innerHTML = 'No license found. A trial license will be created automatically.';
-            // Show license key input for activation
-            document.querySelector('[data-name="license_key"]').parentElement.style.display = 'block';
-            document.querySelector('[data-name="activate_license"]').parentElement.style.display = 'block';
-        } else {
-            document.getElementById('license-status-display').innerHTML = '<span style="color: red;">✗ Invalid</span>';
-            document.getElementById('trial-info-display').innerHTML = 'License is invalid or expired.';
-            // Show license key input for activation
-            document.querySelector('[data-name="license_key"]').parentElement.style.display = 'block';
-            document.querySelector('[data-name="activate_license"]').parentElement.style.display = 'block';
-        }
+    } else {
+        console.log('Centralized Key Card: No license data found');
+        document.getElementById('centralized-status').innerText = 'No centralized license data available';
+        document.getElementById('centralized-vendor-id').innerText = 'Not Available';
+        document.getElementById('centralized-key-display').innerText = 'NONE';
+        document.getElementById('centralized-activation-status').innerHTML = '<span style="color: #6b7280;">⚪ None</span>';
+        document.getElementById('centralized-devices-count').innerText = '0';
     }
     
-    function activateLicense() {
-        var licenseKey = document.querySelector('[data-name="license_key"]').value.trim();
-        if (!licenseKey) {
-            alert('Please enter a license key');
-            return;
-        }
+    if (data.status === 'valid') {
+        document.getElementById('license-status-display').innerHTML = '<span style="color: green;">✓ Valid</span>';
         
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', apiUrl + '/license_activate', true);
-        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-        xhr.onload = function() {
-            if (xhr.status === 200) {
-                var data = JSON.parse(xhr.responseText);
-                alert('License activated successfully! Vendor UUID: ' + (data.vendor_uuid || 'N/A'));
-                // Reload to update display
+        if (data.license_data) {
+            if (data.license_data.status === 'trial') {
+                document.getElementById('trial-info-display').innerHTML = 'You are using a 7-day trial. ' + formatDaysRemaining(data.license_data.expires_at);
+                // Show license key input for activation
+                var keyInput = document.querySelector('[data-name="license_key"]');
+                if (keyInput && keyInput.parentElement) keyInput.parentElement.style.display = 'block';
+                var activateBtn = document.querySelector('[data-name="activate_license"]');
+                if (activateBtn && activateBtn.parentElement) activateBtn.parentElement.style.display = 'block';
+            } else if (data.license_data.status === 'active') {
+                document.getElementById('license-status-display').innerHTML = '<span style="color: green;">✓ Active License</span>';
+                document.getElementById('vendor-uuid-display').innerText = data.license_data.vendor_uuid || 'N/A';
+                if (data.license_data.license_key) {
+                    var keyInput = document.querySelector('[data-name="license_key"]');
+                    if (keyInput) keyInput.value = data.license_data.license_key;
+                }
+                // Hide activation controls
+                var keyInput = document.querySelector('[data-name="license_key"]');
+                if (keyInput && keyInput.parentElement) keyInput.parentElement.style.display = 'none';
+                var activateBtn = document.querySelector('[data-name="activate_license"]');
+                if (activateBtn && activateBtn.parentElement) activateBtn.parentElement.style.display = 'none';
+            }
+        }
+    } else if (data.status === 'no_license') {
+        document.getElementById('license-status-display').innerHTML = '<span style="color: orange;">No license found</span>';
+        document.getElementById('trial-info-display').innerHTML = 'No license found. A trial license will be created automatically.';
+        // Show license key input for activation
+        var keyInput = document.querySelector('[data-name="license_key"]');
+        if (keyInput && keyInput.parentElement) keyInput.parentElement.style.display = 'block';
+        var activateBtn = document.querySelector('[data-name="activate_license"]');
+        if (activateBtn && activateBtn.parentElement) activateBtn.parentElement.style.display = 'block';
+    } else {
+        document.getElementById('license-status-display').innerHTML = '<span style="color: red;">✗ Invalid</span>';
+        document.getElementById('trial-info-display').innerHTML = 'License is invalid or expired.';
+        // Show license key input for activation
+        var keyInput = document.querySelector('[data-name="license_key"]');
+        if (keyInput && keyInput.parentElement) keyInput.parentElement.style.display = 'block';
+        var activateBtn = document.querySelector('[data-name="activate_license"]');
+        if (activateBtn && activateBtn.parentElement) activateBtn.parentElement.style.display = 'block';
+    }
+};
+
+window.activateLicense = function() {
+    var apiUrl = "/cgi-bin/luci/pisowifi/api";
+    var licenseKey = document.querySelector('[data-name="license_key"]').value.trim();
+    if (!licenseKey) {
+        alert('Please enter a license key');
+        return;
+    }
+    
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', apiUrl + '/license_activate', true);
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            var data = JSON.parse(xhr.responseText);
+            alert('License activated successfully! Vendor UUID: ' + (data.vendor_uuid || 'N/A'));
+            // Reload to update display
+            location.reload();
+        } else {
+            var error = JSON.parse(xhr.responseText);
+            alert('Activation failed: ' + (error.error || 'Unknown error'));
+        }
+    };
+    xhr.send('license_key=' + encodeURIComponent(licenseKey));
+};
+
+window.syncCentralizedVendor = function() {
+    if (!confirm('This will sync your machine with the centralized vendor system. Continue?')) {
+        return;
+    }
+    
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/cgi-bin/luci/admin/pisowifi/sync_centralized', true);
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            var data = JSON.parse(xhr.responseText);
+            if (data.success) {
+                alert('Successfully synced with centralized vendor system!');
+                checkLicenseStatus(); // Refresh the display
+            } else {
+                alert('Sync failed: ' + (data.error || 'Unknown error'));
+            }
+        } else {
+            alert('Sync request failed');
+        }
+    };
+    xhr.send();
+};
+
+window.syncWifiDevices = function() {
+    if (!confirm('This will sync all active WiFi devices to the centralized system. Continue?')) {
+        return;
+    }
+    
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/cgi-bin/luci/admin/pisowifi/sync_devices', true);
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            var data = JSON.parse(xhr.responseText);
+            if (data.success) {
+                alert('Successfully synced WiFi devices to centralized system! ' + data.message);
+            } else {
+                alert('Device sync failed: ' + (data.error || 'Unknown error'));
+            }
+        } else {
+            alert('Device sync request failed');
+        }
+    };
+    xhr.send();
+};
+
+window.activateCentralizedKey = function(btn) {
+    var apiUrl = "/cgi-bin/luci/pisowifi/api";
+    // Find the input field by ID since we are using raw HTML now
+    var input = document.getElementById('centralized_key_input_field');
+    var key = input ? input.value.trim() : '';
+    
+    if (!key) {
+        alert('Please enter a Centralized Key');
+        return false;
+    }
+    
+    console.log('Activating Centralized Key:', key);
+    
+    // Basic format check (relaxed)
+    if (!key.toUpperCase().startsWith('CENTRAL-')) {
+        alert('Invalid format. Key must start with "CENTRAL-"');
+        return false;
+    }
+    
+    if (!confirm('Activate Centralized Key: ' + key + '?')) {
+        return false;
+    }
+    
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', apiUrl + '/license_activate', true);
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            var data = JSON.parse(xhr.responseText);
+            if (data.vendor_uuid || data.status === 'active') {
+                alert('Centralized Key activated successfully!');
                 location.reload();
             } else {
+                alert('Activation failed: ' + (data.error || 'Unknown error'));
+            }
+        } else {
+            try {
                 var error = JSON.parse(xhr.responseText);
-                alert('Activation failed: ' + (error.error || 'Unknown error'));
+                alert('Activation failed: ' + (error.error || 'Server error'));
+            } catch(e) {
+                alert('Activation failed: Server error ' + xhr.status);
             }
-        };
-        xhr.send('license_key=' + encodeURIComponent(licenseKey));
-    }
-    
-    function syncCentralizedVendor() {
-        if (!confirm('This will sync your machine with the centralized vendor system. Continue?')) {
-            return;
         }
-        
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', '/cgi-bin/luci/admin/pisowifi/sync_centralized', true);
-        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-        xhr.onload = function() {
-            if (xhr.status === 200) {
-                var data = JSON.parse(xhr.responseText);
-                if (data.success) {
-                    alert('Successfully synced with centralized vendor system!');
-                    checkLicenseStatus(); // Refresh the display
-                } else {
-                    alert('Sync failed: ' + (data.error || 'Unknown error'));
-                }
-            } else {
-                alert('Sync request failed');
-            }
-        };
-        xhr.send();
+    };
+    xhr.send('license_key=' + encodeURIComponent(key));
+    
+    return false; // Prevent form submission
+};
+
+window.clearCentralizedKey = function(btn) {
+    if (!confirm('Are you sure you want to clear the Centralized Key? This will deactivate centralized management.')) {
+        return false;
     }
     
-    function syncWifiDevices() {
-        if (!confirm('This will sync all active WiFi devices to the centralized system. Continue?')) {
-            return;
-        }
-        
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', '/cgi-bin/luci/admin/pisowifi/sync_devices', true);
-        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-        xhr.onload = function() {
-            if (xhr.status === 200) {
-                var data = JSON.parse(xhr.responseText);
-                if (data.success) {
-                    alert('Successfully synced WiFi devices to centralized system! ' + data.message);
-                } else {
-                    alert('Device sync failed: ' + (data.error || 'Unknown error'));
-                }
-            } else {
-                alert('Device sync request failed');
-            }
-        };
-        xhr.send();
-    }
+    var input = document.getElementById('centralized_key_input_field');
+    if (input) input.value = '';
+    alert('Key cleared from input. To fully deactivate, please contact support or enter a new key.');
     
+    return false; // Prevent form submission
+};
+
+(function() {
     // Initialize license check when page loads
     document.addEventListener('DOMContentLoaded', function() {
         console.log('Centralized Key Card: Initializing license check...');
@@ -499,38 +601,7 @@ o.value = [[
         
         checkLicenseStatus();
         
-        // Set up activation button
-        var activateBtn = document.querySelector('[data-name="activate_license"]');
-        if (activateBtn) {
-            activateBtn.addEventListener('click', function(e) {
-                e.preventDefault();
-                activateLicense();
-            });
-        }
-        
-        // Set up centralized sync button
-        var syncBtn = document.querySelector('[data-name="sync_centralized"]');
-        if (syncBtn) {
-            console.log('Centralized Key Card: Sync button found');
-            syncBtn.addEventListener('click', function(e) {
-                e.preventDefault();
-                syncCentralizedVendor();
-            });
-        } else {
-            console.log('Centralized Key Card: Sync button NOT found');
-        }
-        
-        // Set up WiFi devices sync button
-        var deviceSyncBtn = document.querySelector('[data-name="sync_devices"]');
-        if (deviceSyncBtn) {
-            console.log('Centralized Key Card: Device sync button found');
-            deviceSyncBtn.addEventListener('click', function(e) {
-                e.preventDefault();
-                syncWifiDevices();
-            });
-        } else {
-            console.log('Centralized Key Card: Device sync button NOT found');
-        }
+        // Setup listeners for other buttons if needed (though onclick handles most now)
         
         // Force display of centralized key card elements
         setTimeout(function() {
