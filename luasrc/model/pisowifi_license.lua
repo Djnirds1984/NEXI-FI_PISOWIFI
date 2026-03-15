@@ -74,6 +74,45 @@ function M.activate_license(hardware_id, license_key, ip_address)
         return {error = "Hardware ID and license key required"}
     end
     
+    -- Check if this is a centralized key format (CENTRAL-XXXXXXXX-XXXXXXXX)
+    local is_centralized_key = license_key:match("^CENTRAL%-[a-f0-9]+%-[a-f0-9]+$")
+    
+    -- For centralized keys, validate format and activate as centralized license
+    if is_centralized_key then
+        local curl_cmd = string.format(
+            "curl -s -X POST '%s/rest/v1/rpc/activate_centralized_license' " ..
+            "-H 'apikey: %s' " ..
+            "-H 'Authorization: Bearer %s' " ..
+            "-H 'Content-Type: application/json' " ..
+            "-d '{\"hardware_id\": \"%s\", \"centralized_key\": \"%s\", \"ip_address\": \"%s\"}'",
+            SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_ANON_KEY, hardware_id, license_key, ip_address or ""
+        )
+        
+        local result = sys.exec(curl_cmd)
+        local data = json.parse(result)
+        
+        return data
+    end
+    
+    -- For regular license keys, use the existing activation logic
+    -- Validate regular license key format (can be any format except centralized)
+    if license_key:match("^CENTRAL%-") then
+        return {error = "Invalid license key format. Centralized keys should use the CENTRAL-XXXXXXXX-XXXXXXXX format"}
+    end
+    
+    local curl_cmd = string.format(
+        "curl -s -X POST '%s/rest/v1/rpc/activate_license' " ..
+        "-H 'apikey: %s' " ..
+        "-H 'Authorization: Bearer %s' " ..
+        "-H 'Content-Type: application/json' " ..
+        "-d '{\"hardware_id\": \"%s\", \"license_key\": \"%s\", \"ip_address\": \"%s\"}'",
+        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_ANON_KEY, hardware_id, license_key, ip_address or ""
+    )
+    
+    local result = sys.exec(curl_cmd)
+    local data = json.parse(result)
+    
+    -- For regular license keys, use the existing activation logic
     local curl_cmd = string.format(
         "curl -s -X POST '%s/rest/v1/rpc/activate_license' " ..
         "-H 'apikey: %s' " ..

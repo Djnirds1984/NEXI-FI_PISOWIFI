@@ -39,6 +39,8 @@ function index()
 	entry({"admin", "pisowifi", "settings"}, cbi("pisowifi/settings"), "Settings", 2)
 	entry({"admin", "pisowifi", "users"}, call("action_users"), "Users", 3)
 	entry({"admin", "pisowifi", "kick"}, call("action_kick"), nil)
+	entry({"admin", "pisowifi", "sync_centralized"}, call("action_sync_centralized"), nil)
+	entry({"admin", "pisowifi", "sync_devices"}, call("action_sync_devices"), nil)
 end
 
 -- Helpers
@@ -86,27 +88,34 @@ end
 
 local function load_sessions()
 	local sessions = {}
-	local f = io.open(SESSION_FILE, "r")
-	if f then
-		for line in f:lines() do
-			local mac, expiry = line:match("([%x:]+) (%d+)")
-			if mac and expiry then
-				sessions[mac] = tonumber(expiry)
-			end
+	-- Use SQLite database instead of file
+	local db_file = "/etc/pisowifi/pisowifi.db"
+	local current_time = os.time()
+	local cmd = string.format("sqlite3 %s 'SELECT mac, session_end FROM users WHERE session_end > %d'", db_file, current_time)
+	
+	sys.exec("logger -t pisowifi 'load_sessions: Executing command: " .. cmd .. "'")
+	local result = sys.exec(cmd)
+	sys.exec("logger -t pisowifi 'load_sessions: Raw result: " .. (result or "nil") .. "'")
+	
+	local count = 0
+	for line in result:gmatch("[^\n]+") do
+		local mac, expiry = line:match("([%x:]+)|(%d+)")
+		if mac and expiry then
+			sessions[mac] = tonumber(expiry)
+			count = count + 1
+			sys.exec("logger -t pisowifi 'load_sessions: Found session - MAC: " .. mac .. " expiry: " .. expiry .. "'")
+		else
+			sys.exec("logger -t pisowifi 'load_sessions: Failed to parse line: " .. line .. "'")
 		end
-		f:close()
 	end
+	
+	sys.exec("logger -t pisowifi 'load_sessions: Total sessions loaded: " .. count .. "'")
 	return sessions
 end
 
 local function save_sessions(sessions)
-	local f = io.open(SESSION_FILE, "w")
-	if f then
-		for mac, expiry in pairs(sessions) do
-			f:write(mac .. " " .. expiry .. "\n")
-		end
-		f:close()
-	end
+	-- No longer needed since we use SQLite database
+	-- Sessions are saved directly to database via update_user_session
 end
 
 -- API Implementations
@@ -188,9 +197,9 @@ function api_logout()
 	local mac = get_client_mac()
 	if mac then
 		firewall_deny(mac)
-		local sessions = load_sessions()
-		sessions[mac] = nil
-		save_sessions(sessions)
+		-- Remove from database instead of file
+		local db_file = "/etc/pisowifi/pisowifi.db"
+		sys.exec(string.format("sqlite3 %s 'UPDATE users SET session_end=0 WHERE mac=\"%s\"'", db_file, mac))
 		http.write_json({status = "success"})
 	end
 end
@@ -270,23 +279,249 @@ function get_active_users()
 	local sessions = load_sessions()
 	local users = {}
 	local now = os.time()
+	
+	-- Debug logging
+	sys.exec("logger -t pisowifi 'get_active_users: Found ' .. tostring(#sessions) .. ' sessions in load_sessions()'")
+	
 	for mac, expiry in pairs(sessions) do
 		if expiry > now then
-			table.insert(users, {mac = mac, expiry = expiry, remaining = expiry - now})
+			-- Get hostname from dnsmasq
+			local hostname = "Unknown"
+			local hostname_cmd = "cat /tmp/dhcp.leases 2>/dev/null | grep -i '" .. mac .. "' | awk '{print $4}' | head -1"
+			local hostname_result = sys.exec(hostname_cmd)
+			if hostname_result and hostname_result:gsub("%s+", "") ~= "" then
+				hostname = hostname_result:gsub("%s+", "")
+			end
+			
+			-- Get session token from database
+			local token = ""
+			local db_file = "/etc/pisowifi/pisowifi.db"
+			local token_cmd = "sqlite3 " .. db_file .. " 'SELECT token FROM users WHERE mac=\"" .. mac .. "\" AND session_end > " .. now .. " LIMIT 1'"
+			local token_result = sys.exec(token_cmd)
+			if token_result and token_result:gsub("%s+", "") ~= "" then
+				token = token_result:gsub("%s+", "")
+			end
+			
+			table.insert(users, {
+				mac = mac, 
+				expiry = expiry, 
+				remaining = expiry - now,
+				hostname = hostname,
+				token = token
+			})
+			sys.exec("logger -t pisowifi 'Active user: ' .. mac .. ' (' .. hostname .. ') expires in ' .. tostring(expiry - now) .. ' seconds'")
 		end
 	end
+	
+	sys.exec("logger -t pisowifi 'get_active_users: Returning ' .. tostring(#users) .. ' active users'")
 	return users
+end
+
+-- Test function to check database connectivity
+function test_db_connection()
+	local db_file = "/etc/pisowifi/pisowifi.db"
+	local test_cmd = "sqlite3 " .. db_file .. " 'SELECT COUNT(*) FROM users'"
+	local result = sys.exec(test_cmd)
+	sys.exec("logger -t pisowifi 'DB Test: users table count = " .. (result or "nil") .. "'")
+	
+	local test_cmd2 = "sqlite3 " .. db_file .. " 'SELECT mac, session_end FROM users WHERE session_end > " .. os.time() .. " LIMIT 5'"
+	local result2 = sys.exec(test_cmd2)
+	sys.exec("logger -t pisowifi 'DB Test: active sessions = " .. (result2 or "nil") .. "'")
+	
+	return result, result2
+end
+
+-- Sync with centralized vendor system
+function sync_with_centralized_vendor()
+	local hardware_id = license_model.get_hardware_id()
+	if not hardware_id then
+		return false, "No hardware ID available"
+	end
+	
+	-- Get current license status
+	local license_data = license_model.get_license_status(hardware_id)
+	if not license_data or not license_data.vendor_uuid then
+		return false, "No vendor UUID available"
+	end
+	
+	-- Prepare vendor sync data
+	local machine_name = sys.hostname() or "PisoWifi-Machine"
+	local vendor_body = {
+		hardware_id = hardware_id,
+		machine_name = machine_name,
+		vendor_id = license_data.vendor_uuid,
+		license_key = license_data.license_key or "",
+		is_licensed = (license_data.status == "active"),
+		activated_at = license_data.activated_at or os.date("!%Y-%m-%dT%H:%M:%SZ"),
+		status = "online"
+	}
+	
+	-- Convert to JSON
+	local json_body = json.stringify(vendor_body)
+	
+	-- Sync to centralized vendor system
+	local curl_cmd = string.format(
+		"curl -s -X POST '%s/rest/v1/vendors' " ..
+		"-H 'apikey: %s' " ..
+		"-H 'Authorization: Bearer %s' " ..
+		"-H 'Content-Type: application/json' " ..
+		"-H 'Prefer: return=representation' " ..
+		"-d '%s'",
+		"https://fuiabtdflbodglfexvln.supabase.co",
+		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ1aWFidGRmbGJvZGdsZmV4dmxuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkxNTAyMDAsImV4cCI6MjA4NDcyNjIwMH0.kbvAhEBKHLaByS9d9GRHbvuPikHvGjkdTaGHuubYazo",
+		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ1aWFidGRmbGJvZGdsZmV4dmxuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkxNTAyMDAsImV4cCI6MjA4NDcyNjIwMH0.kbvAhEBKHLaByS9d9GRHbvuPikHvGjkdTaGHuubYazo",
+		json_body
+	)
+	
+	local result = sys.exec(curl_cmd)
+	local response_data = json.parse(result)
+	
+	if response_data and response_data.error then
+		return false, response_data.error
+	elseif response_data and response_data[1] then
+		-- Sync WiFi devices to centralized system
+		sync_wifi_devices_to_centralized(license_data.vendor_uuid)
+		return true, "Successfully synced with centralized vendor system"
+	else
+		return false, "Unknown error during vendor sync"
+	end
+end
+
+-- Sync WiFi devices to centralized wifi_devices table
+function sync_wifi_devices_to_centralized(vendor_uuid)
+	if not vendor_uuid then
+		return false, "No vendor UUID provided"
+	end
+	
+	-- Get all active WiFi devices from local database
+	local db_file = "/etc/pisowifi/pisowifi.db"
+	local devices_query = string.format(
+		"sqlite3 %s 'SELECT mac, session_start, session_end, ip_address FROM users WHERE session_end > %d'",
+		db_file, os.time()
+	)
+	
+	local devices_result = sys.exec(devices_query)
+	if not devices_result or devices_result == "" then
+		return true, "No active devices to sync"
+	end
+	
+	-- Parse devices and sync each one
+	local devices_synced = 0
+	for line in devices_result:gmatch("[^\r\n]+") do
+		local mac, session_start, session_end, ip_address = line:match("([^|]+)|([^|]+)|([^|]+)|([^|]+)")
+		if mac then
+			-- Get hostname from dnsmasq
+			local hostname = "Unknown"
+			local hostname_cmd = string.format("grep '%s' /tmp/dhcp.leases | awk '{print $4}' | head -1", mac:lower())
+			local hostname_result = sys.exec(hostname_cmd)
+			if hostname_result and hostname_result ~= "" then
+				hostname = hostname_result:gsub("%s+", "")
+			end
+			
+			-- Prepare device sync data
+			local device_body = {
+				vendor_id = vendor_uuid,
+				mac_address = mac:upper(),
+				device_name = hostname,
+				ip_address = ip_address or "Unknown",
+				session_start = tonumber(session_start) or os.time(),
+				session_end = tonumber(session_end) or (os.time() + 3600),
+				last_seen = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+				status = "active"
+			}
+			
+			-- Convert to JSON
+			local json_body = json.stringify(device_body)
+			
+			-- Sync device to centralized wifi_devices table
+			local device_curl_cmd = string.format(
+				"curl -s -X POST '%s/rest/v1/wifi_devices' " ..
+				"-H 'apikey: %s' " ..
+				"-H 'Authorization: Bearer %s' " ..
+				"-H 'Content-Type: application/json' " ..
+				"-H 'Prefer: return=representation' " ..
+				"-d '%s'",
+				"https://fuiabtdflbodglfexvln.supabase.co",
+				"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ1aWFidGRmbGJvZGdsZmV4dmxuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkxNTAyMDAsImV4cCI6MjA4NDcyNjIwMH0.kbvAhEBKHLaByS9d9GRHbvuPikHvGjkdTaGHuubYazo",
+				"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ1aWFidGRmbGJvZGdsZmV4dmxuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkxNTAyMDAsImV4cCI6MjA4NDcyNjIwMH0.kbvAhEBKHLaByS9d9GRHbvuPikHvGjkdTaGHuubYazo",
+				json_body
+			)
+			
+			local device_result = sys.exec(device_curl_cmd)
+			local device_response = json.parse(device_result)
+			
+			if device_response and not device_response.error then
+				devices_synced = devices_synced + 1
+			end
+		end
+	end
+	
+	return true, string.format("Successfully synced %d devices to centralized system", devices_synced), devices_synced
 end
 
 function action_kick()
 	local mac = http.formvalue("mac")
 	if mac then
 		firewall_deny(mac)
-		local sessions = load_sessions()
-		sessions[mac] = nil
-		save_sessions(sessions)
+		-- Remove from database instead of file
+		local db_file = "/etc/pisowifi/pisowifi.db"
+		sys.exec(string.format("sqlite3 %s 'UPDATE users SET session_end=0 WHERE mac=\"%s\"'", db_file, mac))
 	end
 	http.redirect(luci.dispatcher.build_url("admin", "pisowifi", "dashboard"))
+end
+
+function action_sync_centralized()
+	local success, message = sync_with_centralized_vendor()
+	
+	http.prepare_content("application/json")
+	if success then
+		http.write_json({
+			success = true,
+			message = message
+		})
+	else
+		http.status(400, "Bad Request")
+		http.write_json({
+			success = false,
+			error = message
+		})
+	end
+end
+
+-- Sync only WiFi devices to centralized system
+function action_sync_devices()
+	local hardware_id = license_model.get_hardware_id()
+	if not hardware_id then
+		http.status(500, "Internal Server Error")
+		http.write_json({error = "Could not determine hardware ID"})
+		return
+	end
+	
+	-- Get current license status
+	local license_data = license_model.get_license_status(hardware_id)
+	if not license_data or not license_data.vendor_uuid then
+		http.status(400, "Bad Request")
+		http.write_json({error = "No vendor UUID available - please activate license first"})
+		return
+	end
+	
+	-- Sync devices to centralized system
+	local success, message, devices_synced = sync_wifi_devices_to_centralized(license_data.vendor_uuid)
+	
+	http.prepare_content("application/json")
+	if success then
+		http.write_json({
+			success = true,
+			message = message,
+			devices_synced = devices_synced or 0
+		})
+	else
+		http.status(400, "Bad Request")
+		http.write_json({
+			success = false,
+			error = message
+		})
+	end
 end
 
 _G.get_active_users = get_active_users

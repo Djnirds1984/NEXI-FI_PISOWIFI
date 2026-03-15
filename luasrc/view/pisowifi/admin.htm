@@ -27,27 +27,51 @@
 		<h3>Active Sessions</h3>
 		<table class="cbi-section-table">
 			<tr class="cbi-section-table-titles">
+				<th class="cbi-section-table-cell">Device Name</th>
 				<th class="cbi-section-table-cell">MAC Address</th>
+				<th class="cbi-section-table-cell">Session ID</th>
+				<th class="cbi-section-table-cell">Time Remaining</th>
+				<th class="cbi-section-table-cell">Status</th>
 				<th class="cbi-section-table-cell">Action</th>
 			</tr>
 			<% 
-			-- Import our controller function
-			-- Since we exported it to _G, it might be available, but safer to require if possible.
-			-- However, calling the global function directly.
+			-- Load controller and get active users
+			local pisowifi_ctrl = require "luci.controller.pisowifi"
 			local users = {}
-			if get_active_users then
-				users = get_active_users()
+			local debug_info = ""
+			
+			-- Debug: Check if controller loaded
+			if not pisowifi_ctrl then
+				debug_info = debug_info .. "Controller not loaded. "
 			else
-				-- Fallback if function not found in global scope (should not happen if controller loaded)
-				-- Or try to load the module
-				require "luci.controller.pisowifi"
-				if get_active_users then users = get_active_users() end
+				debug_info = debug_info .. "Controller loaded successfully. "
 			end
+			
+			-- Call the function from the loaded controller
+			if pisowifi_ctrl and pisowifi_ctrl.get_active_users then
+				users = pisowifi_ctrl.get_active_users()
+				debug_info = debug_info .. "Function called. Found " .. #users .. " users. "
+			else
+				debug_info = debug_info .. "get_active_users function not found. "
+			end
+			
+			-- Test database connection
+			if pisowifi_ctrl and pisowifi_ctrl.test_db_connection then
+				local count_result, sessions_result = pisowifi_ctrl.test_db_connection()
+				debug_info = debug_info .. "DB Test: " .. (count_result or "nil") .. " | " .. (sessions_result or "nil")
+			end
+			
+			-- Debug: Log to system log
+			luci.sys.exec("logger -t pisowifi 'Admin view: Found " .. #users .. " active users'")
 			
 			for i, v in ipairs(users) do 
 			%>
 			<tr class="cbi-section-table-row">
+				<td class="cbi-section-table-cell"><%=v.hostname%></td>
 				<td class="cbi-section-table-cell"><%=v.mac%></td>
+				<td class="cbi-section-table-cell"><%=v.token:sub(1,8)%>...</td>
+				<td class="cbi-section-table-cell"><%=math.floor(v.remaining/60)%>m <%=v.remaining%60%>s</td>
+				<td class="cbi-section-table-cell">Connected</td>
 				<td class="cbi-section-table-cell">
 					<form action="<%=luci.dispatcher.build_url("admin", "pisowifi", "kick")%>" method="post" style="display:inline;">
 						<input type="hidden" name="mac" value="<%=v.mac%>" />
@@ -58,7 +82,7 @@
 			<% end %>
 			<% if #users == 0 then %>
 			<tr class="cbi-section-table-row">
-				<td class="cbi-section-table-cell" colspan="2">No active users found.</td>
+				<td class="cbi-section-table-cell" colspan="6">No active users found. <%=debug_info%></td>
 			</tr>
 			<% end %>
 		</table>

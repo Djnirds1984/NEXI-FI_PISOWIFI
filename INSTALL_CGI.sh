@@ -805,6 +805,43 @@ insert_coin_record() {
     query_db "INSERT INTO coins (mac, coins) VALUES ('$mac', $coins)"
 }
 
+# Supabase Helper Functions
+supa_request() {
+    local url="$1" key="$2" path="$3"
+    SUPA_HTTP_CODE="" SUPA_BODY=""
+    local curl_bin="/usr/bin/curl"
+    [ -x "$curl_bin" ] || curl_bin="/bin/curl"
+    [ -x "$curl_bin" ] || return
+    local tmp="/tmp/supa_$$"
+    SUPA_HTTP_CODE=$("$curl_bin" -sS -o "$tmp" -w "%{http_code}" -H "apikey: $key" -H "Authorization: Bearer $key" -H "Accept: application/json" "$url/rest/v1/$path")
+    SUPA_BODY=$(cat "$tmp" 2>/dev/null)
+    rm -f "$tmp"
+}
+
+supa_patch() {
+    local url="$1" key="$2" path="$3" body="$4"
+    SUPA_HTTP_CODE="" SUPA_BODY=""
+    local curl_bin="/usr/bin/curl"
+    [ -x "$curl_bin" ] || curl_bin="/bin/curl"
+    [ -x "$curl_bin" ] || return
+    local tmp="/tmp/supa_$$"
+    SUPA_HTTP_CODE=$("$curl_bin" -sS -o "$tmp" -w "%{http_code}" -X PATCH -H "apikey: $key" -H "Authorization: Bearer $key" -H "Content-Type: application/json" -d "$body" "$url/rest/v1/$path")
+    SUPA_BODY=$(cat "$tmp" 2>/dev/null)
+    rm -f "$tmp"
+}
+
+supa_insert() {
+    local url="$1" key="$2" path="$3" body="$4"
+    SUPA_HTTP_CODE="" SUPA_BODY=""
+    local curl_bin="/usr/bin/curl"
+    [ -x "$curl_bin" ] || curl_bin="/bin/curl"
+    [ -x "$curl_bin" ] || return
+    local tmp="/tmp/supa_$$"
+    SUPA_HTTP_CODE=$("$curl_bin" -sS -o "$tmp" -w "%{http_code}" -X POST -H "apikey: $key" -H "Authorization: Bearer $key" -H "Content-Type: application/json" -d "$body" "$url/rest/v1/$path")
+    SUPA_BODY=$(cat "$tmp" 2>/dev/null)
+    rm -f "$tmp"
+}
+
 get_coin_count() {
     local mac="$1"
     # Get coins from global counter (mac 00:00:00:00:00:00)
@@ -849,7 +886,15 @@ get_client_mac() {
 handle_api() {
     MAC=$(get_client_mac)
     
-    [ -f /tmp/pisowifi_verbose ] && logger -t pisowifi "API request: $QUERY_STRING from MAC: $MAC IP: $REMOTE_ADDR"
+    # Extract SID from Query String
+    SID=$(echo "$QUERY_STRING" | grep -o "sid=[^&]*" | cut -d= -f2 | sed 's/%3A/:/g' | sed 's/%2D/-/g')
+    [ -z "$SID" ] && SID="UNKNOWN"
+    
+    # Supabase Config for Roaming
+    SUPA_URL=$(uci get pisowifi.supabase.url 2>/dev/null)
+    SUPA_KEY=$(uci get pisowifi.supabase.key 2>/dev/null)
+    
+    [ -f /tmp/pisowifi_verbose ] && logger -t pisowifi "API request: $QUERY_STRING from MAC: $MAC IP: $REMOTE_ADDR SID: $SID"
     
     # Simple JSON Response Wrapper
     json_response() {
@@ -858,7 +903,7 @@ handle_api() {
     }
     
     case "$QUERY_STRING" in
-        "action=status")
+        "action=status"*)
             # Check firewall status
             # Use nft to check if table exists, if not init
             nft list table inet pisowifi >/dev/null 2>&1 || $FIREWALL_SCRIPT init
@@ -885,28 +930,38 @@ handle_api() {
                 if [ "$PAUSED_TIME" -gt 0 ]; then
                     AUTH="paused"
                     TIME_REMAINING=$PAUSED_TIME
-                    # Reduced logging to prevent CPU spikes
                     # logger -t pisowifi "User $MAC is PAUSED. Remaining: $PAUSED_TIME"
-                    
-                    # Do NOT call firewall script on every status check!
-                    # The session daemon handles enforcement.
-                    # $FIREWALL_SCRIPT deny "$MAC" >/dev/null 2>&1
                 elif [ "$EXPIRY" -gt "$NOW" ]; then
                     AUTH="true"
                     TIME_REMAINING=$((EXPIRY - NOW))
-                    # Reduced logging
                     # logger -t pisowifi "User $MAC authenticated, time remaining: $TIME_REMAINING"
-                    
-                    # Do NOT call firewall script on every status check!
-                    # $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
                 else
-                    # logger -t pisowifi "Session expired for $MAC"
-                    # $FIREWALL_SCRIPT deny "$MAC" >/dev/null 2>&1
-                    true
+                    # Local check failed, check Supabase for roaming session
+                    if [ -n "$SUPA_URL" ] && [ "$SID" != "UNKNOWN" ]; then
+                        # Try to find a persistent session bound to this MAC and SID
+                        supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=remaining_seconds,connected_at,is_paused&mac=eq.$MAC&session_uuid=eq.$SID&limit=1"
+                        if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                            # Session found in Supabase!
+                            REM_SEC=$(echo "$SUPA_BODY" | grep -o '"remaining_seconds":[0-9]*' | cut -d: -f2)
+                            CONN_AT=$(echo "$SUPA_BODY" | grep -o '"connected_at":[0-9]*' | cut -d: -f2)
+                            IS_PAUSED=$(echo "$SUPA_BODY" | grep -o '"is_paused":[^,}]*' | cut -d: -f2)
+                            
+                            if [ "$IS_PAUSED" = "true" ]; then
+                                AUTH="paused"
+                                TIME_REMAINING=$REM_SEC
+                                query_db "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time) VALUES ('$MAC', '$REMOTE_ADDR', 0, $REM_SEC)"
+                                logger -t pisowifi "Roaming session synced (PAUSED) for MAC: $MAC SID: $SID"
+                            elif [ "$REM_SEC" -gt 0 ]; then
+                                NEW_EXPIRY=$((NOW + REM_SEC))
+                                AUTH="true"
+                                TIME_REMAINING=$REM_SEC
+                                query_db "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time) VALUES ('$MAC', '$REMOTE_ADDR', $NEW_EXPIRY, 0)"
+                                $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
+                                logger -t pisowifi "Roaming session synced (ACTIVE) for MAC: $MAC SID: $SID"
+                            fi
+                        fi
+                    fi
                 fi
-            else
-                # logger -t pisowifi "No MAC address found for IP: $REMOTE_ADDR"
-                true
             fi
             json_response "{\"authenticated\": \"$AUTH\", \"time_remaining\": $TIME_REMAINING, \"mac\": \"$MAC\", \"ip\": \"$REMOTE_ADDR\"}"
             ;;
@@ -929,7 +984,7 @@ handle_api() {
             json_response "{\"count\": $COUNT, \"minutes\": $MINUTES}"
             ;;
             
-        "action=connect")
+        "action=connect"*)
             # Transfer coins from global counter to user
             COUNT=$(transfer_coins_to_user "$MAC")
             [ -z "$COUNT" ] && COUNT=0
@@ -962,6 +1017,31 @@ handle_api() {
                 # Update user session in database
                 update_user_session "$MAC" "$REMOTE_ADDR" $NEW_EXPIRY $COUNT
                 
+                # Sync to Supabase for Roaming
+                if [ -n "$SUPA_URL" ] && [ "$SID" != "UNKNOWN" ]; then
+                    REM_SEC=$((NEW_EXPIRY - NOW))
+                    # Check if session exists in Supabase
+                    supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=id&mac=eq.$MAC&limit=1"
+                    if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                        # Update existing
+                        SID_BODY="{\"remaining_seconds\": $REM_SEC, \"session_uuid\": \"$SID\", \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$MAC" "$SID_BODY"
+                    else
+                        # Insert new
+                        SID_BODY="{\"mac\": \"$MAC\", \"remaining_seconds\": $REM_SEC, \"session_uuid\": \"$SID\", \"connected_at\": $NOW, \"is_paused\": false}"
+                        supa_insert "$SUPA_URL" "$SUPA_KEY" "sessions" "$SID_BODY"
+                    fi
+                    
+                    # Also sync to wifi_devices for tracking
+                    DEV_BODY="{\"mac_address\": \"$MAC\", \"session_token\": \"$SID\", \"remaining_seconds\": $REM_SEC, \"last_heartbeat\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                    supa_request "$SUPA_URL" "$SUPA_KEY" "wifi_devices?select=id&mac_address=eq.$MAC&limit=1"
+                    if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "wifi_devices?mac_address=eq.$MAC" "$DEV_BODY"
+                    else
+                        supa_insert "$SUPA_URL" "$SUPA_KEY" "wifi_devices" "$DEV_BODY"
+                    fi
+                fi
+                
                 # Allow Access
                 $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
                 logger -t pisowifi "User $MAC connected successfully. Time added: $ADDED_MINUTES mins. New Expiry: $NEW_EXPIRY"
@@ -972,7 +1052,7 @@ handle_api() {
             fi
             ;;
             
-        "action=pause")
+        "action=pause"*)
             # Get current expiry
             EXPIRY=$(get_user_session "$MAC")
             NOW=$(date +%s)
@@ -981,6 +1061,13 @@ handle_api() {
                 REMAINING=$((EXPIRY - NOW))
                 # Save remaining time, clear session end
                 query_db "UPDATE users SET paused_time=$REMAINING, session_end=0 WHERE mac='$MAC'"
+                
+                # Sync to Supabase
+                if [ -n "$SUPA_URL" ]; then
+                    SID_BODY="{\"remaining_seconds\": $REMAINING, \"is_paused\": true, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                    supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$MAC" "$SID_BODY"
+                fi
+                
                 # Cut internet
                 $FIREWALL_SCRIPT deny "$MAC"
                 json_response "{\"status\": \"paused\", \"remaining\": $REMAINING}"
@@ -989,7 +1076,7 @@ handle_api() {
             fi
             ;;
 
-        "action=resume")
+        "action=resume"*)
             # Get paused time
             PAUSED=$(query_db "SELECT paused_time FROM users WHERE mac='$MAC'")
             [ -z "$PAUSED" ] && PAUSED=0
@@ -999,6 +1086,13 @@ handle_api() {
                 NEW_END=$((NOW + PAUSED))
                 # Restore session, clear paused time
                 query_db "UPDATE users SET session_end=$NEW_END, paused_time=0 WHERE mac='$MAC'"
+                
+                # Sync to Supabase
+                if [ -n "$SUPA_URL" ]; then
+                    SID_BODY="{\"remaining_seconds\": $PAUSED, \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                    supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$MAC" "$SID_BODY"
+                fi
+                
                 # Restore internet
                 $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
                 json_response "{\"status\": \"resumed\", \"expiry\": $NEW_END}"
@@ -1007,10 +1101,17 @@ handle_api() {
             fi
             ;;
 
-        "action=logout")
+        "action=logout"*)
             $FIREWALL_SCRIPT deny "$MAC"
             # Remove user session from database
-            query_db "UPDATE users SET session_end=0 WHERE mac='$MAC'"
+            query_db "UPDATE users SET session_end=0, paused_time=0 WHERE mac='$MAC'"
+            
+            # Sync to Supabase
+            if [ -n "$SUPA_URL" ]; then
+                SID_BODY="{\"remaining_seconds\": 0, \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$MAC" "$SID_BODY"
+            fi
+            
             json_response "{\"status\": \"success\"}"
             ;;
             
@@ -1169,6 +1270,26 @@ var interval;
 var timerInterval;
 var timeLeft = 0;
 
+// Persistent Session ID (1 year)
+function getSessionId() {
+    var sid = localStorage.getItem('pisowifi_sid');
+    var expiry = localStorage.getItem('pisowifi_sid_expiry');
+    var now = new Date().getTime();
+    
+    if (!sid || !expiry || now > parseInt(expiry)) {
+        // Generate new SID
+        sid = 'SID-' + Math.random().toString(36).substr(2, 9) + '-' + now;
+        var oneYear = 365 * 24 * 60 * 60 * 1000;
+        localStorage.setItem('pisowifi_sid', sid);
+        localStorage.setItem('pisowifi_sid_expiry', (now + oneYear).toString());
+    }
+    return sid;
+}
+
+function getSidParam() {
+    return "&sid=" + encodeURIComponent(getSessionId());
+}
+
 function openRates() {
     document.getElementById("rates-modal").style.display = "block";
     loadRates();
@@ -1179,7 +1300,7 @@ function closeRates() {
 }
 
 function loadRates() {
-    fetch(apiUrl + "?action=rates")
+    fetch(apiUrl + "?action=rates" + getSidParam())
     .then(r => r.json())
     .then(d => {
         var el = document.getElementById("rates-body");
@@ -1267,7 +1388,7 @@ function checkInternet() {
             el.innerText = "Internet: ONLINE ✅";
             el.style.color = "green";
         }
-        fetch(apiUrl + "?action=log_internet&status=ONLINE&mac=" + encodeURIComponent(document.getElementById("client-mac") ? document.getElementById("client-mac").innerText : "UNKNOWN"));
+        fetch(apiUrl + "?action=log_internet&status=ONLINE&mac=" + encodeURIComponent(document.getElementById("client-mac") ? document.getElementById("client-mac").innerText : "UNKNOWN") + getSidParam());
     };
     
     img.onerror = function() {
@@ -1276,12 +1397,12 @@ function checkInternet() {
             el.innerText = "Internet: OFFLINE ❌ (Check Connection)";
             el.style.color = "red";
         }
-        fetch(apiUrl + "?action=log_internet&status=OFFLINE&mac=" + encodeURIComponent(document.getElementById("client-mac") ? document.getElementById("client-mac").innerText : "UNKNOWN"));
+        fetch(apiUrl + "?action=log_internet&status=OFFLINE&mac=" + encodeURIComponent(document.getElementById("client-mac") ? document.getElementById("client-mac").innerText : "UNKNOWN") + getSidParam());
     };
 }
 
 function checkStatus() {
-    fetch(apiUrl + "?action=status")
+    fetch(apiUrl + "?action=status" + getSidParam())
     .then(r => {
         if (!r.ok) throw new Error("HTTP " + r.status);
         return r.json();
@@ -1335,7 +1456,7 @@ function checkStatus() {
 
 function pauseTime() {
     if(!confirm("Pause Internet? You can resume later.")) return;
-    fetch(apiUrl + "?action=pause")
+    fetch(apiUrl + "?action=pause" + getSidParam())
     .then(r => r.json())
     .then(data => {
         if(data.status === "paused") {
@@ -1349,7 +1470,7 @@ function pauseTime() {
 }
 
 function resumeTime() {
-    fetch(apiUrl + "?action=resume")
+    fetch(apiUrl + "?action=resume" + getSidParam())
     .then(r => r.json())
     .then(data => {
         if(data.status === "resumed") {
@@ -1362,7 +1483,7 @@ function resumeTime() {
 }
 
 function startCoin() {
-    fetch(apiUrl + "?action=start_coin")
+    fetch(apiUrl + "?action=start_coin" + getSidParam())
     .then(r => r.json())
     .then(data => {
         document.getElementById("coin-modal").style.display = "block";
@@ -1372,7 +1493,7 @@ function startCoin() {
         
         if(interval) clearInterval(interval);
         interval = setInterval(() => {
-            fetch(apiUrl + "?action=check_coin")
+            fetch(apiUrl + "?action=check_coin" + getSidParam())
             .then(r => r.json())
             .then(d => {
                 document.getElementById("coin-count").innerText = d.count;
@@ -1393,7 +1514,7 @@ function connect() {
     stopAudio();
     playAudio('connect');
     
-    fetch(apiUrl + "?action=connect")
+    fetch(apiUrl + "?action=connect" + getSidParam())
     .then(r => r.json())
     .then(data => {
         closeModal();
@@ -1415,7 +1536,7 @@ function connect() {
 }
 
 function logout() {
-    fetch(apiUrl + "?action=logout")
+    fetch(apiUrl + "?action=logout" + getSidParam())
     .then(r => r.json())
     .then(() => checkStatus())
     .catch(err => {
@@ -1503,9 +1624,9 @@ log_license() {
 
 # --- RAW UPLOAD HANDLER (Bypass generic POST processing for speed/RAM) ---
 # Check if query string contains upload_raw action
-if [ "$REQUEST_METHOD" = "POST" ] && echo "$QUERY_STRING" | grep -q "action=upload_raw"; then
+if [ "$REQUEST_METHOD" = "POST" ] && echo "$QUERY_STRING" | $GREP -q "action=upload_raw"; then
     # Extract filename safely
-    FILENAME=$(echo "$QUERY_STRING" | grep -o "filename=[^&]*" | cut -d= -f2)
+    FILENAME=$(echo "$QUERY_STRING" | $GREP -o "filename=[^&]*" | $CUT -d= -f2)
     
     # Security Validation: Only allow specific files
     if [ "$FILENAME" = "bg.jpg" ] || [ "$FILENAME" = "insert.mp3" ] || [ "$FILENAME" = "connected.mp3" ]; then
@@ -1537,13 +1658,15 @@ if [ "$REQUEST_METHOD" = "POST" ] && echo "$QUERY_STRING" | grep -q "action=uplo
 fi
 
 # Session Helper
-SESSION_COOKIE=$(echo "$HTTP_COOKIE" | grep -o "session=[^;]*" | cut -d= -f2)
-ADMIN_PASS=$(uci get pisowifi.settings.admin_password 2>/dev/null || echo "admin")
+SESSION_COOKIE=$(echo "$HTTP_COOKIE" | $GREP -o "session=[^;]*" | $CUT -d= -f2)
+ADMIN_PASS=$($UCI get pisowifi.settings.admin_password 2>/dev/null || echo "admin")
 DB_FILE="/etc/pisowifi/pisowifi.db"
 
 # Initialize SQLite Database Tables
 [ -d /etc/pisowifi ] || mkdir -p /etc/pisowifi
-sqlite3 "$DB_FILE" "CREATE TABLE IF NOT EXISTS license (id INTEGER PRIMARY KEY, status TEXT, license_key TEXT, expires_at TEXT, vendor_uuid TEXT, hardware_id TEXT, valid INTEGER, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);" 2>/dev/null
+if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$DB_FILE" "CREATE TABLE IF NOT EXISTS license (id INTEGER PRIMARY KEY, status TEXT, license_key TEXT, expires_at TEXT, vendor_uuid TEXT, hardware_id TEXT, valid INTEGER, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);" 2>/dev/null
+fi
 
 # Simple Login Check
 check_auth() {
@@ -1801,7 +1924,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              fi
 
              # First, check by hardware_id
-             supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,license_key&hardware_id=eq.$HARDWARE_ID&limit=1"
+             supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key&hardware_id=eq.$HARDWARE_ID&limit=1"
              RESP="$SUPA_BODY"
              LAST_CODE="$SUPA_HTTP_CODE"
              log_license "Check HW: $HARDWARE_ID code=$LAST_CODE"
@@ -1836,7 +1959,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              if [ "$ACTION" = "activate_license" ] && [ "$FOUND_BY_HW" = "0" ]; then
                  LIC_KEY=$(get_post_var "license_key")
                  if [ -n "$LIC_KEY" ]; then
-                     supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
+                     supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
                      RESP="$SUPA_BODY"
                      LAST_CODE="$SUPA_HTTP_CODE"
                      if [ "$LAST_CODE" = "200" ] && echo "$RESP" | $GREP -q '"id"'; then
@@ -1847,7 +1970,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                              PATCH_BODY=$(printf '{"hardware_id":"%s","activated_at":"%s","status":"active"}' "$HARDWARE_ID" "$($DATE -Iseconds 2>/dev/null || $DATE +%Y-%m-%dT%H:%M:%SZ)")
                              supa_patch "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?license_key=ilike.$LIC_KEY" "$PATCH_BODY"
                              # Refresh data
-                             supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
+                             supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
                              RESP="$SUPA_BODY"
                              FOUND_BY_HW=1
                          else
@@ -1867,13 +1990,14 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  # Extract data and save to UCI
                  L_STATUS=$(echo "$RESP" | json_first "status")
                  L_EXPIRES=$(echo "$RESP" | json_first "expires_at")
-                 L_VENDOR=$(echo "$RESP" | json_first "vendor_uuid")
+                 L_VENDOR=$(echo "$RESP" | json_first "vendor_id")
+                 [ -z "$L_VENDOR" ] || [ "$L_VENDOR" = "null" ] && L_VENDOR=$(echo "$RESP" | json_first "vendor_uuid")
                  L_KEY=$(echo "$RESP" | json_first "license_key")
                  
                  "$UCI" set pisowifi.license=license
                  "$UCI" set pisowifi.license.status="$L_STATUS"
                  "$UCI" set pisowifi.license.expires_at="$L_EXPIRES"
-                 "$UCI" set pisowifi.license.vendor_uuid="$L_VENDOR"
+                 "$UCI" set pisowifi.license.vendor_id="$L_VENDOR"
                  "$UCI" set pisowifi.license.license_key="$L_KEY"
                  "$UCI" set pisowifi.license.hardware_id="$HARDWARE_ID"
                  "$UCI" set pisowifi.license.valid=1
@@ -1931,6 +2055,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              "$UCI" set pisowifi.license.valid='0'
              "$UCI" set pisowifi.license.license_key=''
              "$UCI" set pisowifi.license.vendor_uuid=''
+             "$UCI" set pisowifi.license.vendor_id=''
              "$UCI" set pisowifi.license.expires_at=''
              "$UCI" set pisowifi.license.hardware_id=''
              "$UCI" commit pisowifi
@@ -2211,9 +2336,10 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  $GREP -a -o "filedata=[^&]*" "$POST_FILE" | $CUT -d= -f2- | $SED 's/%2B/+/g; s/%2F/\//g; s/%3D/=/g' | base64 -d > "/www/$FILENAME"
                  
                  echo "Status: 302 Found"
-                 echo "Location: /cgi-bin/admin?tab=portal&msg=upload_success"
-             else
-                 echo "Status: 400 Bad Request"
+                echo "Location: /cgi-bin/admin?tab=portal&msg=upload_success"
+                echo ""
+            else
+                echo "Status: 400 Bad Request"
                  echo "Content-type: text/plain"
                  echo ""
                  echo "Invalid filename"
@@ -2221,6 +2347,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              exit 0
         fi
     fi
+fi
 
 
 # Check Auth for View
@@ -2256,7 +2383,9 @@ if [ "$LIC_VALID" != "1" ]; then
             "$UCI" set pisowifi.license.status=$(echo "$SQL_LIC" | $CUT -d'|' -f2)
             "$UCI" set pisowifi.license.license_key=$(echo "$SQL_LIC" | $CUT -d'|' -f3)
             "$UCI" set pisowifi.license.expires_at=$(echo "$SQL_LIC" | $CUT -d'|' -f4)
-            "$UCI" set pisowifi.license.vendor_uuid=$(echo "$SQL_LIC" | $CUT -d'|' -f5)
+            V_SQL=$(echo "$SQL_LIC" | $CUT -d'|' -f5)
+            "$UCI" set pisowifi.license.vendor_id="$V_SQL"
+            "$UCI" set pisowifi.license.vendor_uuid="$V_SQL"
             "$UCI" set pisowifi.license.hardware_id=$(echo "$SQL_LIC" | $CUT -d'|' -f6)
             "$UCI" commit pisowifi
         fi
@@ -2275,13 +2404,8 @@ echo "Status: 200 OK"
 echo "Content-type: text/html; charset=utf-8"
 echo ""
 
-# Use echo for HTML header to avoid nested heredoc issues
-echo "<!DOCTYPE html>"
-echo "<html>"
-echo "<head>"
-echo "<title>NEXI-FI Admin Dashboard</title>"
-echo "<meta charset='UTF-8'>"
-echo "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+# HTML Start
+echo "<!DOCTYPE html><html><head><title>NEXI-FI Admin Dashboard</title><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
 echo "<style>"
 echo "  :root { --primary: #2563eb; --secondary: #64748b; --success: #22c55e; --danger: #ef4444; --bg: #f1f5f9; --sidebar-bg: #1e293b; --sidebar-text: #e2e8f0; }"
 echo "  body { font-family: 'Inter', sans-serif; background: var(--bg); color: #1e293b; margin: 0; padding: 0; display: flex; min-height: 100vh; }"
@@ -2309,25 +2433,9 @@ echo "  .btn-danger { background: var(--danger); color: white; }"
 echo "  .chart-container { height: 200px; width: 100%; margin-top: 10px; position: relative; }"
 echo "  canvas { width: 100% !important; height: 100% !important; }"
 echo "  @media (max-width: 768px) { body { flex-direction: column; } .sidebar { width: 100%; padding: 10px; box-sizing: border-box; } .main-content { padding: 15px; } }"
-echo "</style>"
-echo "</head>"
-echo "<body>"
+echo "</style></head><body>"
 
-# Handle API Actions (for Dashboard Charts/Stats)
-if [ "$QUERY_STRING" = "action=get_traffic" ]; then
-    check_auth || exit 0
-    echo "Status: 200 OK"
-    echo "Content-type: application/json"
-    echo ""
-    # Get RX/TX bytes for WAN interface (usually eth0 or eth1, we'll try to find it)
-    WAN_IF=$($UCI get network.wan.device 2>/dev/null || $UCI get network.wan.ifname 2>/dev/null || echo "eth0")
-    RX=$($CAT /sys/class/net/$WAN_IF/statistics/rx_bytes 2>/dev/null || echo 0)
-    TX=$($CAT /sys/class/net/$WAN_IF/statistics/tx_bytes 2>/dev/null || echo 0)
-    echo "{\"rx\": $RX, \"tx\": $TX, \"time\": $($DATE +%s)}"
-    exit 0
-fi
-
-# Sidebar
+# Render Sidebar
 echo "<div class='sidebar'>"
 echo "  <h2>NEXI-FI ADMIN</h2>"
 echo "  <nav>"
@@ -2347,8 +2455,7 @@ echo "    <form method='POST'><input type='hidden' name='action' value='logout'>
 echo "  </div>"
 echo "</div>"
 
-    echo "<div class='main-content'>"
-    echo "<div class='container'>"
+echo "<div class='main-content'><div class='container'>"
 
     if [ "$TAB" = "dashboard" ]; then
         # Dashboard Content
@@ -3036,7 +3143,9 @@ echo "</div>"
 
         LIC_ENABLED=$("$UCI" get pisowifi.license.enabled 2>/dev/null || echo 0)
         LIC_VALID=$("$UCI" get pisowifi.license.valid 2>/dev/null || echo 0)
-        LIC_VENDOR=$("$UCI" get pisowifi.license.vendor_id 2>/dev/null || echo "")
+        LIC_VENDOR=$("$UCI" get pisowifi.license.vendor_id 2>/dev/null)
+        [ -z "$LIC_VENDOR" ] || [ "$LIC_VENDOR" = "null" ] && LIC_VENDOR=$("$UCI" get pisowifi.license.vendor_uuid 2>/dev/null)
+        [ -z "$LIC_VENDOR" ] && LIC_VENDOR=""
         LIC_VENDOR_NAME=$("$UCI" get pisowifi.license.vendor_name 2>/dev/null || echo "")
         LIC_KEY=$("$UCI" get pisowifi.license.license_key 2>/dev/null || echo "")
         LIC_EXPIRES=$("$UCI" get pisowifi.license.expires_at 2>/dev/null || echo "")
@@ -3075,6 +3184,12 @@ echo "</div>"
         echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Hardware ID</div>"
         echo "        <div style='font-weight:900; font-size:0.95rem; word-break:break-all; font-family:monospace; color:#0f172a;'>$ROUTER_ID</div>"
         echo "      </div>"
+        if [ -n "$LIC_VENDOR" ] && [ "$LIC_VENDOR" != "null" ]; then
+            echo "      <div style='margin-top:10px;'>"
+            echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Vendor UUID</div>"
+            echo "        <div style='font-weight:700; font-size:0.85rem; word-break:break-all; font-family:monospace; color:#475569;'>$LIC_VENDOR</div>"
+            echo "      </div>"
+        fi
         [ -n "$LIC_EXPIRES" ] && [ "$LIC_VALID" = "0" ] && [ "$LIC_STATUS" = "trial" ] && echo "      <div style='margin-top:10px; font-size:12px; color:#0369a1; font-weight:600;'>Trial expires: $LIC_EXPIRES</div>"
         echo "    </div>"
 
@@ -3098,7 +3213,6 @@ echo "</div>"
 
     echo "</div>" # End Container
     echo "</div>" # End Main Content
-fi
 
 echo "</body></html>"
 EOF
