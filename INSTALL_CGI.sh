@@ -1855,7 +1855,35 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         if command -v jsonfilter >/dev/null 2>&1; then
             jsonfilter -e "@[0].$FIELD" 2>/dev/null
         else
-            $SED -n "s/.*\"$FIELD\":[ ]*\"\\([^\"]*\\)\".*/\\1/p" | $HEAD -1
+            # Direct extraction using grep and sed
+            # For boolean true/false values
+            if echo "$SUPA_BODY" | grep -q "\"$FIELD\":true"; then
+                echo "true"
+                return
+            elif echo "$SUPA_BODY" | grep -q "\"$FIELD\":false"; then
+                echo "false"
+                return
+            fi
+            
+            # For null values
+            if echo "$SUPA_BODY" | grep -q "\"$FIELD\":null"; then
+                echo "null"
+                return
+            fi
+            
+            # For string values (quoted)
+            STRING_VALUE=$(echo "$SUPA_BODY" | sed -n "s/.*\"$FIELD\":[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1)
+            if [ -n "$STRING_VALUE" ]; then
+                echo "$STRING_VALUE"
+                return
+            fi
+            
+            # For numeric values
+            NUMBER_VALUE=$(echo "$SUPA_BODY" | sed -n "s/.*\"$FIELD\":[[:space:]]*\([0-9]*\).*/\1/p" | head -1)
+            if [ -n "$NUMBER_VALUE" ]; then
+                echo "$NUMBER_VALUE"
+                return
+            fi
         fi
     }
 
@@ -2135,6 +2163,10 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                      echo "<!-- DEBUG: HTTP_CODE=$SUPA_HTTP_CODE -->" >&2
                      echo "<!-- DEBUG: RESPONSE_BODY=$SUPA_BODY -->" >&2
                      
+                     # DEBUG: Enhanced JSON parsing test
+                     echo "<!-- DEBUG: Testing JSON parsing... -->" >&2
+                     echo "<!-- DEBUG: Raw SUPA_BODY: $SUPA_BODY -->" >&2
+                     
                      # If anon key fails, try with service role key (if available)
                      if [ "$SUPA_HTTP_CODE" != "200" ] || ! echo "$SUPA_BODY" | $GREP -q '"id"'; then
                          if [ -n "$SUPA_SERVICE_KEY" ]; then
@@ -2146,10 +2178,22 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                      fi
                      
                      if [ "$SUPA_HTTP_CODE" = "200" ] && echo "$SUPA_BODY" | $GREP -q '"id"'; then
+                         # DEBUG: Test individual field parsing
                          C_VENDOR=$(echo "$SUPA_BODY" | json_first "vendor_id")
                          C_ACTIVE=$(echo "$SUPA_BODY" | json_first "is_active")
                          
+                         echo "<!-- DEBUG: Parsed C_VENDOR='$C_VENDOR' -->" >&2
+                         echo "<!-- DEBUG: Parsed C_ACTIVE='$C_ACTIVE' -->" >&2
+                         
+                         # Handle null vendor_id - convert to empty string
+                         if [ "$C_VENDOR" = "null" ] || [ -z "$C_VENDOR" ]; then
+                             C_VENDOR=""
+                             echo "<!-- DEBUG: C_VENDOR was null, converted to empty string -->" >&2
+                         fi
+                         
+                         # Handle boolean true/false properly
                          if [ "$C_ACTIVE" = "true" ]; then
+                             # Accept key regardless of vendor_id value (even if null/empty)
                              "$UCI" set pisowifi.license.centralized_key="$C_KEY"
                              "$UCI" set pisowifi.license.centralized_vendor_id="$C_VENDOR"
                              "$UCI" set pisowifi.license.centralized_status="active"
