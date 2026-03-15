@@ -24,6 +24,16 @@
 		<legend>Hotspot Management</legend>
 		<div class="cbi-section-descr">Manage connected users and hotspot settings.</div>
 		
+		<div class="cbi-section-node">
+			<div class="cbi-value">
+				<label class="cbi-value-title">Device Sync</label>
+				<div class="cbi-value-field">
+					<input type="button" class="cbi-button cbi-button-apply" value="Sync All Devices" onclick="sync_all_devices()" id="sync_all_btn" />
+					<span id="sync_status" class="cbi-value-description" style="margin-left: 10px;"></span>
+				</div>
+			</div>
+		</div>
+		
 		<h3>Active Sessions</h3>
 		<table class="cbi-section-table">
 			<tr class="cbi-section-table-titles">
@@ -88,4 +98,94 @@
 		</table>
 	</fieldset>
 </div>
+
+<script type="text/javascript">
+// Function to check if centralized key is installed
+function check_centralized_key() {
+	return new Promise((resolve, reject) => {
+		// Check license status first
+		XHR.get('<%=luci.dispatcher.build_url("admin", "pisowifi", "api", "license_status")%>', null, function(x, data) {
+			if (data && data.license_data && data.license_data.license_key) {
+				// Check if it's a centralized key format
+				var licenseKey = data.license_data.license_key;
+				var isCentralized = /^CENTRAL-[A-F0-9]+-[A-F0-9]+$/i.test(licenseKey);
+				resolve(isCentralized);
+			} else {
+				resolve(false);
+			}
+		}, function(x, error) {
+			console.error('Error checking license status:', error);
+			resolve(false);
+		});
+	});
+}
+
+// Function to sync all devices
+function sync_all_devices() {
+	var syncBtn = document.getElementById('sync_all_btn');
+	var syncStatus = document.getElementById('sync_status');
+	
+	// Disable button during sync
+	syncBtn.disabled = true;
+	syncBtn.value = 'Syncing...';
+	syncStatus.textContent = 'Checking centralized key...';
+	syncStatus.style.color = '#666';
+	
+	// First check if centralized key is installed
+	check_centralized_key().then(function(hasCentralizedKey) {
+		if (!hasCentralizedKey) {
+			syncStatus.textContent = '❌ Sync requires centralized key installation';
+			syncStatus.style.color = '#d44';
+			syncBtn.disabled = false;
+			syncBtn.value = 'Sync All Devices';
+			return;
+		}
+		
+		syncStatus.textContent = 'Starting device sync...';
+		syncStatus.style.color = '#666';
+		
+		// Perform the sync
+		XHR.post('<%=luci.dispatcher.build_url("admin", "pisowifi", "sync_devices")%>', null, function(x, data) {
+			if (data && data.success) {
+				syncStatus.textContent = '✅ ' + data.message + ' (' + data.devices_synced + ' devices)';
+				syncStatus.style.color = '#4a4';
+				// Reload page after successful sync to show updated data
+				setTimeout(function() {
+					window.location.reload();
+				}, 2000);
+			} else {
+				syncStatus.textContent = '⚠️ Sync completed with errors: ' + (data.error || 'Unknown error');
+				syncStatus.style.color = '#d44';
+			}
+			syncBtn.disabled = false;
+			syncBtn.value = 'Sync All Devices';
+		}, function(x, error) {
+			console.error('Sync error:', error);
+			syncStatus.textContent = '❌ Sync failed: Network error';
+			syncStatus.style.color = '#d44';
+			syncBtn.disabled = false;
+			syncBtn.value = 'Sync All Devices';
+		});
+	});
+}
+
+// Check centralized key status on page load
+document.addEventListener('DOMContentLoaded', function() {
+	check_centralized_key().then(function(hasCentralizedKey) {
+		var syncBtn = document.getElementById('sync_all_btn');
+		var syncStatus = document.getElementById('sync_status');
+		
+		if (!hasCentralizedKey) {
+			syncBtn.disabled = true;
+			syncBtn.title = 'Centralized key required for device sync';
+			syncStatus.textContent = 'Centralized key required';
+			syncStatus.style.color = '#d44';
+		} else {
+			syncStatus.textContent = 'Ready to sync';
+			syncStatus.style.color = '#4a4';
+		}
+	});
+});
+</script>
+
 <%+footer%>
