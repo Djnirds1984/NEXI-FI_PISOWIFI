@@ -1,0 +1,966 @@
+#!/bin/sh
+
+# Simple captive portal detection - only check for specific known detection URLs
+REQUEST_URI="${REQUEST_URI:-}"
+
+# Check for common captive portal detection URLs and return success
+# This prevents devices from thinking they have internet when they don't
+# REMOVED: We WANT them to think they have NO internet so they pop up the portal.
+# If we return 204 or Success here, the device stays connected but shows "Connected / No Internet" or just "Connected"
+# and DOES NOT show the popup.
+# By removing these checks, we fall through to the HTML response, which triggers the popup.
+
+# Auth-aware connectivity checks to avoid needing WiFi reconnect after buying time
+DB_FILE="/etc/pisowifi/pisowifi.db"
+mkdir -p /etc/pisowifi
+chmod 777 /etc/pisowifi
+
+NOW=$(date +%s)
+CLIENT_MAC=$(grep "$REMOTE_ADDR " /proc/net/arp | awk '{print $4}' | tr 'a-z' 'A-Z' | head -1)
+[ -z "$CLIENT_MAC" ] && CLIENT_MAC="UNKNOWN"
+AUTH_OK=0
+if [ "$CLIENT_MAC" != "UNKNOWN" ] && [ -f "$DB_FILE" ]; then
+    RES=$(sqlite3 "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$CLIENT_MAC' LIMIT 1" 2>/dev/null)
+    EXP=$(echo "$RES" | cut -d'|' -f1)
+    PAU=$(echo "$RES" | cut -d'|' -f2)
+    [ -z "$EXP" ] && EXP=0
+    [ -z "$PAU" ] && PAU=0
+    if [ "$PAU" -eq 0 ] && [ "$EXP" -gt "$NOW" ]; then
+        AUTH_OK=1
+    fi
+fi
+
+if echo "$REQUEST_URI" | grep -Eq "(generate_204|connecttest\.txt|ncsi\.txt|hotspot-detect\.html|success\.html)"; then
+    if [ "$AUTH_OK" -eq 1 ]; then
+        if echo "$REQUEST_URI" | grep -q "generate_204"; then
+            echo "Status: 204 No Content"
+            echo "Content-type: text/plain"
+            echo ""
+            exit 0
+        fi
+        echo "Status: 200 OK"
+        echo "Content-type: text/plain"
+        echo ""
+        echo "OK"
+        exit 0
+    fi
+fi
+
+# if echo "$REQUEST_URI" | grep -q "generate_204"; then
+#    # Android/Google connectivity check - return 204 to indicate no internet
+#    echo "Status: 204 No Content"
+#    echo "Content-type: text/plain"
+#    echo ""
+#    exit 0
+# fi
+
+# if echo "$REQUEST_URI" | grep -q "connecttest.txt"; then
+#    # Microsoft Windows connectivity check - return success but no real content
+#    echo "HTTP/1.1 200 OK"
+#    echo "Content-Type: text/plain"
+#    echo ""
+#    echo "Microsoft Connect Test - No Internet"
+#    exit 0
+# fi
+
+# if echo "$REQUEST_URI" | grep -q "ncsi.txt"; then
+#    # Microsoft NCSI check - return success but no real content
+#    echo "HTTP/1.1 200 OK"
+#    echo "Content-Type: text/plain"
+#    echo ""
+#    echo "Microsoft NCSI - No Internet"
+#    exit 0
+# fi
+
+# Set Content-Type for normal requests
+echo "Status: 200 OK"
+echo "Content-type: text/html; charset=utf-8"
+echo ""
+
+# Helper Variables
+DB_FILE="/etc/pisowifi/pisowifi.db"
+COIN_FILE="/tmp/pisowifi_coins"
+SESSION_FILE="/tmp/pisowifi.sessions"
+MINUTES_PER_PESO=$(uci get pisowifi.settings.minutes_per_peso 2>/dev/null || echo 12)
+FIREWALL_SCRIPT="/usr/bin/pisowifi_nftables.sh"
+
+# Log Captive Portal Triggers
+    # Reduced logging: Only log unique triggers occasionally?
+    # Or just rely on the session log.
+    if ! echo "$QUERY_STRING" | grep -q "action="; then
+        # CLIENT_MAC=$(grep "$REMOTE_ADDR " /proc/net/arp | awk '{print $4}' | tr 'a-z' 'A-Z' | head -1)
+        # logger -t pisowifi "CAPTIVE PORTAL: $REMOTE_ADDR -> $REQUEST_URI"
+        true
+    fi
+
+# Ensure database exists
+if [ ! -f "$DB_FILE" ]; then
+    echo "Warning: Database not found at $DB_FILE, creating default database" >&2
+    # Create minimal database schema
+    sqlite3 $DB_FILE "CREATE TABLE IF NOT EXISTS users (mac TEXT PRIMARY KEY, ip TEXT, session_token TEXT, session_end INTEGER, coins_inserted INTEGER DEFAULT 0);"
+    sqlite3 $DB_FILE "CREATE TABLE IF NOT EXISTS coins (id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT, coins INTEGER, timestamp INTEGER DEFAULT (strftime('%s', 'now')));"
+fi
+chmod 666 $DB_FILE
+
+# Database Helper Functions
+query_db() {
+    sqlite3 $DB_FILE "$1" 2>/dev/null || echo ""
+}
+
+get_user_session() {
+    local mac="$1"
+    local result=$(query_db "SELECT session_end FROM users WHERE mac='$mac' AND session_end > $(date +%s) LIMIT 1")
+    echo "$result"
+}
+
+update_user_session() {
+    local mac="$1"
+    local ip="$2"
+    local session_end="$3"
+    local coins="$4"
+    local token="$5"
+    
+    sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, coins_inserted, session_token) VALUES ('$mac', '$ip', $session_end, $coins, '$token');" 2>/dev/null \
+    || sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, coins_inserted) VALUES ('$mac', '$ip', $session_end, $coins);" 2>/dev/null || true
+}
+
+insert_coin_record() {
+    local mac="$1"
+    local coins="$2"
+    query_db "INSERT INTO coins (mac, coins) VALUES ('$mac', $coins)"
+}
+
+# Supabase Helper Functions
+supa_request() {
+    local url="$1" key="$2" path="$3"
+    SUPA_HTTP_CODE="" SUPA_BODY=""
+    local curl_bin="/usr/bin/curl"
+    [ -x "$curl_bin" ] || curl_bin="/bin/curl"
+    [ -x "$curl_bin" ] || return
+    local tmp="/tmp/supa_$$"
+    SUPA_HTTP_CODE=$("$curl_bin" -sS -o "$tmp" -w "%{http_code}" -H "apikey: $key" -H "Authorization: Bearer $key" -H "Accept: application/json" "$url/rest/v1/$path")
+    SUPA_BODY=$(cat "$tmp" 2>/dev/null)
+    rm -f "$tmp"
+}
+
+supa_patch() {
+    local url="$1" key="$2" path="$3" body="$4"
+    SUPA_HTTP_CODE="" SUPA_BODY=""
+    local curl_bin="/usr/bin/curl"
+    [ -x "$curl_bin" ] || curl_bin="/bin/curl"
+    [ -x "$curl_bin" ] || return
+    local tmp="/tmp/supa_$$"
+    SUPA_HTTP_CODE=$("$curl_bin" -sS -o "$tmp" -w "%{http_code}" -X PATCH -H "apikey: $key" -H "Authorization: Bearer $key" -H "Content-Type: application/json" -d "$body" "$url/rest/v1/$path")
+    SUPA_BODY=$(cat "$tmp" 2>/dev/null)
+    rm -f "$tmp"
+}
+
+supa_insert() {
+    local url="$1" key="$2" path="$3" body="$4"
+    SUPA_HTTP_CODE="" SUPA_BODY=""
+    local curl_bin="/usr/bin/curl"
+    [ -x "$curl_bin" ] || curl_bin="/bin/curl"
+    [ -x "$curl_bin" ] || return
+    local tmp="/tmp/supa_$$"
+    SUPA_HTTP_CODE=$("$curl_bin" -sS -o "$tmp" -w "%{http_code}" -X POST -H "apikey: $key" -H "Authorization: Bearer $key" -H "Content-Type: application/json" -d "$body" "$url/rest/v1/$path")
+    SUPA_BODY=$(cat "$tmp" 2>/dev/null)
+    rm -f "$tmp"
+}
+
+get_coin_count() {
+    local mac="$1"
+    # Get coins from global counter (mac 00:00:00:00:00:00)
+    local result=$(query_db "SELECT SUM(coins) FROM coins WHERE mac='00:00:00:00:00:00'")
+    echo "$result" | head -1
+}
+
+transfer_coins_to_user() {
+    local mac="$1"
+    local global_coins=$(get_coin_count)
+    [ -z "$global_coins" ] && global_coins=0
+    
+    if [ "$global_coins" -gt 0 ]; then
+        # Transfer coins from global counter to user
+        query_db "INSERT INTO coins (mac, coins) VALUES ('$mac', $global_coins)"
+        # Clear global counter
+        query_db "DELETE FROM coins WHERE mac='00:00:00:00:00:00'"
+        echo $global_coins
+    else
+        echo 0
+    fi
+}
+
+# Get Query String
+QUERY_STRING="$QUERY_STRING"
+
+# Get Request Method (GET/POST)
+REQUEST_METHOD="$REQUEST_METHOD"
+
+# Helper Functions
+get_client_mac() {
+    # Try to find MAC from ARP table using REMOTE_ADDR
+    local mac=$(grep "$REMOTE_ADDR " /proc/net/arp | awk '{print $4}' | tr 'a-z' 'A-Z' | head -1)
+    if [ -n "$mac" ]; then
+        echo "$mac"
+    else
+        # Fallback: generate a fake MAC based on IP for testing
+        echo "00:00:00:$(echo $REMOTE_ADDR | awk -F. '{printf "%02X:%02X:%02X", $2, $3, $4}')"
+    fi
+}
+
+handle_api() {
+    MAC=$(get_client_mac)
+    
+    SID=$(echo "$QUERY_STRING" | grep -o "sid=[^&]*" | cut -d= -f2 | sed 's/%3A/:/g; s/%2D/-/g; s/%2d/-/g')
+    [ "$SID" = "UNKNOWN" ] && SID=""
+    
+    # Supabase Config for Roaming
+    SUPA_URL=$(uci get pisowifi.supabase.url 2>/dev/null)
+    SUPA_KEY=$(uci get pisowifi.supabase.key 2>/dev/null)
+    SUPA_SERVICE_KEY=$(uci get pisowifi.license.supabase_service_key 2>/dev/null)
+    
+    [ -f /tmp/pisowifi_verbose ] && logger -t pisowifi "API request: $QUERY_STRING from MAC: $MAC IP: $REMOTE_ADDR SID: $SID"
+    
+    # Simple JSON Response Wrapper
+    json_response() {
+        echo "$1"
+        exit 0
+    }
+
+    gen_sid() {
+        if [ -r /proc/sys/kernel/random/uuid ]; then
+            echo "SID-$(cat /proc/sys/kernel/random/uuid | tr -d '\r\n')"
+            return
+        fi
+        if [ -r /dev/urandom ] && command -v hexdump >/dev/null 2>&1; then
+            echo "SID-$(hexdump -n 16 -e '16/1 \"%02x\"' /dev/urandom 2>/dev/null)-$(date +%s)"
+            return
+        fi
+        echo "SID-$(date +%s)-$$"
+    }
+    
+    case "$QUERY_STRING" in
+        "action=status"*)
+            # Check firewall status
+            # Use nft to check if table exists, if not init
+            nft list table inet pisowifi >/dev/null 2>&1 || $FIREWALL_SCRIPT init
+            
+            AUTH="false"
+            TIME_REMAINING=0
+            PAUSED_TIME=0
+            
+            # logger -t pisowifi "Status check - MAC: $MAC, IP: $REMOTE_ADDR"
+            
+            if [ -n "$MAC" ]; then
+                NOW=$(date +%s)
+                TOKEN_FOUND=0
+                if [ -n "$SID" ]; then
+                    TOKEN_ROW=$(sqlite3 $DB_FILE "SELECT mac, session_end, paused_time FROM users WHERE session_token='$SID' LIMIT 1" 2>/dev/null)
+                    TOKEN_MAC=$(echo "$TOKEN_ROW" | cut -d'|' -f1)
+                    TOKEN_EXPIRY=$(echo "$TOKEN_ROW" | cut -d'|' -f2)
+                    TOKEN_PAUSED=$(echo "$TOKEN_ROW" | cut -d'|' -f3)
+                    [ -z "$TOKEN_EXPIRY" ] && TOKEN_EXPIRY=0
+                    [ -z "$TOKEN_PAUSED" ] && TOKEN_PAUSED=0
+                    if [ -n "$TOKEN_MAC" ]; then
+                        TOKEN_FOUND=1
+                        if [ "$TOKEN_MAC" != "$MAC" ]; then
+                            sqlite3 $DB_FILE "DELETE FROM users WHERE mac='$MAC' AND session_token!='$SID';" 2>/dev/null || true
+                            sqlite3 $DB_FILE "UPDATE users SET mac='$MAC', ip='$REMOTE_ADDR' WHERE session_token='$SID';" 2>/dev/null || true
+                        else
+                            sqlite3 $DB_FILE "UPDATE users SET ip='$REMOTE_ADDR' WHERE session_token='$SID';" 2>/dev/null || true
+                        fi
+                        EXPIRY="$TOKEN_EXPIRY"
+                        PAUSED_TIME="$TOKEN_PAUSED"
+                    fi
+                fi
+
+                if [ "$TOKEN_FOUND" = "0" ]; then
+                    RESULT=$(sqlite3 $DB_FILE "SELECT session_end, paused_time FROM users WHERE mac='$MAC' LIMIT 1" 2>/dev/null)
+                    EXPIRY=$(echo "$RESULT" | cut -d'|' -f1)
+                    PAUSED_TIME=$(echo "$RESULT" | cut -d'|' -f2)
+                    [ -z "$EXPIRY" ] && EXPIRY=0
+                    [ -z "$PAUSED_TIME" ] && PAUSED_TIME=0
+                    if [ -n "$SID" ] && { [ "$PAUSED_TIME" -gt 0 ] 2>/dev/null || [ "$EXPIRY" -gt "$NOW" ] 2>/dev/null; }; then
+                        sqlite3 $DB_FILE "UPDATE users SET session_token='$SID' WHERE mac='$MAC' AND (session_token IS NULL OR session_token='');" 2>/dev/null || true
+                    fi
+                fi
+
+                if [ "$PAUSED_TIME" -gt 0 ] 2>/dev/null; then
+                    AUTH="paused"
+                    TIME_REMAINING=$PAUSED_TIME
+                elif [ "$EXPIRY" -gt "$NOW" ] 2>/dev/null; then
+                    AUTH="true"
+                    TIME_REMAINING=$((EXPIRY - NOW))
+                else
+                    if [ -n "$SUPA_URL" ] && [ -n "$SID" ]; then
+                        supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=remaining_seconds,connected_at,is_paused&session_uuid=eq.$SID&limit=1"
+                        if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                            REM_SEC=$(echo "$SUPA_BODY" | grep -o '"remaining_seconds":[0-9]*' | cut -d: -f2)
+                            IS_PAUSED=$(echo "$SUPA_BODY" | grep -o '"is_paused":[^,}]*' | cut -d: -f2)
+                            [ -z "$REM_SEC" ] && REM_SEC=0
+                            if [ "$IS_PAUSED" = "true" ]; then
+                                AUTH="paused"
+                                TIME_REMAINING=$REM_SEC
+                                sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time, session_token) VALUES ('$MAC', '$REMOTE_ADDR', 0, $REM_SEC, '$SID');" 2>/dev/null \
+                                || sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time) VALUES ('$MAC', '$REMOTE_ADDR', 0, $REM_SEC);" 2>/dev/null || true
+                            elif [ "$REM_SEC" -gt 0 ] 2>/dev/null; then
+                                NEW_EXPIRY=$((NOW + REM_SEC))
+                                AUTH="true"
+                                TIME_REMAINING=$REM_SEC
+                                sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time, session_token) VALUES ('$MAC', '$REMOTE_ADDR', $NEW_EXPIRY, 0, '$SID');" 2>/dev/null \
+                                || sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time) VALUES ('$MAC', '$REMOTE_ADDR', $NEW_EXPIRY, 0);" 2>/dev/null || true
+                                $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+            json_response "{\"authenticated\": \"$AUTH\", \"time_remaining\": $TIME_REMAINING, \"mac\": \"$MAC\", \"ip\": \"$REMOTE_ADDR\"}"
+            ;;
+            
+        "action=start_coin")
+            # Clear coins from database for this user
+            query_db "DELETE FROM coins WHERE mac='$MAC'"
+            
+            # REMOVED AUTO-INIT.
+            # We assume firewall is ready. This prevents disconnecting other users.
+            
+            json_response "{\"status\": \"started\"}"
+            ;;
+            
+        "action=check_coin")
+            COUNT=$(get_coin_count "$MAC")
+            [ -z "$COUNT" ] && COUNT=0
+            logger -t pisowifi "Coin check for $MAC: $COUNT coins"
+            MINUTES=$((COUNT * MINUTES_PER_PESO))
+            json_response "{\"count\": $COUNT, \"minutes\": $MINUTES}"
+            ;;
+            
+        "action=connect"*)
+            # Transfer coins from global counter to user
+            COUNT=$(transfer_coins_to_user "$MAC")
+            [ -z "$COUNT" ] && COUNT=0
+            
+            if [ "$COUNT" -gt 0 ]; then
+                # Check for Custom Rate first
+                CUSTOM_MIN=$(query_db "SELECT minutes FROM rates WHERE amount=$COUNT LIMIT 1")
+                
+                if [ -n "$CUSTOM_MIN" ] && [ "$CUSTOM_MIN" -gt 0 ]; then
+                    ADDED_MINUTES=$CUSTOM_MIN
+                    logger -t pisowifi "Using CUSTOM rate for $COUNT Pesos: $ADDED_MINUTES minutes"
+                else
+                    # Fallback to standard rate
+                    MINUTES_PER_PESO=$(uci get pisowifi.settings.minutes_per_peso 2>/dev/null || echo 12)
+                    ADDED_MINUTES=$((COUNT * MINUTES_PER_PESO))
+                    logger -t pisowifi "Using STANDARD rate for $COUNT Pesos: $ADDED_MINUTES minutes"
+                fi
+                
+                NOW=$(date +%s)
+                
+                # Load current expiry from database
+                EXPIRY=$NOW
+                EXISTING=$(get_user_session "$MAC")
+                if [ -n "$EXISTING" ] && [ "$EXISTING" -gt "$NOW" ]; then
+                    EXPIRY=$EXISTING
+                fi
+                
+                NEW_EXPIRY=$((EXPIRY + (ADDED_MINUTES * 60)))
+                
+                # Update user session in database
+                [ -z "$SID" ] && SID="$(gen_sid)"
+                update_user_session "$MAC" "$REMOTE_ADDR" $NEW_EXPIRY $COUNT "$SID"
+                
+                # Sync to Supabase for Roaming
+                if [ -n "$SUPA_URL" ] && [ -n "$SID" ]; then
+                    REM_SEC=$((NEW_EXPIRY - NOW))
+                    # Check if session exists in Supabase
+                    supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=id&session_uuid=eq.$SID&limit=1"
+                    if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                        # Update existing
+                        SID_BODY="{\"mac\": \"$MAC\", \"remaining_seconds\": $REM_SEC, \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?session_uuid=eq.$SID" "$SID_BODY"
+                    else
+                        # Insert new
+                        SID_BODY="{\"mac\": \"$MAC\", \"remaining_seconds\": $REM_SEC, \"session_uuid\": \"$SID\", \"connected_at\": $NOW, \"is_paused\": false}"
+                        supa_insert "$SUPA_URL" "$SUPA_KEY" "sessions" "$SID_BODY"
+                    fi
+                fi
+                
+                # Allow Access
+                $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
+                logger -t pisowifi "User $MAC connected successfully. Time added: $ADDED_MINUTES mins. New Expiry: $NEW_EXPIRY"
+                
+                json_response "{\"status\": \"connected\", \"expiry\": $NEW_EXPIRY, \"sid\": \"$SID\", \"redirect_url\": \"https://www.google.com\"}"
+            else
+                json_response "{\"error\": \"No coins\"}"
+            fi
+            ;;
+            
+        "action=pause"*)
+            TARGET_MAC="$MAC"
+            if [ -n "$SID" ]; then
+                TM=$(sqlite3 $DB_FILE "SELECT mac FROM users WHERE session_token='$SID' LIMIT 1" 2>/dev/null)
+                [ -n "$TM" ] && TARGET_MAC="$TM"
+            fi
+            EXPIRY=$(get_user_session "$TARGET_MAC")
+            NOW=$(date +%s)
+            
+            if [ -n "$EXPIRY" ] && [ "$EXPIRY" -gt "$NOW" ]; then
+                REMAINING=$((EXPIRY - NOW))
+                # Save remaining time, clear session end
+                query_db "UPDATE users SET paused_time=$REMAINING, session_end=0 WHERE mac='$TARGET_MAC'"
+                
+                # Sync to Supabase
+                if [ -n "$SUPA_URL" ]; then
+                    SID_BODY="{\"remaining_seconds\": $REMAINING, \"is_paused\": true, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                    if [ -n "$SID" ]; then
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?session_uuid=eq.$SID" "$SID_BODY"
+                    else
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
+                    fi
+                fi
+                
+                # Cut internet
+                $FIREWALL_SCRIPT deny "$TARGET_MAC"
+                json_response "{\"status\": \"paused\", \"remaining\": $REMAINING}"
+            else
+                json_response "{\"error\": \"No active session to pause\"}"
+            fi
+            ;;
+
+        "action=resume"*)
+            TARGET_MAC="$MAC"
+            if [ -n "$SID" ]; then
+                TM=$(sqlite3 $DB_FILE "SELECT mac FROM users WHERE session_token='$SID' LIMIT 1" 2>/dev/null)
+                [ -n "$TM" ] && TARGET_MAC="$TM"
+            fi
+            PAUSED=$(query_db "SELECT paused_time FROM users WHERE mac='$TARGET_MAC'")
+            [ -z "$PAUSED" ] && PAUSED=0
+            
+            if [ "$PAUSED" -gt 0 ]; then
+                NOW=$(date +%s)
+                NEW_END=$((NOW + PAUSED))
+                # Restore session, clear paused time
+                query_db "UPDATE users SET session_end=$NEW_END, paused_time=0 WHERE mac='$TARGET_MAC'"
+                
+                # Sync to Supabase
+                if [ -n "$SUPA_URL" ]; then
+                    SID_BODY="{\"remaining_seconds\": $PAUSED, \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                    if [ -n "$SID" ]; then
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?session_uuid=eq.$SID" "$SID_BODY"
+                    else
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
+                    fi
+                fi
+                
+                # Restore internet
+                $FIREWALL_SCRIPT allow "$TARGET_MAC" "$REMOTE_ADDR"
+                json_response "{\"status\": \"resumed\", \"expiry\": $NEW_END}"
+            else
+                json_response "{\"error\": \"No paused session found\"}"
+            fi
+            ;;
+
+        "action=logout"*)
+            TARGET_MAC="$MAC"
+            if [ -n "$SID" ]; then
+                TM=$(sqlite3 $DB_FILE "SELECT mac FROM users WHERE session_token='$SID' LIMIT 1" 2>/dev/null)
+                [ -n "$TM" ] && TARGET_MAC="$TM"
+            fi
+            $FIREWALL_SCRIPT deny "$TARGET_MAC"
+            # Remove user session from database
+            query_db "UPDATE users SET session_end=0, paused_time=0 WHERE mac='$TARGET_MAC'"
+            
+            # Sync to Supabase
+            if [ -n "$SUPA_URL" ]; then
+                SID_BODY="{\"remaining_seconds\": 0, \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                if [ -n "$SID" ]; then
+                    supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?session_uuid=eq.$SID" "$SID_BODY"
+                else
+                    supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
+                fi
+            fi
+            
+            json_response "{\"status\": \"success\"}"
+            ;;
+            
+        "action=insert_coin")
+            # Manual coin insertion for testing
+            sqlite3 $DB_FILE "INSERT INTO coins (mac, coins) VALUES ('00:00:00:00:00:00', 1)"
+            COUNT=$(sqlite3 $DB_FILE "SELECT SUM(coins) FROM coins WHERE mac='00:00:00:00:00:00'")
+            logger -t pisowifi "Manual coin inserted. Total: $COUNT"
+            json_response "{\"status\": \"coin_inserted\", \"total\": $COUNT}"
+            ;;
+            
+        "action=log_internet")
+            # Log client internet status
+            STATUS=$(echo "$QUERY_STRING" | grep -o "status=[^&]*" | cut -d= -f2)
+            CLIENT_MAC=$(echo "$QUERY_STRING" | grep -o "mac=[^&]*" | cut -d= -f2 | sed 's/%3A/:/g')
+            
+            # Simple rate limiting: Only log if status changed or every few minutes?
+            # For now, just log it. Use logger so it shows in logread.
+            if [ "$STATUS" = "ONLINE" ]; then
+        # Only log online status if verbose logging is enabled (to save CPU)
+        [ -f /tmp/pisowifi_verbose ] && logger -t pisowifi "INTERNET CHECK: Client $CLIENT_MAC is ONLINE ✅"
+    else
+        # Always log offline status as it is an error condition
+        logger -t pisowifi "INTERNET CHECK: Client $CLIENT_MAC is OFFLINE ❌"
+    fi
+            json_response "{\"status\": \"logged\"}"
+            ;;
+
+        "action=rates")
+            RATES_JSON=$(sqlite3 -separator '|' "$DB_FILE" "SELECT amount, minutes, is_pausable, expiration FROM rates ORDER BY amount ASC;" 2>/dev/null | awk -F'|' 'BEGIN{printf "["} {a=$1+0; m=$2+0; p=($3==""?1:$3)+0; e=($4==""?0:$4)+0; if(NR>1) printf ","; printf "{\"amount\":%d,\"minutes\":%d,\"pausable\":%d,\"expiration\":%d}", a,m,p,e} END{printf "]"}')
+            [ -z "$RATES_JSON" ] && RATES_JSON="[]"
+            json_response "{\"rates\": $RATES_JSON}"
+            ;;
+            
+        "action=test_dns")
+            # Test DNS resolution for debugging
+            MAC=$(get_client_mac)
+            AUTH="false"
+            if [ -n "$MAC" ]; then
+                EXPIRY=$(get_user_session "$MAC")
+                NOW=$(date +%s)
+                if [ -n "$EXPIRY" ] && [ "$EXPIRY" -gt "$NOW" ]; then
+                    AUTH="true"
+                fi
+            fi
+            
+            # Test DNS resolution
+            DNS_TEST=$(nslookup google.com 8.8.8.8 2>/dev/null | grep -c "Address")
+            DNS_LOCAL=$(nslookup google.com 10.0.0.1 2>/dev/null | grep -c "Address")
+            
+            json_response "{\"authenticated\": \"$AUTH\", \"dns_external\": $DNS_TEST, \"dns_local\": $DNS_LOCAL, \"mac\": \"$MAC\"}"
+            ;;
+    esac
+}
+
+# Check if it's an API call
+echo "$QUERY_STRING" | grep -q "action=" && handle_api
+
+# If not API, serve HTML Landing Page
+# Refactored to serve from external file for easier editing
+if [ -f /www/portal.html ]; then
+    cat /www/portal.html
+else
+    # Fallback default portal if file missing
+    cat << 'HTML'
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>PisoWifi Portal</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { font-family: sans-serif; text-align: center; padding: 20px; background: #f4f4f4; background-image: url('/bg.jpg'); background-size: cover; background-position: center; min-height: 100vh; }
+.container { background: rgba(255,255,255,0.95); max-width: 500px; margin: 0 auto; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.3); }
+button { padding: 15px 30px; font-size: 1.2em; color: white; border: none; border-radius: 5px; cursor: pointer; margin: 10px; width: 100%; transition: transform 0.1s; }
+button:active { transform: scale(0.98); }
+.btn-blue { background: #007bff; }
+.btn-green { background: #28a745; }
+.btn-red { background: #dc3545; }
+.modal { display: none; position: fixed; z-index: 1; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); }
+.modal-content { background: #fff; margin: 20% auto; padding: 20px; width: 80%; max-width: 400px; border-radius: 10px; }
+</style>
+</head>
+<body>
+
+<div class="container">
+    <h1>NEXI-FI PISOWIFI</h1>
+    <div id="loading">Loading...</div>
+    
+    <!-- Permanent Device Info -->
+    <div id="device-info" style="background:#e9ecef; padding:10px; margin-bottom:15px; border-radius:5px; font-size:0.9em; text-align:left;">
+        <strong>Device Info:</strong><br>
+        MAC: <span id="info-mac">Loading...</span><br>
+        IP: <span id="info-ip">Loading...</span>
+    </div>
+
+    <div id="login-section" style="display:none;">
+        <p>Insert Coin to Connect</p>
+        <button onclick="playAudio('insert'); startCoin()" class="btn-green">INSERT COIN</button>
+        <button onclick="openRates()" class="btn-blue">RATES</button>
+    </div>
+    
+    <div id="resume-section" style="display:none;">
+        <h2>Session Paused</h2>
+        <p>Time Remaining: <strong id="paused-time"></strong></p>
+        <button onclick="resumeTime()" class="btn-blue">RESUME TIME</button>
+    </div>
+    
+    <div id="connected-section" style="display:none;">
+        <h2>Connected!</h2>
+        <p>MAC: <span id="client-mac"></span></p>
+        <p>Time Remaining: <strong id="time-remaining">Loading...</strong></p>
+        <p id="internet-status" style="font-size: 0.8em; color: gray;">Checking internet...</p>
+        
+        <div style="display:flex; gap:10px; margin-bottom:10px;">
+             <!-- Add Time Button (Green) -->
+             <button onclick="playAudio('insert'); startCoin()" class="btn-green">ADD TIME</button>
+             <!-- Pause Button (Yellow) -->
+             <button onclick="pauseTime()" class="btn-blue" style="background:#f59e0b;">PAUSE</button>
+        </div>
+
+        <button onclick="openRates()" class="btn-blue">RATES</button>
+        
+        <button onclick="logout()" class="btn-red">Logout</button>
+    </div>
+</div>
+
+<div id="coin-modal" class="modal">
+    <div class="modal-content">
+        <h2>Insert Coin</h2>
+        <p>Press WPS Button on Router</p>
+        <div style="font-size: 1.5em; margin: 20px;">
+            <span id="coin-count">0</span> Pesos<br>
+            <span id="coin-time">0</span> Minutes
+        </div>
+        <button id="connect-btn" onclick="playAudio('connect'); connect()" class="btn-blue" style="display:none;">START INTERNET</button>
+        <button onclick="closeModal()" style="background:none; color:red; margin-top:10px;">Cancel</button>
+    </div>
+</div>
+
+<div id="rates-modal" class="modal">
+    <div class="modal-content">
+        <h2>Rates</h2>
+        <div id="rates-body">Loading...</div>
+        <button onclick="closeRates()" style="background:none; color:red; margin-top:10px;">Close</button>
+    </div>
+</div>
+
+<!-- Audio Elements -->
+<audio id="audio-insert" src="/insert.mp3"></audio>
+<audio id="audio-connect" src="/connected.mp3"></audio>
+
+<script>
+var apiUrl = "/cgi-bin/pisowifi";
+var interval;
+var timerInterval;
+var timeLeft = 0;
+
+function getSessionId() {
+    var sid = localStorage.getItem('pisowifi_sid');
+    var expiry = localStorage.getItem('pisowifi_sid_expiry');
+    var now = Date.now();
+    if (!sid || !expiry) return "";
+    if (now > parseInt(expiry)) {
+        localStorage.removeItem('pisowifi_sid');
+        localStorage.removeItem('pisowifi_sid_expiry');
+        return "";
+    }
+    return sid;
+}
+
+function generateSessionId() {
+    return 'SID-' + Math.random().toString(36).substr(2, 9) + '-' + Date.now();
+}
+
+function saveSessionId(sid) {
+    var now = Date.now();
+    var oneYear = 365 * 24 * 60 * 60 * 1000;
+    localStorage.setItem('pisowifi_sid', sid);
+    localStorage.setItem('pisowifi_sid_expiry', (now + oneYear).toString());
+}
+
+function getSidParam() {
+    var sid = getSessionId();
+    return sid ? ("&sid=" + encodeURIComponent(sid)) : "";
+}
+
+function openRates() {
+    document.getElementById("rates-modal").style.display = "block";
+    loadRates();
+}
+
+function closeRates() {
+    document.getElementById("rates-modal").style.display = "none";
+}
+
+function loadRates() {
+    fetch(apiUrl + "?action=rates" + getSidParam())
+    .then(r => r.json())
+    .then(d => {
+        var el = document.getElementById("rates-body");
+        if(!el) return;
+        if(!d || !d.rates || !d.rates.length) { el.innerHTML = "<div>No rates set.</div>"; return; }
+        var html = "<div style='margin-top:10px; text-align:left;'>";
+        d.rates.forEach(function(x){
+            html += "<div style='display:flex; justify-content:space-between; padding:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; margin-bottom:8px;'><strong>₱" + x.amount + "</strong><span>" + x.minutes + " minutes</span></div>";
+        });
+        html += "</div>";
+        el.innerHTML = html;
+    })
+    .catch(() => {
+        var el = document.getElementById("rates-body");
+        if(el) el.innerHTML = "<div>Failed to load rates.</div>";
+    });
+}
+
+function playAudio(type) {
+    try {
+        // Stop any currently playing audio first
+        stopAudio();
+        
+        var audio = document.getElementById("audio-" + type);
+        if(audio) {
+            audio.currentTime = 0; // Reset to start
+            audio.play().catch(e => console.log("Audio play failed", e));
+        }
+    } catch(e) { console.error(e); }
+}
+
+function stopAudio() {
+    try {
+        var sounds = document.querySelectorAll('audio');
+        sounds.forEach(function(sound) {
+            sound.pause();
+            sound.currentTime = 0;
+        });
+    } catch(e) { console.error(e); }
+}
+
+function formatTime(s) {
+    if(s<=0) return "Expired";
+    
+    var d = Math.floor(s/86400); // Days
+    var h = Math.floor((s%86400)/3600); // Hours
+    var m = Math.floor((s%3600)/60); // Minutes
+    var sec = s%60; // Seconds
+    
+    var timeStr = "";
+    if(d > 0) timeStr += d + "d ";
+    if(h > 0) timeStr += h + "h ";
+    if(m > 0) timeStr += m + "m ";
+    timeStr += sec + "s";
+    
+    return timeStr.trim();
+}
+
+function startTimer() {
+    if(timerInterval) clearInterval(timerInterval);
+    
+    timerInterval = setInterval(function() {
+        if(timeLeft > 0) {
+            timeLeft--;
+            document.getElementById("time-remaining").innerText = formatTime(timeLeft);
+            if(document.getElementById("paused-time")) {
+                 // Only update paused time if actively paused? No, paused time is static.
+                 // This timer is for connected state.
+            }
+        } else {
+            clearInterval(timerInterval);
+            checkStatus(); // Refresh status when time expires
+        }
+    }, 1000);
+}
+
+function checkInternet() {
+    var img = new Image();
+    var now = new Date().getTime();
+    img.src = "https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png?t=" + now;
+    
+    img.onload = function() {
+        var el = document.getElementById("internet-status");
+        if(el) {
+            el.innerText = "Internet: ONLINE ✅";
+            el.style.color = "green";
+        }
+        fetch(apiUrl + "?action=log_internet&status=ONLINE&mac=" + encodeURIComponent(document.getElementById("client-mac") ? document.getElementById("client-mac").innerText : "UNKNOWN") + getSidParam());
+    };
+    
+    img.onerror = function() {
+        var el = document.getElementById("internet-status");
+        if(el) {
+            el.innerText = "Internet: OFFLINE ❌ (Check Connection)";
+            el.style.color = "red";
+        }
+        fetch(apiUrl + "?action=log_internet&status=OFFLINE&mac=" + encodeURIComponent(document.getElementById("client-mac") ? document.getElementById("client-mac").innerText : "UNKNOWN") + getSidParam());
+    };
+}
+
+function checkStatus() {
+    fetch(apiUrl + "?action=status" + getSidParam())
+    .then(r => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+    })
+    .then(data => {
+        if(data.mac) document.getElementById("info-mac").innerText = data.mac;
+        if(data.ip) document.getElementById("info-ip").innerText = data.ip;
+        
+        document.getElementById("loading").style.display = "none";
+        
+        if(data.authenticated === "true") {
+            document.getElementById("login-section").style.display = "none";
+            document.getElementById("resume-section").style.display = "none";
+            document.getElementById("connected-section").style.display = "block";
+            
+            // Update global timeLeft variable
+            timeLeft = parseInt(data.time_remaining);
+            document.getElementById("time-remaining").innerText = formatTime(timeLeft);
+            if(data.mac) document.getElementById("client-mac").innerText = data.mac;
+            
+            // Start the countdown
+            startTimer();
+            
+            checkInternet();
+            setTimeout(checkStatus, 5000); 
+            
+        } else if(data.authenticated === "paused") {
+            document.getElementById("login-section").style.display = "none";
+            document.getElementById("connected-section").style.display = "none";
+            document.getElementById("resume-section").style.display = "block";
+            
+            // Paused time is static
+            document.getElementById("paused-time").innerText = formatTime(data.time_remaining);
+            if(timerInterval) clearInterval(timerInterval); // Stop timer if paused
+            
+            setTimeout(checkStatus, 10000);
+            
+        } else {
+            document.getElementById("login-section").style.display = "block";
+            document.getElementById("resume-section").style.display = "none";
+            document.getElementById("connected-section").style.display = "none";
+            if(timerInterval) clearInterval(timerInterval);
+        }
+    })
+    .catch(err => {
+        console.error("Status check failed:", err);
+        document.getElementById("loading").style.display = "none";
+        document.getElementById("login-section").style.display = "block";
+    });
+}
+
+function pauseTime() {
+    if(!confirm("Pause Internet? You can resume later.")) return;
+    fetch(apiUrl + "?action=pause" + getSidParam())
+    .then(r => r.json())
+    .then(data => {
+        if(data.status === "paused") {
+            alert("Internet Paused. Time saved: " + formatTime(data.remaining));
+            checkStatus();
+        } else {
+            alert("Error: " + (data.error || "Failed to pause"));
+        }
+    })
+    .catch(err => console.error(err));
+}
+
+function resumeTime() {
+    fetch(apiUrl + "?action=resume" + getSidParam())
+    .then(r => r.json())
+    .then(data => {
+        if(data.status === "resumed") {
+            checkStatus();
+        } else {
+            alert("Error: " + (data.error || "Failed to resume"));
+        }
+    })
+    .catch(err => console.error(err));
+}
+
+function startCoin() {
+    fetch(apiUrl + "?action=start_coin" + getSidParam())
+    .then(r => r.json())
+    .then(data => {
+        document.getElementById("coin-modal").style.display = "block";
+        document.getElementById("coin-count").innerText = "0";
+        document.getElementById("coin-time").innerText = "0";
+        document.getElementById("connect-btn").style.display = "none";
+        
+        if(interval) clearInterval(interval);
+        interval = setInterval(() => {
+            fetch(apiUrl + "?action=check_coin" + getSidParam())
+            .then(r => r.json())
+            .then(d => {
+                document.getElementById("coin-count").innerText = d.count;
+                document.getElementById("coin-time").innerText = d.minutes;
+                if(d.count > 0) document.getElementById("connect-btn").style.display = "block";
+            })
+            .catch(err => console.error("Coin check failed:", err));
+        }, 1000);
+    })
+    .catch(err => {
+        console.error("Start coin failed:", err);
+        alert("Failed to start coin session. Please refresh the page.");
+    });
+}
+
+function connect() {
+    // Stop Insert Coin Audio immediately
+    stopAudio();
+    playAudio('connect');
+
+    var existingSid = getSessionId();
+    var candidateSid = existingSid || generateSessionId();
+    var sidParam = "&sid=" + encodeURIComponent(candidateSid);
+
+    fetch(apiUrl + "?action=connect" + sidParam)
+    .then(r => r.json())
+    .then(data => {
+        closeModal();
+        if (data.status === "connected") {
+            if (!existingSid) saveSessionId(data.sid || candidateSid);
+            checkStatus();
+            if (data.redirect_url) {
+                setTimeout(() => {
+                    window.location.href = data.redirect_url;
+                }, 2000);
+            }
+        } else {
+            alert(data.error || "Connection failed");
+        }
+    })
+    .catch(err => {
+        console.error("Connect failed:", err);
+        alert("Failed to connect. Please try again.");
+    });
+}
+
+function logout() {
+    fetch(apiUrl + "?action=logout" + getSidParam())
+    .then(r => r.json())
+    .then(() => checkStatus())
+    .catch(err => {
+        console.error("Logout failed:", err);
+        checkStatus();
+    });
+}
+
+function closeModal() {
+    document.getElementById("coin-modal").style.display = "none";
+    if(interval) clearInterval(interval);
+    stopAudio(); // Stop audio when closing modal
+}
+
+function checkCoinCount() {
+    fetch(apiUrl + "?action=check_coin")
+    .then(r => r.json())
+    .then(data => {
+        document.getElementById("coin-count").innerText = data.count;
+        document.getElementById("coin-time").innerText = data.minutes;
+        if(data.count > 0) {
+            document.getElementById("connect-btn").style.display = "block";
+        }
+    })
+    .catch(err => console.error("Coin check failed:", err));
+}
+
+function testDNS() {
+    fetch(apiUrl + "?action=test_dns")
+    .then(r => r.json())
+    .then(data => {
+        console.log("DNS Test Results:", data);
+    })
+    .catch(err => console.error("DNS test failed:", err));
+}
+
+setTimeout(testDNS, 3000);
+checkStatus();
+</script>
+
+</body>
+</html>
+HTML
+fi

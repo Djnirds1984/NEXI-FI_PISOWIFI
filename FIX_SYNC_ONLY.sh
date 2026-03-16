@@ -1,8 +1,7 @@
 #!/bin/sh
 
 # FIX SYNC FUNCTIONALITY - Single file solution
-APP_VERSION="NEXI-FI V1"
-echo "=== FIXING SYNC FUNCTIONALITY ($APP_VERSION) ==="
+echo "=== FIXING SYNC FUNCTIONALITY ==="
 echo "Fixing centralized key detection for sync..."
 
 # Get current directory

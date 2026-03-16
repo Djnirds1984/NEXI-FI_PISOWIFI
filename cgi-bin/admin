@@ -1,0 +1,2324 @@
+#!/bin/sh
+
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+BB="/bin/busybox"
+[ -x "$BB" ] || BB=$(command -v busybox)
+
+# Define robust command aliases
+if [ -x "$BB" ]; then
+    HEAD="$BB head"
+    CUT="$BB cut"
+    GREP="$BB grep"
+    SED="$BB sed"
+    TR="$BB tr"
+    CAT="$BB cat"
+    DATE="$BB date"
+    LOGGER="$BB logger"
+else
+    HEAD="head"
+    CUT="cut"
+    GREP="grep"
+    SED="sed"
+    TR="tr"
+    CAT="cat"
+    DATE="date"
+    LOGGER="logger"
+fi
+
+UCI="/sbin/uci"
+log_license() {
+    $LOGGER -t pisowifi_license "$@"
+}
+
+sql_escape() {
+    printf "%s" "$1" | $SED "s/'/''/g"
+}
+
+# Enable debugging to log errors to system log
+# set -x
+
+# --- RAW UPLOAD HANDLER (Bypass generic POST processing for speed/RAM) ---
+# Check if query string contains upload_raw action
+if [ "$REQUEST_METHOD" = "POST" ] && echo "$QUERY_STRING" | $GREP -q "action=upload_raw"; then
+    # Extract filename safely
+    FILENAME=$(echo "$QUERY_STRING" | $GREP -o "filename=[^&]*" | $CUT -d= -f2)
+    
+    # Security Validation: Only allow specific files
+    if [ "$FILENAME" = "bg.jpg" ] || [ "$FILENAME" = "insert.mp3" ] || [ "$FILENAME" = "connected.mp3" ]; then
+        
+        # Stream stdin directly to file (Low RAM usage)
+        if [ -n "$CONTENT_LENGTH" ]; then
+            # If head -c is available (BusyBox usually has it)
+            if [ -x "$BB" ]; then
+                "$BB" head -c "$CONTENT_LENGTH" > "/www/$FILENAME" 2>/dev/null || cat > "/www/$FILENAME"
+            else
+                head -c "$CONTENT_LENGTH" > "/www/$FILENAME" 2>/dev/null || cat > "/www/$FILENAME"
+            fi
+        else
+            cat > "/www/$FILENAME"
+        fi
+        
+        # Return success
+        echo "Status: 200 OK"
+        echo "Content-type: application/json"
+        echo ""
+        echo "{\"success\": true}"
+        exit 0
+    else
+        echo "Status: 400 Bad Request"
+        echo ""
+        echo "Invalid filename"
+        exit 0
+    fi
+fi
+
+# Session Helper
+SESSION_COOKIE=$(echo "$HTTP_COOKIE" | $GREP -o "session=[^;]*" | $CUT -d= -f2)
+ADMIN_PASS=$($UCI get pisowifi.settings.admin_password 2>/dev/null || echo "admin")
+DB_FILE="/etc/pisowifi/pisowifi.db"
+
+# Initialize SQLite Database Tables
+[ -d /etc/pisowifi ] || mkdir -p /etc/pisowifi
+if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$DB_FILE" "CREATE TABLE IF NOT EXISTS license (id INTEGER PRIMARY KEY, status TEXT, license_key TEXT, expires_at TEXT, vendor_uuid TEXT, hardware_id TEXT, valid INTEGER, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);" 2>/dev/null
+fi
+
+# Simple Login Check
+check_auth() {
+    if [ "$SESSION_COOKIE" != "logged_in_secret_token" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# --- POST REQUEST HANDLER ---
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    # Use temporary file instead of variable to handle large uploads
+    POST_FILE="/tmp/post_data_$$"
+    
+    if [ -n "$CONTENT_LENGTH" ]; then
+        # Read exactly CONTENT_LENGTH bytes
+        if [ -x "$BB" ]; then
+            "$BB" head -c "$CONTENT_LENGTH" > "$POST_FILE"
+        else
+            head -c "$CONTENT_LENGTH" > "$POST_FILE"
+        fi
+    else
+        cat > "$POST_FILE"
+    fi
+    
+    # Helper to get POST var from file
+    # Uses grep and cut, handles basic URL decoding
+    get_post_var() {
+        # Grep for var name, then decode
+        # Using grep -a (text mode) in case of binary data
+        # We look for $1= then characters that are NOT & (param separator)
+        VAL=$($GREP -a -o "$1=[^&]*" "$POST_FILE" 2>/dev/null | $HEAD -1 | $CUT -d= -f2-)
+        [ -z "$VAL" ] && return
+        
+        # Decode URL encoding:
+        # 1. Replace + with space
+        # 2. Replace %XX with \xXX for printf %b
+        DECODED=$(echo "$VAL" | $SED 's/+/ /g; s/%\([0-9a-fA-F]\{2\}\)/\\x\1/g')
+        # Use printf %b to interpret \xXX as characters
+        printf "%b" "$DECODED"
+    }
+
+    sql_escape() {
+        printf "%s" "$1" | $SED "s/'/''/g"
+    }
+
+    supa_request() {
+        URL="$1"
+        KEY="$2"
+        PATH="$3"
+        SUPA_HTTP_CODE=""
+        SUPA_CURL_EXIT="0"
+        SUPA_CURL_ERR=""
+        SUPA_BODY=""
+        CURL_BIN="/usr/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN="/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN=""
+        if [ -z "$CURL_BIN" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_EXIT="127"
+            SUPA_CURL_ERR="curl_missing"
+            return
+        fi
+        TMP="/tmp/pisowifi_supa_$$"
+        ERR="/tmp/pisowifi_supa_err_$$"
+        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" "$URL/rest/v1/$PATH" 2>"$ERR")
+        SUPA_CURL_EXIT="$?"
+        if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_ERR=$($HEAD -1 "$ERR" 2>/dev/null | $TR -d '\r' | $TR '\n' ' ')
+            [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
+        fi
+        SUPA_BODY=$($CAT "$TMP" 2>/dev/null)
+        $CAT /dev/null > "$TMP" 2>/dev/null
+        rm -f "$TMP" "$ERR" 2>/dev/null || true
+    }
+
+    supa_patch() {
+        URL="$1"
+        KEY="$2"
+        PATH="$3"
+        BODY="$4"
+        SUPA_HTTP_CODE=""
+        SUPA_CURL_EXIT="0"
+        SUPA_CURL_ERR=""
+        SUPA_BODY=""
+        CURL_BIN="/usr/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN="/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN=""
+        if [ -z "$CURL_BIN" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_EXIT="127"
+            SUPA_CURL_ERR="curl_missing"
+            return
+        fi
+        TMP="/tmp/pisowifi_supa_$$"
+        ERR="/tmp/pisowifi_supa_err_$$"
+        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -X PATCH -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" -H "Content-Type: application/json" -H "Prefer: return=representation" --data "$BODY" "$URL/rest/v1/$PATH" 2>"$ERR")
+        SUPA_CURL_EXIT="$?"
+        if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_ERR=$($HEAD -1 "$ERR" 2>/dev/null | $TR -d '\r' | $TR '\n' ' ')
+            [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
+        fi
+        SUPA_BODY=$($CAT "$TMP" 2>/dev/null)
+        $CAT /dev/null > "$TMP" 2>/dev/null
+        rm -f "$TMP" "$ERR" 2>/dev/null || true
+    }
+
+    supa_rpc() {
+        URL="$1"
+        KEY="$2"
+        FN="$3"
+        BODY="$4"
+        SUPA_HTTP_CODE=""
+        SUPA_CURL_EXIT="0"
+        SUPA_CURL_ERR=""
+        SUPA_BODY=""
+        CURL_BIN="/usr/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN="/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN=""
+        if [ -z "$CURL_BIN" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_EXIT="127"
+            SUPA_CURL_ERR="curl_missing"
+            return
+        fi
+        TMP="/tmp/pisowifi_supa_$$"
+        ERR="/tmp/pisowifi_supa_err_$$"
+        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -X POST -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" -H "Content-Type: application/json" --data "$BODY" "$URL/rest/v1/rpc/$FN" 2>"$ERR")
+        SUPA_CURL_EXIT="$?"
+        if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_ERR=$($HEAD -1 "$ERR" 2>/dev/null | $TR -d '\r' | $TR '\n' ' ')
+            [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
+        fi
+        SUPA_BODY=$($CAT "$TMP" 2>/dev/null)
+        $CAT /dev/null > "$TMP" 2>/dev/null
+        rm -f "$TMP" "$ERR" 2>/dev/null || true
+    }
+
+    supa_insert() {
+        URL="$1"
+        KEY="$2"
+        PATH="$3"
+        BODY="$4"
+        SUPA_HTTP_CODE=""
+        SUPA_CURL_EXIT="0"
+        SUPA_CURL_ERR=""
+        SUPA_BODY=""
+        CURL_BIN="/usr/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN="/bin/curl"
+        [ -x "$CURL_BIN" ] || CURL_BIN=""
+        if [ -z "$CURL_BIN" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_EXIT="127"
+            SUPA_CURL_ERR="curl_missing"
+            return
+        fi
+        TMP="/tmp/pisowifi_supa_$$"
+        ERR="/tmp/pisowifi_supa_err_$$"
+        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -X POST -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" -H "Content-Type: application/json" -H "Prefer: return=representation" --data "$BODY" "$URL/rest/v1/$PATH" 2>"$ERR")
+        SUPA_CURL_EXIT="$?"
+        if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
+            SUPA_HTTP_CODE="0"
+            SUPA_CURL_ERR=$($HEAD -1 "$ERR" 2>/dev/null | $TR -d '\r' | $TR '\n' ' ')
+            [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
+        fi
+        SUPA_BODY=$($CAT "$TMP" 2>/dev/null)
+        $CAT /dev/null > "$TMP" 2>/dev/null
+        rm -f "$TMP" "$ERR" 2>/dev/null || true
+    }
+
+    json_first() {
+        FIELD="$1"
+        if command -v jsonfilter >/dev/null 2>&1; then
+            jsonfilter -e "@[0].$FIELD" 2>/dev/null
+        else
+            # Direct extraction using grep and sed
+            # For boolean true/false values
+            if echo "$SUPA_BODY" | $GREP -q "\"$FIELD\":true"; then
+                echo "true"
+                return
+            elif echo "$SUPA_BODY" | $GREP -q "\"$FIELD\":false"; then
+                echo "false"
+                return
+            fi
+            
+            # For null values
+            if echo "$SUPA_BODY" | $GREP -q "\"$FIELD\":null"; then
+                echo "null"
+                return
+            fi
+            
+            # For string values (quoted)
+            STRING_VALUE=$(echo "$SUPA_BODY" | $SED -n "s/.*\"$FIELD\":[[:space:]]*\"\([^\"]*\)\".*/\1/p" | $HEAD -1)
+            if [ -n "$STRING_VALUE" ]; then
+                echo "$STRING_VALUE"
+                return
+            fi
+            
+            # For numeric values
+            NUMBER_VALUE=$(echo "$SUPA_BODY" | $SED -n "s/.*\"$FIELD\":[[:space:]]*\([0-9]*\).*/\1/p" | $HEAD -1)
+            if [ -n "$NUMBER_VALUE" ]; then
+                echo "$NUMBER_VALUE"
+                return
+            fi
+        fi
+    }
+
+    load_supabase_env() {
+        [ -f /etc/pisowifi/supabase.env ] || return 1
+        FILE_URL=$($GREP -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | $CUT -d= -f2- | $TR -d '\r')
+        FILE_KEY=$($GREP -m1 '^SUPABASE_ANON_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | $CUT -d= -f2- | $TR -d '\r')
+        FILE_URL=$(echo "$FILE_URL" | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+        FILE_KEY=$(echo "$FILE_KEY" | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+        [ -z "$FILE_URL" ] && return 1
+        [ -z "$FILE_KEY" ] && return 1
+        "$UCI" set pisowifi.license=license
+        "$UCI" set pisowifi.license.supabase_url="$FILE_URL"
+        "$UCI" set pisowifi.license.supabase_key="$FILE_KEY"
+        "$UCI" commit pisowifi
+        return 0
+    }
+
+    ACTION=$(get_post_var "action")
+    PASS=$(get_post_var "password")
+    
+    # Cleanup trap
+    trap "[ -x \"$BB\" ] && \"$BB\" rm -f \"$POST_FILE\" 2>/dev/null; rm -f \"$POST_FILE\" 2>/dev/null" EXIT
+    
+    if [ -n "$PASS" ]; then
+        if [ "$PASS" = "$ADMIN_PASS" ]; then
+            echo "Set-Cookie: session=logged_in_secret_token; Path=/; Max-Age=3600"
+            echo "Status: 302 Found"
+            echo "Location: /cgi-bin/admin?tab=dashboard"
+            echo ""
+            exit 0
+        else
+            echo "Status: 302 Found"
+            echo "Location: /cgi-bin/admin?error=invalid"
+            echo ""
+            exit 0
+        fi
+    fi
+    
+    if [ "$ACTION" = "logout" ]; then
+        echo "Set-Cookie: session=; Path=/; Max-Age=0"
+        echo "Status: 302 Found"
+        echo "Location: /cgi-bin/admin"
+        echo ""
+        exit 0
+    fi
+    
+    if check_auth; then
+        if [ "$ACTION" = "activate_license" ] || [ "$ACTION" = "license_check" ]; then
+             SUPA_URL=$("$UCI" get pisowifi.license.supabase_url 2>/dev/null)
+             SUPA_KEY=$("$UCI" get pisowifi.license.supabase_key 2>/dev/null)
+             NOW_TS=$($DATE +%s)
+             OPENWRT_TABLE="pisowifi_openwrt"
+
+             # Get Device ID
+             HW_MAC=$($CAT /sys/class/net/br-lan/address 2>/dev/null || $CAT /sys/class/net/eth0/address 2>/dev/null || echo "")
+             HW_MAC=$(printf "%s" "$HW_MAC" | $TR -d ':' | $TR 'a-z' 'A-Z')
+             
+             HW_HEX="$HW_MAC"
+             if command -v md5sum >/dev/null 2>&1 && [ -n "$HW_MAC" ]; then
+                 HW_HEX=$(echo -n "$HW_MAC" | md5sum 2>/dev/null | awk '{print toupper(substr($1,1,16))}')
+             fi
+             HARDWARE_ID="CPU-$HW_HEX"
+
+             if [ -z "$SUPA_URL" ] || [ -z "$SUPA_KEY" ]; then
+                 load_supabase_env >/dev/null 2>&1 || true
+                 SUPA_URL=$("$UCI" get pisowifi.license.supabase_url 2>/dev/null)
+                 SUPA_KEY=$("$UCI" get pisowifi.license.supabase_key 2>/dev/null)
+             fi
+
+             if [ -z "$SUPA_URL" ] || [ -z "$SUPA_KEY" ]; then
+                 echo "Status: 302 Found"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_missing_supabase"
+                 echo ""
+                 exit 0
+             fi
+
+             # First, check by hardware_id
+             supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key&hardware_id=eq.$HARDWARE_ID&limit=1"
+             RESP="$SUPA_BODY"
+             LAST_CODE="$SUPA_HTTP_CODE"
+             log_license "Check HW: $HARDWARE_ID code=$LAST_CODE"
+
+             FOUND_BY_HW=0
+             if [ "$LAST_CODE" = "200" ] && echo "$RESP" | $GREP -q '"id"'; then
+                 FOUND_BY_HW=1
+                 log_license "Found license for HW"
+             fi
+
+             if [ "$FOUND_BY_HW" = "0" ] && [ "$ACTION" = "license_check" ]; then
+                 # No license for this HW, initiate 7-day trial
+                 NOW_SEC=$($DATE +%s)
+                 EXP_SEC=$((NOW_SEC + 604800)) # 7 days
+                 EXP_DATE=$($DATE -u -d "@$EXP_SEC" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || $DATE -u -r "$EXP_SEC" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+                 
+                 # Fallback if date command fails to format
+                 [ -z "$EXP_DATE" ] && EXP_DATE=$(printf "%s" "$EXP_SEC")
+                 
+                 TRIAL_BODY=$(printf '{"hardware_id":"%s","status":"trial","expires_at":"%s"}' "$HARDWARE_ID" "$EXP_DATE")
+                 log_license "Creating trial: $TRIAL_BODY"
+                 supa_insert "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE" "$TRIAL_BODY"
+                 RESP="$SUPA_BODY"
+                 LAST_CODE="$SUPA_HTTP_CODE"
+                 log_license "Trial creation code: $LAST_CODE"
+                 if [ "$LAST_CODE" = "201" ] || [ "$LAST_CODE" = "200" ]; then
+                     FOUND_BY_HW=1
+                 fi
+             fi
+
+             # If activating, and not found by HW, check by License Key
+             if [ "$ACTION" = "activate_license" ] && [ "$FOUND_BY_HW" = "0" ]; then
+                 LIC_KEY=$(get_post_var "license_key")
+                 if [ -n "$LIC_KEY" ]; then
+                     supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
+                     RESP="$SUPA_BODY"
+                     LAST_CODE="$SUPA_HTTP_CODE"
+                     if [ "$LAST_CODE" = "200" ] && echo "$RESP" | $GREP -q '"id"'; then
+                         # Found license key, check if already bound
+                         BOUND_HW=$(echo "$RESP" | json_first "hardware_id")
+                         if [ -z "$BOUND_HW" ] || [ "$BOUND_HW" = "null" ]; then
+                             # Bind it
+                             PATCH_BODY=$(printf '{"hardware_id":"%s","activated_at":"%s","status":"active"}' "$HARDWARE_ID" "$($DATE -Iseconds 2>/dev/null || $DATE +%Y-%m-%dT%H:%M:%SZ)")
+                             supa_patch "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?license_key=ilike.$LIC_KEY" "$PATCH_BODY"
+                             # Refresh data
+                             supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
+                             RESP="$SUPA_BODY"
+                             FOUND_BY_HW=1
+                         else
+                             if [ "$BOUND_HW" != "$HARDWARE_ID" ]; then
+                                 echo "Status: 302 Found"
+                                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_hw_mismatch"
+                                 echo ""
+                                 exit 0
+                             fi
+                             FOUND_BY_HW=1
+                         fi
+                     fi
+                 fi
+             fi
+
+             if [ "$FOUND_BY_HW" = "1" ]; then
+                 # Extract data and save to UCI
+                 L_STATUS=$(echo "$RESP" | json_first "status")
+                 L_EXPIRES=$(echo "$RESP" | json_first "expires_at")
+                 L_VENDOR=$(echo "$RESP" | json_first "vendor_id")
+                 [ -z "$L_VENDOR" ] || [ "$L_VENDOR" = "null" ] && L_VENDOR=$(echo "$RESP" | json_first "vendor_uuid")
+                 L_KEY=$(echo "$RESP" | json_first "license_key")
+                 
+                 "$UCI" set pisowifi.license=license
+                 "$UCI" set pisowifi.license.status="$L_STATUS"
+                 "$UCI" set pisowifi.license.expires_at="$L_EXPIRES"
+                 "$UCI" set pisowifi.license.vendor_id="$L_VENDOR"
+                 "$UCI" set pisowifi.license.license_key="$L_KEY"
+                 "$UCI" set pisowifi.license.hardware_id="$HARDWARE_ID"
+                 "$UCI" set pisowifi.license.valid=1
+                 [ "$L_STATUS" = "expired" ] && "$UCI" set pisowifi.license.valid=0
+                 "$UCI" commit pisowifi
+
+                 # Save to SQLite for persistence
+                 L_VALID_INT=1
+                 [ "$L_STATUS" = "expired" ] && L_VALID_INT=0
+                 sqlite3 "$DB_FILE" "DELETE FROM license; INSERT INTO license (status, license_key, expires_at, vendor_uuid, hardware_id, valid) VALUES ('$L_STATUS', '$L_KEY', '$L_EXPIRES', '$L_VENDOR', '$HARDWARE_ID', $L_VALID_INT);" 2>/dev/null
+
+                 # Update/Insert into vendors table in Supabase
+                 if [ "$L_STATUS" = "active" ]; then
+                     MACHINE_NAME=$(cat /tmp/sysinfo/model 2>/dev/null || echo "PisoWifi-Machine")
+                     
+                     # Ensure valid UUID for vendor_id, or send null
+                     V_ID_JSON="null"
+                     if [ -n "$L_VENDOR" ] && [ "$L_VENDOR" != "null" ]; then
+                         V_ID_JSON=$(printf "\"%s\"" "$L_VENDOR")
+                     fi
+
+                     VENDOR_BODY=$(printf '{"hardware_id":"%s","machine_name":"%s","vendor_id":%s,"license_key":"%s","is_licensed":true,"activated_at":"%s","status":"online"}' "$HARDWARE_ID" "$MACHINE_NAME" "$V_ID_JSON" "$L_KEY" "$($DATE -u +"%Y-%m-%dT%H:%M:%SZ")")
+                     
+                     log_license "Syncing to vendors: $VENDOR_BODY"
+                     
+                     # First check if exists
+                     supa_request "$SUPA_URL" "$SUPA_KEY" "vendors?select=id&hardware_id=eq.$HARDWARE_ID&limit=1"
+                     V_EXIST_RESP="$SUPA_BODY"
+                     V_EXIST_CODE="$SUPA_HTTP_CODE"
+                     
+                     if [ "$V_EXIST_CODE" = "200" ] && echo "$V_EXIST_RESP" | $GREP -q '"id"'; then
+                         log_license "Machine exists in vendors, patching..."
+                         supa_patch "$SUPA_URL" "$SUPA_KEY" "vendors?hardware_id=eq.$HARDWARE_ID" "$VENDOR_BODY"
+                     else
+                         log_license "Machine missing in vendors, inserting..."
+                         supa_insert "$SUPA_URL" "$SUPA_KEY" "vendors" "$VENDOR_BODY"
+                     fi
+                     log_license "Sync result code: $SUPA_HTTP_CODE"
+                 fi
+                 
+                 echo "Status: 302 Found"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_ok"
+                 echo ""
+                 exit 0
+             else
+                 echo "Status: 302 Found"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_not_found"
+                 echo ""
+                 exit 0
+             fi
+
+        elif [ "$ACTION" = "clear_license" ]; then
+             "$UCI" set pisowifi.license=license
+             "$UCI" set pisowifi.license.status='inactive'
+             "$UCI" set pisowifi.license.valid='0'
+             "$UCI" set pisowifi.license.license_key=''
+             "$UCI" set pisowifi.license.vendor_uuid=''
+             "$UCI" set pisowifi.license.vendor_id=''
+             "$UCI" set pisowifi.license.expires_at=''
+             "$UCI" set pisowifi.license.hardware_id=''
+             "$UCI" commit pisowifi
+
+             # Clear SQLite
+             sqlite3 "$DB_FILE" "DELETE FROM license;" 2>/dev/null
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=settings&msg=license_cleared"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "clear_centralized_license" ]; then
+             "$UCI" set pisowifi.license.centralized_key=''
+             "$UCI" set pisowifi.license.centralized_vendor_id=''
+             "$UCI" set pisowifi.license.centralized_status=''
+             "$UCI" commit pisowifi
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_cleared"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "activate_centralized_license" ]; then
+             SUPA_URL=$("$UCI" get pisowifi.license.supabase_url 2>/dev/null)
+             SUPA_KEY=$("$UCI" get pisowifi.license.supabase_key 2>/dev/null)
+             SUPA_SERVICE_KEY=$("$UCI" get pisowifi.license.supabase_service_key 2>/dev/null)
+             
+             # DEBUG LOGGING
+             echo "<!-- DEBUG: SUPA_URL=$SUPA_URL -->" >&2
+             echo "<!-- DEBUG: SUPA_KEY length=${#SUPA_KEY} -->" >&2
+             echo "<!-- DEBUG: SUPA_SERVICE_KEY available: $([ -n "$SUPA_SERVICE_KEY" ] && echo "YES" || echo "NO") -->" >&2
+             
+             HW_MAC=$($CAT /sys/class/net/br-lan/address 2>/dev/null || $CAT /sys/class/net/eth0/address 2>/dev/null || echo "")
+             HW_MAC=$(printf "%s" "$HW_MAC" | $TR -d ':' | $TR 'a-z' 'A-Z')
+             HW_HEX="$HW_MAC"
+             if command -v md5sum >/dev/null 2>&1 && [ -n "$HW_MAC" ]; then
+                 HW_HEX=$(echo -n "$HW_MAC" | md5sum 2>/dev/null | awk '{print toupper(substr($1,1,16))}')
+             fi
+             HARDWARE_ID="CPU-$HW_HEX"
+             
+             C_KEY=$(get_post_var "centralized_key")
+             
+             # DEBUG LOGGING
+             echo "<!-- DEBUG: Received C_KEY=$C_KEY -->" >&2
+             echo "<!-- DEBUG: HARDWARE_ID=$HARDWARE_ID -->" >&2
+             
+             if [ -n "$C_KEY" ]; then
+                 # DEBUG: Test the regex pattern
+                 echo "<!-- DEBUG: Testing regex pattern -->" >&2
+                 if echo "$C_KEY" | $GREP -Eqi "^CENTRAL-[a-fA-F0-9]+-[a-fA-F0-9]+$"; then
+                     echo "<!-- DEBUG: Regex MATCHED -->" >&2
+                     
+                     # DEBUG: Log the database query
+                     echo "<!-- DEBUG: Querying database with key: $C_KEY -->" >&2
+                     echo "<!-- DEBUG: SUPA_URL=$SUPA_URL -->" >&2
+                     echo "<!-- DEBUG: SUPA_KEY exists: $([ -n "$SUPA_KEY" ] && echo "YES" || echo "NO") -->" >&2
+                     
+                     # DEBUG: Show the exact REST API URL being called
+                     FULL_QUERY="centralized_keys?select=id,vendor_id,is_active&key_value=ilike.$C_KEY&limit=1"
+                     echo "<!-- DEBUG: FULL_QUERY=$FULL_QUERY -->" >&2
+                     echo "<!-- DEBUG: ENCODED_QUERY=$(echo "$FULL_QUERY" | sed 's/ /%20/g' | sed 's/:/%3A/g' | sed 's/?/%3F/g') -->" >&2
+                     
+                     supa_request "$SUPA_URL" "$SUPA_KEY" "centralized_keys?select=id,vendor_id,is_active&key_value=ilike.$C_KEY&limit=1"
+                     
+                     # DEBUG: Log the response
+                     echo "<!-- DEBUG: HTTP_CODE=$SUPA_HTTP_CODE -->" >&2
+                     echo "<!-- DEBUG: RESPONSE_BODY=$SUPA_BODY -->" >&2
+                     
+                     # DEBUG: Enhanced JSON parsing test
+                     echo "<!-- DEBUG: Testing JSON parsing... -->" >&2
+                     echo "<!-- DEBUG: Raw SUPA_BODY: $SUPA_BODY -->" >&2
+                     
+                     # If anon key fails, try with service role key (if available)
+                     if [ "$SUPA_HTTP_CODE" != "200" ] || ! echo "$SUPA_BODY" | $GREP -q '"id"'; then
+                         if [ -n "$SUPA_SERVICE_KEY" ]; then
+                             echo "<!-- DEBUG: Trying with service role key -->" >&2
+                             supa_request "$SUPA_URL" "$SUPA_SERVICE_KEY" "centralized_keys?select=id,vendor_id,is_active&key_value=ilike.$C_KEY&limit=1"
+                             echo "<!-- DEBUG: Service role HTTP_CODE=$SUPA_HTTP_CODE -->" >&2
+                             echo "<!-- DEBUG: Service role RESPONSE_BODY=$SUPA_BODY -->" >&2
+                         fi
+                     fi
+                     
+                     if [ "$SUPA_HTTP_CODE" = "200" ] && echo "$SUPA_BODY" | $GREP -q '"id"'; then
+                         # DEBUG: Test individual field parsing
+                         C_VENDOR=$(echo "$SUPA_BODY" | json_first "vendor_id")
+                         C_ACTIVE=$(echo "$SUPA_BODY" | json_first "is_active")
+                         
+                         echo "<!-- DEBUG: Parsed C_VENDOR='$C_VENDOR' -->" >&2
+                         echo "<!-- DEBUG: Parsed C_ACTIVE='$C_ACTIVE' -->" >&2
+                         
+                         # Handle null vendor_id - convert to empty string
+                         if [ "$C_VENDOR" = "null" ] || [ -z "$C_VENDOR" ]; then
+                             C_VENDOR=""
+                             echo "<!-- DEBUG: C_VENDOR was null, converted to empty string -->" >&2
+                         fi
+                         
+                         # Handle boolean true/false properly
+                         if [ "$C_ACTIVE" = "true" ]; then
+                             # Accept key regardless of vendor_id value (even if null/empty)
+                             "$UCI" set pisowifi.license.centralized_key="$C_KEY"
+                             "$UCI" set pisowifi.license.centralized_vendor_id="$C_VENDOR"
+                             "$UCI" set pisowifi.license.centralized_status="active"
+                             "$UCI" commit pisowifi
+                             
+                             echo "Status: 302 Found"
+                             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_ok"
+                             echo ""
+                             exit 0
+                         else
+                             # DEBUG: Log why it failed
+                             echo "<!-- DEBUG: Key found but not active or invalid response -->" >&2
+                             echo "<!-- DEBUG: C_ACTIVE=$C_ACTIVE -->" >&2
+                             echo "Status: 302 Found"
+                             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_failed"
+                             echo ""
+                             exit 0
+                         fi
+                     else
+                         # DEBUG: Log database query failure
+                         echo "<!-- DEBUG: Primary database query failed -->" >&2
+                         echo "<!-- DEBUG: HTTP_CODE=$SUPA_HTTP_CODE -->" >&2
+                         echo "<!-- DEBUG: Checking fallback table... -->" >&2
+                         
+                         # DEBUG: Show fallback query
+                        FALLBACK_QUERY="pisowifi_openwrt?select=id,status,vendor_uuid&license_key=ilike.$C_KEY&limit=1"
+                        echo "<!-- DEBUG: FALLBACK_QUERY=$FALLBACK_QUERY -->" >&2
+                        
+                        # Fallback: check pisowifi_openwrt table just in case they used that for centralized keys
+                       supa_request "$SUPA_URL" "$SUPA_KEY" "pisowifi_openwrt?select=id,status,vendor_uuid&license_key=ilike.$C_KEY&limit=1"
+                       
+                       # DEBUG: Log fallback response
+                       echo "<!-- DEBUG: Fallback HTTP_CODE=$SUPA_HTTP_CODE -->" >&2
+                       echo "<!-- DEBUG: Fallback RESPONSE_BODY=$SUPA_BODY -->" >&2
+                       
+                       # If anon key fails, try with service role key (if available)
+                       if [ "$SUPA_HTTP_CODE" != "200" ] || ! echo "$SUPA_BODY" | $GREP -q '"id"'; then
+                           if [ -n "$SUPA_SERVICE_KEY" ]; then
+                               echo "<!-- DEBUG: Trying fallback with service role key -->" >&2
+                               supa_request "$SUPA_URL" "$SUPA_SERVICE_KEY" "pisowifi_openwrt?select=id,status,vendor_uuid&license_key=ilike.$C_KEY&limit=1"
+                               echo "<!-- DEBUG: Service role fallback HTTP_CODE=$SUPA_HTTP_CODE -->" >&2
+                               echo "<!-- DEBUG: Service role fallback RESPONSE_BODY=$SUPA_BODY -->" >&2
+                           fi
+                       fi
+                       
+                       # DEBUG: Test if we can get ANY records from the tables
+                       echo "<!-- DEBUG: Testing if tables exist... -->" >&2
+                       supa_request "$SUPA_URL" "$SUPA_KEY" "centralized_keys?select=id&limit=1"
+                       echo "<!-- DEBUG: centralized_keys test: HTTP_CODE=$SUPA_HTTP_CODE, BODY=$SUPA_BODY -->" >&2
+                       
+                       # If anon key fails for table test, try service role
+                       if [ "$SUPA_HTTP_CODE" != "200" ] && [ -n "$SUPA_SERVICE_KEY" ]; then
+                           echo "<!-- DEBUG: Testing centralized_keys with service role -->" >&2
+                           supa_request "$SUPA_URL" "$SUPA_SERVICE_KEY" "centralized_keys?select=id&limit=1"
+                           echo "<!-- DEBUG: centralized_keys service role test: HTTP_CODE=$SUPA_HTTP_CODE, BODY=$SUPA_BODY -->" >&2
+                       fi
+                       
+                       supa_request "$SUPA_URL" "$SUPA_KEY" "pisowifi_openwrt?select=id&limit=1"
+                       echo "<!-- DEBUG: pisowifi_openwrt test: HTTP_CODE=$SUPA_HTTP_CODE, BODY=$SUPA_BODY -->" >&2
+                       
+                       # If anon key fails for table test, try service role
+                       if [ "$SUPA_HTTP_CODE" != "200" ] && [ -n "$SUPA_SERVICE_KEY" ]; then
+                           echo "<!-- DEBUG: Testing pisowifi_openwrt with service role -->" >&2
+                           supa_request "$SUPA_URL" "$SUPA_SERVICE_KEY" "pisowifi_openwrt?select=id&limit=1"
+                           echo "<!-- DEBUG: pisowifi_openwrt service role test: HTTP_CODE=$SUPA_HTTP_CODE, BODY=$SUPA_BODY -->" >&2
+                       fi
+                        
+                         if [ "$SUPA_HTTP_CODE" = "200" ] && echo "$SUPA_BODY" | $GREP -q '"id"'; then
+                             C_VENDOR=$(echo "$SUPA_BODY" | json_first "vendor_uuid")
+                             C_STATUS=$(echo "$SUPA_BODY" | json_first "status")
+                             
+                             if [ "$C_STATUS" = "active" ]; then
+                                 "$UCI" set pisowifi.license.centralized_key="$C_KEY"
+                                 "$UCI" set pisowifi.license.centralized_vendor_id="$C_VENDOR"
+                                 "$UCI" set pisowifi.license.centralized_status="active"
+                                 "$UCI" commit pisowifi
+                                 
+                                 echo "Status: 302 Found"
+                                 echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_ok"
+                                 echo ""
+                                 exit 0
+                             fi
+                         fi
+                         
+                         # DEBUG: Log final failure
+                         echo "<!-- DEBUG: Both database queries failed -->" >&2
+                         echo "<!-- DEBUG: Final failure - key not found or connection error -->" >&2
+                         
+                         echo "Status: 302 Found"
+                         echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_failed"
+                         echo ""
+                         exit 0
+                     fi
+                 else
+                     echo "<!-- DEBUG: Regex FAILED for key: $C_KEY -->" >&2
+                     echo "<!-- DEBUG: Expected format: CENTRAL-XXXXXXXX-XXXXXXXX -->" >&2
+                     echo "Status: 302 Found"
+                     echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_format_error"
+                     echo ""
+                     exit 0
+                 fi
+             else
+                 echo "Status: 302 Found"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_invalid_format"
+                 echo ""
+                 exit 0
+             fi
+
+        elif [ "$ACTION" = "add_device" ] || [ "$ACTION" = "save_connected_device" ]; then
+             MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
+             IP_ADDR=$(get_post_var "ip")
+             HOSTNAME=$(get_post_var "hostname")
+             NOTES=$(get_post_var "notes")
+
+             MAC_SQL=$(sql_escape "$MAC")
+             IP_SQL=$(sql_escape "$IP_ADDR")
+             HOST_SQL=$(sql_escape "$HOSTNAME")
+             NOTES_SQL=$(sql_escape "$NOTES")
+
+             sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=device_saved"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "update_device" ]; then
+             MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
+             IP_ADDR=$(get_post_var "ip")
+             HOSTNAME=$(get_post_var "hostname")
+             NOTES=$(get_post_var "notes")
+
+             MAC_SQL=$(sql_escape "$MAC")
+             IP_SQL=$(sql_escape "$IP_ADDR")
+             HOST_SQL=$(sql_escape "$HOSTNAME")
+             NOTES_SQL=$(sql_escape "$NOTES")
+
+             sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=device_saved"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "delete_device" ]; then
+             MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
+             MAC_SQL=$(sql_escape "$MAC")
+             sqlite3 "$DB_FILE" "DELETE FROM devices WHERE mac='$MAC_SQL';" 2>/dev/null
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=device_deleted"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "device_add_time" ]; then
+             MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
+             IP_ADDR=$(get_post_var "ip")
+             ADD_MIN=$(get_post_var "add_minutes")
+
+             case "$ADD_MIN" in
+                 ''|*[!0-9]*) ADD_MIN=0 ;;
+             esac
+
+             if [ "$ADD_MIN" -gt 0 ]; then
+                 NOW_TS=$($DATE +%s)
+                 MAC_SQL=$(sql_escape "$MAC")
+                 IP_SQL=$(sql_escape "$IP_ADDR")
+
+                 USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end FROM users WHERE mac='$MAC_SQL' LIMIT 1;" 2>/dev/null)
+                 CUR_END=$(echo "$USER_ROW" | $CUT -d'|' -f1)
+                 [ -z "$CUR_END" ] && CUR_END=0
+
+                 BASE_TS=$NOW_TS
+                 if [ "$CUR_END" -gt "$NOW_TS" ]; then
+                     BASE_TS=$CUR_END
+                 fi
+
+                 ADD_SEC=$((ADD_MIN * 60))
+                 NEW_END=$((BASE_TS + ADD_SEC))
+
+                 sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO users (mac, ip, session_start, session_end, paused_time) VALUES ('$MAC_SQL', '$IP_SQL', $NOW_TS, $NEW_END, 0); UPDATE users SET ip='$IP_SQL', session_end=$NEW_END, paused_time=0 WHERE mac='$MAC_SQL';" 2>/dev/null
+
+                 /usr/bin/pisowifi_nftables.sh allow "$MAC" "$IP_ADDR" >/dev/null 2>&1 &
+             fi
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=time_added"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "sync_devices" ]; then
+             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+             CENTRALIZED_KEY="$($UCI_BIN -q get pisowifi.license.centralized_key 2>/dev/null)"
+             CENTRAL_STATUS="$($UCI_BIN -q get pisowifi.license.centralized_status 2>/dev/null)"
+             CENTRAL_STATUS_LC="$(echo "$CENTRAL_STATUS" | tr 'A-Z' 'a-z')"
+             if [ -n "$CENTRAL_STATUS_LC" ] && [ "$CENTRAL_STATUS_LC" != "active" ]; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Centralized key is not active. Please activate it first."}'
+                 exit 0
+             fi
+             if [ -z "$CENTRALIZED_KEY" ] || [ "$CENTRALIZED_KEY" = "none" ]; then
+                 if [ -f "/etc/pisowifi/license.json" ]; then
+                     CENTRALIZED_KEY="$(sed -n 's/.*\"license_key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' /etc/pisowifi/license.json | head -n1)"
+                 fi
+             fi
+             if [ -z "$CENTRALIZED_KEY" ] || [ "$CENTRALIZED_KEY" = "none" ]; then
+                 if [ -n "$DB_FILE" ] && [ -f "$DB_FILE" ]; then
+                     CENTRALIZED_KEY="$(sqlite3 "$DB_FILE" "SELECT value FROM settings WHERE key='centralized_key' LIMIT 1;" 2>/dev/null)"
+                     if [ -z "$CENTRALIZED_KEY" ] || [ "$CENTRALIZED_KEY" = "none" ]; then
+                         CENTRALIZED_KEY="$(sqlite3 "$DB_FILE" "SELECT centralized_key FROM settings LIMIT 1;" 2>/dev/null)"
+                     fi
+                 fi
+             fi
+             if ! echo "$CENTRALIZED_KEY" | grep -Eq '^CENTRAL-[a-fA-F0-9]+-[a-fA-F0-9]+$'; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"No active centralized key found. Please activate a centralized key first."}'
+                 exit 0
+             fi
+             
+             # Run sync script
+             if [ -f "/usr/bin/wifi_devices_sync_auto.sh" ]; then
+                 SYNC_RESULT=$(sh /usr/bin/wifi_devices_sync_auto.sh 2>&1)
+                 SYNC_STATUS=$?
+                 
+                 echo "Content-type: application/json"
+                 echo ""
+                 if [ $SYNC_STATUS -eq 0 ]; then
+                     SYNC_SAFE="$(printf '%s' "$SYNC_RESULT" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+                     if [ -n "$SYNC_SAFE" ]; then
+                         echo "{\"status\":\"success\",\"message\":\"Device sync completed: $SYNC_SAFE\"}"
+                     else
+                         echo '{"status":"success","message":"Device sync completed successfully."}'
+                     fi
+                 else
+                     SYNC_SAFE="$(printf '%s' "$SYNC_RESULT" | tr '\r\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+                     echo "{\"status\":\"error\",\"message\":\"Sync failed: $SYNC_SAFE\"}"
+                 fi
+             else
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Sync script not found. Please reinstall device sync functionality."}'
+             fi
+             exit 0
+
+        elif [ "$ACTION" = "sync_get_interval" ]; then
+             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+             MIN="$($UCI_BIN -q get pisowifi.license.auto_sync_minutes 2>/dev/null)"
+             [ -z "$MIN" ] && MIN="30"
+             case "$MIN" in
+                 ''|*[!0-9]*) MIN="30" ;;
+             esac
+             echo "Content-type: application/json"
+             echo ""
+             echo "{\"status\":\"success\",\"minutes\":$MIN}"
+             exit 0
+
+        elif [ "$ACTION" = "sync_set_interval" ]; then
+             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+             MIN="$(get_post_var "minutes")"
+             case "$MIN" in
+                 ''|*[!0-9]*) MIN="" ;;
+             esac
+             if [ -z "$MIN" ]; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Invalid minutes value"}'
+                 exit 0
+             fi
+
+             CRON_EXPR=""
+             if [ "$MIN" = "0" ]; then
+                 CRON_EXPR=""
+             else
+                 case "$MIN" in
+                     15) CRON_EXPR="*/15 * * * *" ;;
+                     30) CRON_EXPR="*/30 * * * *" ;;
+                     60) CRON_EXPR="0 * * * *" ;;
+                     120) CRON_EXPR="0 */2 * * *" ;;
+                     360) CRON_EXPR="0 */6 * * *" ;;
+                     720) CRON_EXPR="0 */12 * * *" ;;
+                     1440) CRON_EXPR="0 0 * * *" ;;
+                     *) CRON_EXPR="" ;;
+                 esac
+             fi
+
+             if [ "$MIN" != "0" ] && [ -z "$CRON_EXPR" ]; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Unsupported interval. Use 0, 15, 30, 60, 120, 360, 720, or 1440."}'
+                 exit 0
+             fi
+
+             $UCI_BIN set pisowifi.license.auto_sync_minutes="$MIN" 2>/dev/null || true
+             $UCI_BIN commit pisowifi 2>/dev/null || true
+
+             CRON_FILE="/etc/crontabs/root"
+             [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
+             TMP_CRON="/tmp/pisowifi_cron_root_$$"
+             if [ -f "$CRON_FILE" ]; then
+                 $CAT "$CRON_FILE" | $GREP -v "pisowifi_auto_sync" > "$TMP_CRON" 2>/dev/null
+             else
+                 $CAT /dev/null > "$TMP_CRON" 2>/dev/null
+             fi
+
+             if [ "$MIN" != "0" ]; then
+                 echo "$CRON_EXPR sh /usr/bin/wifi_devices_sync_auto.sh >/tmp/pisowifi_auto_sync.log 2>&1 # pisowifi_auto_sync" >> "$TMP_CRON"
+             fi
+
+             mv "$TMP_CRON" "$CRON_FILE" 2>/dev/null || true
+             chmod 600 "$CRON_FILE" 2>/dev/null || true
+             [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
+
+             echo "Content-type: application/json"
+             echo ""
+             echo "{\"status\":\"success\",\"minutes\":$MIN}"
+             exit 0
+        elif [ "$ACTION" = "sync_get_interval" ]; then
+             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+             MIN="$($UCI_BIN -q get pisowifi.license.auto_sync_minutes 2>/dev/null)"
+             [ -z "$MIN" ] && MIN="30"
+             case "$MIN" in
+                 ''|*[!0-9]*) MIN="30" ;;
+             esac
+             echo "Content-type: application/json"
+             echo ""
+             echo "{\"status\":\"success\",\"minutes\":$MIN}"
+             exit 0
+
+        elif [ "$ACTION" = "sync_set_interval" ]; then
+             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+             MIN="$(get_post_var "minutes")"
+             case "$MIN" in
+                 ''|*[!0-9]*) MIN="" ;;
+             esac
+             if [ -z "$MIN" ]; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Invalid minutes value"}'
+                 exit 0
+             fi
+
+             CRON_EXPR=""
+             if [ "$MIN" = "0" ]; then
+                 CRON_EXPR=""
+             else
+                 case "$MIN" in
+                     15) CRON_EXPR="*/15 * * * *" ;;
+                     30) CRON_EXPR="*/30 * * * *" ;;
+                     60) CRON_EXPR="0 * * * *" ;;
+                     120) CRON_EXPR="0 */2 * * *" ;;
+                     360) CRON_EXPR="0 */6 * * *" ;;
+                     720) CRON_EXPR="0 */12 * * *" ;;
+                     1440) CRON_EXPR="0 0 * * *" ;;
+                     *) CRON_EXPR="" ;;
+                 esac
+             fi
+
+             if [ "$MIN" != "0" ] && [ -z "$CRON_EXPR" ]; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Unsupported interval. Use 0, 15, 30, 60, 120, 360, 720, or 1440."}'
+                 exit 0
+             fi
+
+             $UCI_BIN set pisowifi.license.auto_sync_minutes="$MIN" 2>/dev/null || true
+             $UCI_BIN commit pisowifi 2>/dev/null || true
+
+             CRON_FILE="/etc/crontabs/root"
+             [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
+             TMP_CRON="/tmp/pisowifi_cron_root_$$"
+             if [ -f "$CRON_FILE" ]; then
+                 $CAT "$CRON_FILE" | $GREP -v "pisowifi_auto_sync" > "$TMP_CRON" 2>/dev/null
+             else
+                 $CAT /dev/null > "$TMP_CRON" 2>/dev/null
+             fi
+
+             if [ "$MIN" != "0" ]; then
+                 echo "$CRON_EXPR sh /usr/bin/wifi_devices_sync_auto.sh >/tmp/pisowifi_auto_sync.log 2>&1 # pisowifi_auto_sync" >> "$TMP_CRON"
+             fi
+
+             mv "$TMP_CRON" "$CRON_FILE" 2>/dev/null || true
+             chmod 600 "$CRON_FILE" 2>/dev/null || true
+             [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
+
+             echo "Content-type: application/json"
+             echo ""
+             echo "{\"status\":\"success\",\"minutes\":$MIN}"
+             exit 0
+        elif [ "$ACTION" = "sync_get_interval" ]; then
+             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+             MIN="$($UCI_BIN -q get pisowifi.license.auto_sync_minutes 2>/dev/null)"
+             [ -z "$MIN" ] && MIN="30"
+             case "$MIN" in
+                 ''|*[!0-9]*) MIN="30" ;;
+             esac
+             echo "Content-type: application/json"
+             echo ""
+             echo "{\"status\":\"success\",\"minutes\":$MIN}"
+             exit 0
+
+        elif [ "$ACTION" = "sync_set_interval" ]; then
+             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+             MIN="$(get_post_var "minutes")"
+             case "$MIN" in
+                 ''|*[!0-9]*) MIN="" ;;
+             esac
+             if [ -z "$MIN" ]; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Invalid minutes value"}'
+                 exit 0
+             fi
+
+             CRON_EXPR=""
+             if [ "$MIN" = "0" ]; then
+                 CRON_EXPR=""
+             else
+                 case "$MIN" in
+                     15) CRON_EXPR="*/15 * * * *" ;;
+                     30) CRON_EXPR="*/30 * * * *" ;;
+                     60) CRON_EXPR="0 * * * *" ;;
+                     120) CRON_EXPR="0 */2 * * *" ;;
+                     360) CRON_EXPR="0 */6 * * *" ;;
+                     720) CRON_EXPR="0 */12 * * *" ;;
+                     1440) CRON_EXPR="0 0 * * *" ;;
+                     *) CRON_EXPR="" ;;
+                 esac
+             fi
+
+             if [ "$MIN" != "0" ] && [ -z "$CRON_EXPR" ]; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Unsupported interval. Use 0, 15, 30, 60, 120, 360, 720, or 1440."}'
+                 exit 0
+             fi
+
+             $UCI_BIN set pisowifi.license.auto_sync_minutes="$MIN" 2>/dev/null || true
+             $UCI_BIN commit pisowifi 2>/dev/null || true
+
+             CRON_FILE="/etc/crontabs/root"
+             [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
+             TMP_CRON="/tmp/pisowifi_cron_root_$$"
+             if [ -f "$CRON_FILE" ]; then
+                 $CAT "$CRON_FILE" | $GREP -v "pisowifi_auto_sync" > "$TMP_CRON" 2>/dev/null
+             else
+                 $CAT /dev/null > "$TMP_CRON" 2>/dev/null
+             fi
+
+             if [ "$MIN" != "0" ]; then
+                 echo "$CRON_EXPR sh /usr/bin/wifi_devices_sync_auto.sh >/tmp/pisowifi_auto_sync.log 2>&1 # pisowifi_auto_sync" >> "$TMP_CRON"
+             fi
+
+             mv "$TMP_CRON" "$CRON_FILE" 2>/dev/null || true
+             chmod 600 "$CRON_FILE" 2>/dev/null || true
+             [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
+
+             echo "Content-type: application/json"
+             echo ""
+             echo "{\"status\":\"success\",\"minutes\":$MIN}"
+             exit 0
+        elif [ "$ACTION" = "update_wifi" ]; then
+             SSID=$(get_post_var "ssid")
+             ENC=$(get_post_var "encryption")
+             KEY=$(get_post_var "key")
+             DISABLED=$(get_post_var "disabled")
+             
+             # Apply to ALL wifi interfaces
+             # Iterate through all sections that are 'wifi-iface'
+             # uci show wireless returns: wireless.default_radio0=wifi-iface ...
+             
+             IFACES=$(uci show wireless | grep "=wifi-iface" | cut -d= -f1)
+             for iface in $IFACES; do
+                 # Check if iface string is valid
+                 if [ -n "$iface" ]; then
+                     uci set $iface.ssid="$SSID" 2>/dev/null
+                     uci set $iface.encryption="$ENC" 2>/dev/null
+                     if [ "$ENC" != "none" ]; then
+                         uci set $iface.key="$KEY" 2>/dev/null
+                     else
+                         uci delete $iface.key 2>/dev/null
+                     fi
+                     uci set $iface.disabled="$DISABLED" 2>/dev/null
+                 fi
+             done
+             
+             uci commit wireless
+             /sbin/wifi reload
+             
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=hotspot&msg=wifi_saved"
+             echo ""
+             exit 0
+             
+        elif [ "$ACTION" = "update_settings" ]; then
+             NEW_PASS=$(get_post_var "new_pass")
+             
+             if [ -n "$NEW_PASS" ]; then
+                 uci set pisowifi.settings.admin_password="$NEW_PASS"
+                 uci commit pisowifi
+             fi
+             
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=settings&msg=saved"
+             echo ""
+             exit 0
+             
+        elif [ "$ACTION" = "update_standard_rate" ]; then
+             RATE=$(get_post_var "rate")
+             uci set pisowifi.settings.minutes_per_peso="$RATE"
+             uci commit pisowifi
+             # Also update in DB for consistency
+             sqlite3 $DB_FILE "UPDATE rates SET minutes=$RATE WHERE amount=1"
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=rates&msg=rate_saved"
+             echo ""
+             exit 0
+             
+        elif [ "$ACTION" = "add_custom_rate" ]; then
+             AMOUNT=$(get_post_var "amount")
+             
+             # Duration Calculation
+             D_VAL=$(get_post_var "d_val")
+             D_UNIT=$(get_post_var "d_unit")
+             [ -z "$D_VAL" ] && D_VAL=0
+             [ -z "$D_UNIT" ] && D_UNIT=1
+             MINUTES=$((D_VAL * D_UNIT))
+             
+             MODE=$(get_post_var "mode") # 1=Pausable, 0=Continuous
+             
+             # Expiration Calculation
+             E_VAL=$(get_post_var "e_val")
+             E_UNIT=$(get_post_var "e_unit")
+             [ -z "$E_VAL" ] && E_VAL=0
+             [ -z "$E_UNIT" ] && E_UNIT=1
+             EXPIRATION=$((E_VAL * E_UNIT))
+             
+             if [ "$MODE" = "0" ]; then
+                 EXPIRATION=0 # Continuous has no separate expiration logic usually
+             fi
+             
+             sqlite3 $DB_FILE "INSERT OR REPLACE INTO rates (amount, minutes, is_pausable, expiration) VALUES ($AMOUNT, $MINUTES, $MODE, $EXPIRATION)"
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=rates&msg=rate_saved"
+             echo ""
+             exit 0
+             
+        elif [ "$ACTION" = "delete_rate" ]; then
+             ID=$(get_post_var "rate_id")
+             sqlite3 $DB_FILE "DELETE FROM rates WHERE id=$ID"
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=rates&msg=rate_deleted"
+             echo ""
+             exit 0
+             
+        elif [ "$ACTION" = "update_qos" ]; then
+             QOS_MODE=$(get_post_var "qos_mode")
+             GLOBAL_DOWN=$(get_post_var "global_down")
+             GLOBAL_UP=$(get_post_var "global_up")
+             USER_DOWN=$(get_post_var "user_down")
+             USER_UP=$(get_post_var "user_up")
+             
+             # Robust fallbacks for empty values
+             [ -z "$QOS_MODE" ] && QOS_MODE="global"
+             [ -z "$GLOBAL_DOWN" ] && GLOBAL_DOWN=0
+             [ -z "$GLOBAL_UP" ] && GLOBAL_UP=0
+             [ -z "$USER_DOWN" ] && USER_DOWN=0
+             [ -z "$USER_UP" ] && USER_UP=0
+             
+             # Log the received values for debugging
+             logger -t pisowifi "ACTION: update_qos | MODE: $QOS_MODE | G_DOWN: $GLOBAL_DOWN | G_UP: $GLOBAL_UP | U_DOWN: $USER_DOWN | U_UP: $USER_UP"
+             
+             # Create the section if it doesn't exist and set values
+             uci set pisowifi.qos=qos
+             uci set pisowifi.qos.mode="$QOS_MODE"
+             uci set pisowifi.qos.global_down="$GLOBAL_DOWN"
+             uci set pisowifi.qos.global_up="$GLOBAL_UP"
+             uci set pisowifi.qos.user_down="$USER_DOWN"
+             uci set pisowifi.qos.user_up="$USER_UP"
+             
+             # Commit explicitly to the file
+             uci commit pisowifi
+             
+             # Re-read to confirm (optional, but good for debug)
+             SAVED_MODE=$(uci get pisowifi.qos.mode 2>/dev/null)
+             logger -t pisowifi "SAVED QoS MODE: $SAVED_MODE"
+             
+             # Apply QoS Settings Immediately
+             /usr/bin/pisowifi_qos.sh reload >/dev/null 2>&1 &
+             /usr/bin/pisowifi_nftables.sh reload_qos >/dev/null 2>&1 &
+             
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=qos&msg=qos_saved"
+             echo ""
+             exit 0
+             
+        elif [ "$ACTION" = "save_portal" ]; then
+             HTML_CONTENT=$(get_post_var "html_content")
+             # Write to file
+             echo "$HTML_CONTENT" > /www/portal.html
+             
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=portal&msg=portal_saved"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "save_theme" ]; then
+             THEME_NAME=$(get_post_var "theme_name")
+             THEME_NAME=$(echo "$THEME_NAME" | $TR ' ' '_' )
+             SLUG=$(echo "$THEME_NAME" | $TR -cd 'A-Za-z0-9_-')
+             [ -z "$SLUG" ] && SLUG=$($DATE +%s)
+             HTML_CONTENT=$(get_post_var "html_content")
+             mkdir -p /www/portal_themes
+             echo "$HTML_CONTENT" > "/www/portal_themes/custom_${SLUG}.html"
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=portal&msg=theme_saved"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "delete_theme" ]; then
+             THEME_ID=$(get_post_var "theme_id")
+             THEME_ID=$(echo "$THEME_ID" | $TR -cd 'A-Za-z0-9_-')
+             case "$THEME_ID" in custom_*) ;; *) THEME_ID="custom_$THEME_ID" ;; esac
+             rm -f "/www/portal_themes/${THEME_ID}.html" 2>/dev/null || true
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=portal&msg=theme_deleted"
+             echo ""
+             exit 0
+             
+        elif [ "$ACTION" = "upload_file" ]; then
+             # Get filename safely
+             FILENAME=$(get_post_var "filename")
+             
+             # For filedata, grep directly from file to avoid variable limits
+             # This is a bit tricky with URL encoding. 
+             # We assume the client sends 'filedata=BASE64...'
+             # Grep the content, strip 'filedata=', then decode
+             
+             # Validate filename
+             if [ "$FILENAME" = "bg.jpg" ] || [ "$FILENAME" = "insert.mp3" ] || [ "$FILENAME" = "connected.mp3" ]; then
+                 # Extract base64 content
+                 # Warning: This sed might still be slow on huge files but better than var
+                 $GREP -a -o "filedata=[^&]*" "$POST_FILE" | $CUT -d= -f2- | $SED 's/%2B/+/g; s/%2F/\//g; s/%3D/=/g' | base64 -d > "/www/$FILENAME"
+                 
+                 echo "Status: 302 Found"
+                echo "Location: /cgi-bin/admin?tab=portal&msg=upload_success"
+                echo ""
+            else
+                echo "Status: 400 Bad Request"
+                 echo "Content-type: text/plain"
+                 echo ""
+                 echo "Invalid filename"
+             fi
+             exit 0
+        fi
+    fi
+fi
+
+
+# Check Auth for View
+if ! check_auth; then
+    echo "Status: 200 OK"
+    echo "Content-type: text/html; charset=utf-8"
+    echo ""
+    echo "<!DOCTYPE html><html><head><title>Admin Login</title>"
+    echo "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+    echo "<style>body{font-family:sans-serif; background:#f1f5f9; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;} .card{background:white; padding:30px; border-radius:12px; box-shadow:0 4px 6px rgba(0,0,0,0.1); width:100%; max-width:400px;} h1{text-align:center; color:#1e293b; margin-bottom:24px;} input{width:100%; padding:12px; margin-bottom:16px; border:1px solid #cbd5e1; border-radius:8px; box-sizing:border-box;} .btn{width:100%; padding:12px; background:#2563eb; color:white; border:none; border-radius:8px; font-weight:700; cursor:pointer;}</style></head><body>"
+    echo "<div class='card'>"
+    echo "<h1>Admin Login</h1>"
+    if echo "$QUERY_STRING" | grep -q "error=invalid"; then echo "<p style='color:red; text-align: center;'>Invalid Password</p>"; fi
+    echo "<form method='POST'><input type='password' name='password' placeholder='Password' required><button class='btn'>Login</button></form>"
+    echo "</div></body></html>"
+    exit 0
+fi
+
+# License Enforcement: Redirect to settings if license is not valid
+TAB=$(echo "$QUERY_STRING" | $GREP -o "tab=[^&]*" | $CUT -d= -f2)
+[ -z "$TAB" ] && TAB="dashboard"
+LIC_VALID=$($UCI get pisowifi.license.valid 2>/dev/null || echo 0)
+
+# SQLite Fallback: If UCI says invalid, check SQLite
+if [ "$LIC_VALID" != "1" ]; then
+    SQL_LIC=$(sqlite3 -separator '|' "$DB_FILE" "SELECT valid, status, license_key, expires_at, vendor_uuid, hardware_id FROM license LIMIT 1;" 2>/dev/null)
+    if [ -n "$SQL_LIC" ]; then
+        LIC_VALID=$(echo "$SQL_LIC" | $CUT -d'|' -f1)
+        # Restore to UCI for faster future access
+        if [ "$LIC_VALID" = "1" ]; then
+            "$UCI" set pisowifi.license=license
+            "$UCI" set pisowifi.license.valid=1
+            "$UCI" set pisowifi.license.status=$(echo "$SQL_LIC" | $CUT -d'|' -f2)
+            "$UCI" set pisowifi.license.license_key=$(echo "$SQL_LIC" | $CUT -d'|' -f3)
+            "$UCI" set pisowifi.license.expires_at=$(echo "$SQL_LIC" | $CUT -d'|' -f4)
+            V_SQL=$(echo "$SQL_LIC" | $CUT -d'|' -f5)
+            "$UCI" set pisowifi.license.vendor_id="$V_SQL"
+            "$UCI" set pisowifi.license.vendor_uuid="$V_SQL"
+            "$UCI" set pisowifi.license.hardware_id=$(echo "$SQL_LIC" | $CUT -d'|' -f6)
+            "$UCI" commit pisowifi
+        fi
+    fi
+fi
+
+if [ "$LIC_VALID" != "1" ] && [ "$TAB" != "settings" ]; then
+    echo "Status: 302 Found"
+    echo "Location: /cgi-bin/admin?tab=settings&msg=license_required"
+    echo ""
+    exit 0
+fi
+
+# Render Page Headers
+echo "Status: 200 OK"
+echo "Content-type: text/html; charset=utf-8"
+echo ""
+
+# HTML Start
+echo "<!DOCTYPE html><html><head><title>NEXI-FI Admin Dashboard</title><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
+echo "<style>"
+echo "  :root { --primary: #2563eb; --secondary: #64748b; --success: #22c55e; --danger: #ef4444; --bg: #f1f5f9; --sidebar-bg: #1e293b; --sidebar-text: #e2e8f0; }"
+echo "  body { font-family: 'Inter', sans-serif; background: var(--bg); color: #1e293b; margin: 0; padding: 0; display: flex; min-height: 100vh; }"
+echo "  .sidebar { width: 250px; background: var(--sidebar-bg); color: var(--sidebar-text); padding: 20px; display: flex; flex-direction: column; flex-shrink: 0; }"
+echo "  .sidebar h2 { color: white; margin-bottom: 30px; font-size: 1.25rem; text-transform: uppercase; letter-spacing: 0.1em; text-align: center; }"
+echo "  .nav-link { display: block; padding: 12px 16px; color: var(--sidebar-text); text-decoration: none; border-radius: 8px; margin-bottom: 8px; transition: all 0.2s; }"
+echo "  .nav-link:hover, .nav-link.active { background: rgba(255,255,255,0.1); color: white; }"
+echo "  .nav-link.active { background: var(--primary); }"
+echo "  .main-content { flex-grow: 1; padding: 30px; overflow-y: auto; }"
+echo "  .container { max-width: 1200px; margin: 0 auto; }"
+echo "  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }"
+echo "  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; margin-bottom: 24px; }"
+echo "  .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }"
+echo "  .card h3 { margin: 0 0 10px 0; font-size: 0.875rem; color: var(--secondary); text-transform: uppercase; letter-spacing: 0.05em; }"
+echo "  .card .value { font-size: 1.5rem; font-weight: 700; color: #0f172a; }"
+echo "  .card .sub { font-size: 0.75rem; color: var(--secondary); margin-top: 4px; }"
+echo "  .progress-bg { background: #e2e8f0; height: 8px; border-radius: 4px; margin-top: 10px; overflow: hidden; }"
+echo "  .progress-fill { background: var(--primary); height: 100%; transition: width 0.3s ease; }"
+echo "  table { width: 100%; border-collapse: collapse; }"
+echo "  th { text-align: left; padding: 12px; border-bottom: 2px solid #f1f5f9; color: var(--secondary); font-size: 0.875rem; }"
+echo "  td { padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 0.875rem; }"
+echo "  .btn { padding: 8px 16px; border-radius: 6px; border: none; font-weight: 600; cursor: pointer; transition: all 0.2s; }"
+echo "  .btn-primary { background: var(--primary); color: white; }"
+echo "  .btn-danger { background: var(--danger); color: white; }"
+echo "  .chart-container { height: 200px; width: 100%; margin-top: 10px; position: relative; }"
+echo "  canvas { width: 100% !important; height: 100% !important; }"
+echo "  @media (max-width: 768px) { body { flex-direction: column; } .sidebar { width: 100%; padding: 10px; box-sizing: border-box; } .main-content { padding: 15px; } }"
+echo "</style></head><body>"
+
+# Render Sidebar
+echo "<div class='sidebar'>"
+echo "  <h2>NEXI-FI ADMIN</h2>"
+echo "  <nav>"
+if [ "$LIC_VALID" = "1" ]; then
+    echo "    <a href='?tab=dashboard' class='nav-link $([ "$TAB" = "dashboard" ] && echo "active")'>Dashboard</a>"
+    echo "    <a href='?tab=rates' class='nav-link $([ "$TAB" = "rates" ] && echo "active")'>Rates Manager</a>"
+    echo "    <a href='?tab=hotspot' class='nav-link $([ "$TAB" = "hotspot" ] && echo "active")'>Hotspot Manager</a>"
+    echo "    <a href='?tab=devices' class='nav-link $([ "$TAB" = "devices" ] && echo "active")'>Device Manager</a>"
+    echo "    <a href='?tab=sales' class='nav-link $([ "$TAB" = "sales" ] && echo "active")'>Sales Report</a>"
+    echo "    <a href='?tab=qos' class='nav-link $([ "$TAB" = "qos" ] && echo "active")'>Bandwidth Manager</a>"
+    echo "    <a href='?tab=portal' class='nav-link $([ "$TAB" = "portal" ] && echo "active")'>Portal Editor</a>"
+fi
+echo "    <a href='?tab=settings' class='nav-link $([ "$TAB" = "settings" ] && echo "active")'>Settings</a>"
+echo "  </nav>"
+echo "  <div style='margin-top: auto; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.1);'>"
+echo "    <form method='POST'><input type='hidden' name='action' value='logout'><button class='btn btn-danger' style='width: 100%'>Logout</button></form>"
+echo "  </div>"
+echo "</div>"
+
+echo "<div class='main-content'><div class='container'>"
+
+    if [ "$TAB" = "dashboard" ]; then
+        # Dashboard Content
+        MODEL=$(cat /tmp/sysinfo/model 2>/dev/null || echo "Generic OpenWrt Router")
+        CORES=$(grep -c ^processor /proc/cpuinfo)
+        MEM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+        MEM_FREE=$(grep MemFree /proc/meminfo | awk '{print $2}')
+        MEM_USED=$((MEM_TOTAL - MEM_FREE))
+        MEM_PCT=$((MEM_USED * 100 / MEM_TOTAL))
+        
+        # Overlay Storage
+        OVERLAY_TOTAL=$(df /overlay | tail -1 | awk '{print $2}')
+        OVERLAY_USED=$(df /overlay | tail -1 | awk '{print $3}')
+        OVERLAY_PCT=$(df /overlay | tail -1 | awk '{print $5}' | tr -d '%')
+        
+        # Users
+        NOW=$($DATE +%s)
+        ACTIVE_USERS=$(sqlite3 $DB_FILE "SELECT COUNT(*) FROM users WHERE session_end > $NOW" 2>/dev/null || echo 0)
+        TOTAL_USERS=$(sqlite3 $DB_FILE "SELECT COUNT(*) FROM users" 2>/dev/null || echo 0)
+        DISCONNECTED_USERS=$((TOTAL_USERS - ACTIVE_USERS))
+        [ $DISCONNECTED_USERS -lt 0 ] && DISCONNECTED_USERS=0
+
+        echo "<div class='header'><h1>Dashboard</h1></div>"
+        
+        # System Stats Grid
+        echo "<div class='grid'>"
+        echo "  <div class='card'><h3>Router Model</h3><div class='value' style='font-size:1.1rem'>$MODEL</div><div class='sub'>$CORES CPU Cores</div></div>"
+        echo "  <div class='card'><h3>RAM Usage</h3><div class='value'>$MEM_PCT%</div><div class='progress-bg'><div class='progress-fill' style='width:$MEM_PCT%'></div></div><div class='sub'>$((MEM_USED/1024))MB / $((MEM_TOTAL/1024))MB</div></div>"
+        echo "  <div class='card'><h3>Storage (Overlay)</h3><div class='value'>$OVERLAY_PCT%</div><div class='progress-bg'><div class='progress-fill' style='width:$OVERLAY_PCT%'></div></div><div class='sub'>$((OVERLAY_USED/1024))MB Used</div></div>"
+        echo "  <div class='card'><h3>Users</h3><div class='value'>$ACTIVE_USERS / $TOTAL_USERS</div><div class='sub'><span style='color:var(--success)'>● $ACTIVE_USERS Online</span> | <span style='color:var(--secondary)'>○ $DISCONNECTED_USERS Offline</span></div></div>"
+        echo "</div>"
+
+        # Traffic Chart
+        echo "<div class='card' style='margin-bottom:24px;'><h3>WAN Traffic (Real-time)</h3><div class='chart-container' style='height:150px;'><canvas id='trafficChart'></canvas></div></div>"
+
+        # JS for Chart
+        echo "<script>"
+        echo "  const canvas = document.getElementById('trafficChart');"
+        echo "  const ctx = canvas.getContext('2d');"
+        echo "  function resizeCanvas() {"
+        echo "     canvas.width = canvas.parentElement.clientWidth;"
+        echo "     canvas.height = canvas.parentElement.clientHeight;"
+        echo "  }"
+        echo "  window.addEventListener('resize', resizeCanvas); resizeCanvas();"
+        echo "  "
+        echo "  let rxData = [], txData = [], labels = [];"
+        echo "  let lastRx = 0, lastTx = 0;"
+        echo "  function updateChart() {"
+        echo "    fetch('/cgi-bin/admin?action=get_traffic').then(r => r.json()).then(data => {"
+        echo "      const now = new Date().toLocaleTimeString();"
+        echo "      if(lastRx > 0) {"
+        echo "        const rxSpeed = (data.rx - lastRx) / 1024; // KB/s"
+        echo "        const txSpeed = (data.tx - lastTx) / 1024; // KB/s"
+        echo "        rxData.push(rxSpeed); txData.push(txSpeed); labels.push(now);"
+        echo "        if(rxData.length > 30) { rxData.shift(); txData.shift(); labels.shift(); }"
+        echo "        drawChart();"
+        echo "      }"
+        echo "      lastRx = data.rx; lastTx = data.tx;"
+        echo "    });"
+        echo "  }"
+        echo "  function drawChart() {"
+        echo "    const w = canvas.width; const h = canvas.height;"
+        echo "    const max = Math.max(...rxData, ...txData, 1024);"
+        echo "    ctx.clearRect(0, 0, w, h);"
+        echo "    ctx.strokeStyle = '#f1f5f9'; ctx.lineWidth = 1;"
+        echo "    ctx.beginPath();"
+        echo "    for(let i=1; i<5; i++) { const y = h - (i/5)*h; ctx.moveTo(0, y); ctx.lineTo(w, y); }"
+        echo "    ctx.stroke();"
+        echo "    ctx.beginPath(); ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2;"
+        echo "    rxData.forEach((d, i) => { const x = (i/(rxData.length-1))*w; const y = h - (d/max)*h; i==0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y); });"
+        echo "    ctx.stroke();"
+        echo "    ctx.beginPath(); ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 2;"
+        echo "    txData.forEach((d, i) => { const x = (i/(txData.length-1))*w; const y = h - (d/max)*h; i==0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y); });"
+        echo "    ctx.stroke();"
+        echo "    ctx.fillStyle = '#64748b'; ctx.font = '10px sans-serif';"
+        echo "    ctx.fillText(Math.round(max/1024) + ' MB/s', 5, 12);"
+        echo "    ctx.fillStyle = '#2563eb'; ctx.fillText('RX: ' + Math.round(rxData[rxData.length-1]||0) + ' KB/s', w-120, 12);"
+        echo "    ctx.fillStyle = '#ef4444'; ctx.fillText('TX: ' + Math.round(txData[txData.length-1]||0) + ' KB/s', w-60, 12);"
+        echo "  }"
+        echo "  setInterval(updateChart, 2000); updateChart();"
+        echo "</script>"
+
+    elif [ "$TAB" = "rates" ]; then
+        echo "<div class='header'><h1>Rates Manager</h1></div>"
+        
+        if echo "$QUERY_STRING" | grep -q "msg=rate_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Rate Saved!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=rate_deleted"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Rate Deleted!</div>"; fi
+        
+        # Global Rate
+        CURRENT_RATE=$(uci get pisowifi.settings.minutes_per_peso 2>/dev/null || echo 12)
+        
+        echo "<div class='grid'>"
+        echo "  <div class='card'>"
+        echo "    <h3>Standard Rate</h3>"
+        echo "    <form method='POST'>"
+        echo "      <input type='hidden' name='action' value='update_standard_rate'>"
+        echo "      <div style='margin-bottom: 15px;'>"
+        echo "        <label style='display:block; margin-bottom:5px; font-weight:600;'>Minutes per 1 Peso</label>"
+        echo "        <input type='number' name='rate' value='$CURRENT_RATE' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; box-sizing:border-box;'>"
+        echo "      </div>"
+        echo "      <button class='btn btn-primary' style='width:100%'>Update Standard Rate</button>"
+        echo "    </form>"
+        echo "  </div>"
+        
+        echo "  <div class='card' style='grid-column: span 2;'>"
+        echo "    <h3>Create Rate Definition</h3>"
+        echo "    <form method='POST' style='display:flex; flex-wrap:wrap; gap:15px; align-items:end;'>"
+        echo "      <input type='hidden' name='action' value='add_custom_rate'>"
+        
+        echo "      <div style='flex:1; min-width:100px;'>"
+        echo "        <label style='display:block; margin-bottom:5px; font-weight:600;'>Currency (₱)</label>"
+        echo "        <input type='number' name='amount' placeholder='1' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; box-sizing:border-box;' required>"
+        echo "      </div>"
+        
+        echo "      <div style='flex:2; min-width:200px;'>"
+        echo "        <label style='display:block; margin-bottom:5px; font-weight:600;'>Duration</label>"
+        echo "        <div style='display:flex;'>"
+        echo "          <input type='number' name='d_val' placeholder='10' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px 0 0 6px; box-sizing:border-box;' required>"
+        echo "          <select name='d_unit' style='padding:10px; border:1px solid #cbd5e1; border-left:none; border-radius:0 6px 6px 0; background:#f8fafc;'>"
+        echo "            <option value='1'>Minutes</option>"
+        echo "            <option value='60'>Hours</option>"
+        echo "            <option value='1440'>Days</option>"
+        echo "          </select>"
+        echo "        </div>"
+        echo "      </div>"
+        
+        echo "      <div style='flex:1; min-width:150px;'>"
+        echo "        <label style='display:block; margin-bottom:5px; font-weight:600;'>Mode</label>"
+        echo "        <select name='mode' onchange=\"document.getElementById('exp-group').style.display = this.value=='1' ? 'block' : 'none'\" style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; box-sizing:border-box;'>"
+        echo "          <option value='1'>Pausable</option>"
+        echo "          <option value='0'>Continuous</option>"
+        echo "        </select>"
+        echo "      </div>"
+        
+        echo "      <div id='exp-group' style='flex:2; min-width:200px;'>"
+        echo "        <label style='display:block; margin-bottom:5px; font-weight:600;'>Expiration (Optional)</label>"
+        echo "        <div style='display:flex;'>"
+        echo "          <input type='number' name='e_val' placeholder='e.g. 24' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px 0 0 6px; box-sizing:border-box;'>"
+        echo "          <select name='e_unit' style='padding:10px; border:1px solid #cbd5e1; border-left:none; border-radius:0 6px 6px 0; background:#f8fafc;'>"
+        echo "            <option value='60'>Hours</option>"
+        echo "            <option value='1440'>Days</option>"
+        echo "            <option value='1'>Minutes</option>"
+        echo "          </select>"
+        echo "        </div>"
+        echo "      </div>"
+        
+        echo "      <button class='btn btn-primary' style='padding: 10px 30px; width:100%;'>Add Rate</button>"
+        echo "    </form>"
+        echo "    <div class='alert' style='background:#fffbeb; color:#92400e; margin-top:10px; font-size:0.8rem;'>⚠️ Limits are in the Bandwidth section</div>"
+        echo "  </div>"
+        echo "</div>"
+        
+        echo "<div class='card' style='margin-top:20px;'>"
+        echo "  <h3>Active Rate Definitions</h3>"
+        echo "  <table>"
+        echo "    <tr><th>Denomination</th><th>Duration</th><th>Expiration</th><th>Action</th></tr>"
+        # List Standard Rate (₱1)
+        echo "    <tr><td>₱1</td><td>$CURRENT_RATE Minutes</td><td>-</td><td>-</td></tr>"
+        # List Custom Rates
+        # Need complex SQL to format output nicely or do it in shell
+        sqlite3 -separator '|' $DB_FILE "SELECT amount, minutes, is_pausable, expiration, id FROM rates WHERE amount != 1 ORDER BY amount ASC" 2>/dev/null | while read line; do
+            ID=$(echo "$line" | cut -d'|' -f5)
+            AMT=$(echo "$line" | cut -d'|' -f1)
+            MIN=$(echo "$line" | cut -d'|' -f2)
+            PAUSE=$(echo "$line" | cut -d'|' -f3)
+            EXP=$(echo "$line" | cut -d'|' -f4)
+            
+            # Format Duration
+            if [ "$MIN" -ge 1440 ] && [ $((MIN % 1440)) -eq 0 ]; then DUR="$((MIN / 1440))d";
+            elif [ "$MIN" -ge 60 ] && [ $((MIN % 60)) -eq 0 ]; then DUR="$((MIN / 60))h";
+            else DUR="${MIN}m"; fi
+            
+            # Format Expiration
+            if [ "$PAUSE" = "0" ]; then EXP_TXT="Continuous";
+            elif [ "$EXP" -eq 0 ]; then EXP_TXT="No Expiry";
+            else
+                if [ "$EXP" -ge 1440 ] && [ $((EXP % 1440)) -eq 0 ]; then EXP_TXT="$((EXP / 1440))d";
+                elif [ "$EXP" -ge 60 ] && [ $((EXP % 60)) -eq 0 ]; then EXP_TXT="$((EXP / 60))h";
+                else EXP_TXT="${EXP}m"; fi
+            fi
+            
+            echo "    <tr><td>₱$AMT</td><td>$DUR</td><td>$EXP_TXT</td><td>"
+            echo "      <form method='POST' style='display:inline;'><input type='hidden' name='action' value='delete_rate'><input type='hidden' name='rate_id' value='$ID'><button class='btn btn-danger' style='padding:4px 8px; font-size:11px;'>DELETE</button></form>"
+            echo "    </td></tr>"
+        done
+        echo "  </table>"
+        echo "</div>"
+
+    elif [ "$TAB" = "hotspot" ]; then
+        echo "<div class='header'><h1>Hotspot Manager</h1></div>"
+        
+        # WiFi Config Form
+        SSID=$(uci get wireless.@wifi-iface[0].ssid 2>/dev/null)
+        KEY=$(uci get wireless.@wifi-iface[0].key 2>/dev/null)
+        ENCRYPTION=$(uci get wireless.@wifi-iface[0].encryption 2>/dev/null)
+        DISABLED=$(uci get wireless.@wifi-iface[0].disabled 2>/dev/null)
+        
+        if echo "$QUERY_STRING" | grep -q "msg=wifi_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>WiFi Settings Saved! (Applied to All Radios)</div>"; fi
+
+        echo "<div class='card' style='max-width: 600px;'>"
+        echo "<h3>WiFi Configuration (2.4GHz / 5GHz)</h3>"
+        echo "<form method='POST'>"
+        echo "<input type='hidden' name='action' value='update_wifi'>"
+        echo "<input type='hidden' name='device' value='radio0'>"
+        
+        echo "<div style='margin-bottom: 20px;'>"
+        echo "  <label style='display:block; margin-bottom:8px; font-weight:600;'>SSID Name</label>"
+        echo "  <input type='text' name='ssid' value='$SSID' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;' required>"
+        echo "</div>"
+        
+        echo "<div style='margin-bottom: 20px;'>"
+        echo "  <label style='display:block; margin-bottom:8px; font-weight:600;'>Encryption</label>"
+        echo "  <select name='encryption' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;'>"
+        echo "    <option value='none' $([ "$ENCRYPTION" = "none" ] && echo "selected")>Open (No Password)</option>"
+        echo "    <option value='psk2' $([ "$ENCRYPTION" = "psk2" ] && echo "selected")>WPA2-PSK</option>"
+        echo "  </select>"
+        echo "</div>"
+        
+        echo "<div style='margin-bottom: 20px;'>"
+        echo "  <label style='display:block; margin-bottom:8px; font-weight:600;'>Password (if WPA2)</label>"
+        echo "  <input type='text' name='key' value='$KEY' placeholder='WiFi Password' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;'>"
+        echo "</div>"
+        
+        echo "<div style='margin-bottom: 20px;'>"
+        echo "  <label style='display:block; margin-bottom:8px; font-weight:600;'>Status</label>"
+        echo "  <select name='disabled' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;'>"
+        echo "    <option value='0' $([ "$DISABLED" = "0" ] && echo "selected")>Enabled</option>"
+        echo "    <option value='1' $([ "$DISABLED" = "1" ] && echo "selected")>Disabled</option>"
+        echo "  </select>"
+        echo "</div>"
+        
+        echo "<button class='btn btn-primary' style='width:100%; padding: 12px;'>Save & Apply to ALL Radios</button>"
+        echo "</form>"
+        echo "</div>"
+
+    elif [ "$TAB" = "devices" ]; then
+        echo "<div class='header'><h1>Device Manager</h1></div>"
+
+        if echo "$QUERY_STRING" | grep -q "msg=device_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Device Saved!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=device_deleted"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Device Deleted!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=time_added"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Time Added!</div>"; fi
+
+        esc() { printf "%s" "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
+        fmt_time() {
+            SEC=$1
+            [ -z "$SEC" ] && SEC=0
+            if [ "$SEC" -le 0 ]; then
+                echo "0s"
+                return
+            fi
+            M=$((SEC / 60))
+            S=$((SEC % 60))
+            if [ "$M" -ge 60 ]; then
+                H=$((M / 60))
+                M2=$((M % 60))
+                echo "${H}h ${M2}m"
+            else
+                echo "${M}m ${S}s"
+            fi
+        }
+
+        NOW=$($DATE +%s)
+        LEASE_FILES="/tmp/dhcp.leases /tmp/dnsmasq.leases /var/dhcp.leases"
+        LEASE_FILE=""
+        for lf in $LEASE_FILES; do
+            if [ -f "$lf" ] && $GREP -q '.' "$lf" 2>/dev/null; then
+                LEASE_FILE="$lf"
+                break
+            fi
+        done
+
+        # Function to get hostname by IP
+        get_hostname_by_ip() {
+            local ip="$1"
+            local hostname=""
+            # Try to get from DHCP leases first
+            for lf in $LEASE_FILES; do
+                if [ -f "$lf" ]; then
+                    hostname=$($GREP "$ip" "$lf" 2>/dev/null | $HEAD -1 | $AWK '{print $4}' 2>/dev/null)
+                    [ "$hostname" = "*" ] && hostname=""
+                    [ -n "$hostname" ] && break
+                fi
+            done
+            # If not found, try reverse DNS lookup
+            if [ -z "$hostname" ]; then
+                hostname=$(nslookup "$ip" 2>/dev/null | $GREP "name =" | $HEAD -1 | $AWK -F'=' '{print $2}' | $SED 's/\.$//' 2>/dev/null)
+            fi
+            # If still not found, generate default
+            if [ -z "$hostname" ]; then
+                hostname="Device-$(echo "$ip" | $SED 's/\./-/g')"
+            fi
+            echo "$hostname"
+        }
+
+        # Auto-save connected devices from DHCP leases
+        AUTO_SAVED_COUNT=0
+        UPDATED_COUNT=0
+        if [ -f "$LEASE_FILE" ]; then
+            while read EXP MACADDR IPADDR HOSTNAME CLIENTID; do
+                [ -z "$MACADDR" ] && continue
+                MAC_UP=$(echo "$MACADDR" | $TR 'a-z' 'A-Z')
+                HOST="$HOSTNAME"
+                [ "$HOST" = "*" ] && HOST=""
+                [ -z "$HOST" ] && HOST=$(get_hostname_by_ip "$IPADDR")
+                
+                # Check if device already exists
+                EXISTS=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM devices WHERE mac='$MAC_UP';" 2>/dev/null)
+                if [ "$EXISTS" = "0" ]; then
+                    # Auto-save new device
+                    MAC_SQL=$(sql_escape "$MAC_UP")
+                    IP_SQL=$(sql_escape "$IPADDR")
+                    HOST_SQL=$(sql_escape "$HOST")
+                    if sqlite3 "$DB_FILE" "INSERT INTO devices (mac, ip, hostname, notes, created_at, updated_at) VALUES ('$MAC_SQL', '$IP_SQL', '$HOST_SQL', 'Auto-detected', strftime('%s','now'), strftime('%s','now'));" 2>/dev/null; then
+                        AUTO_SAVED_COUNT=$((AUTO_SAVED_COUNT + 1))
+                        logger -t pisowifi "Auto-saved new device: $MAC_UP ($HOST) at $IPADDR"
+                    else
+                        logger -t pisowifi "Failed to auto-save device: $MAC_UP ($HOST)"
+                    fi
+                else
+                    # Update IP if changed
+                    MAC_SQL=$(sql_escape "$MAC_UP")
+                    IP_SQL=$(sql_escape "$IPADDR")
+                    if sqlite3 "$DB_FILE" "UPDATE devices SET ip='$IP_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL' AND ip!='$IP_SQL';" 2>/dev/null; then
+                        if [ $(sqlite3 "$DB_FILE" "SELECT changes();") -gt 0 ]; then
+                            UPDATED_COUNT=$((UPDATED_COUNT + 1))
+                            logger -t pisowifi "Updated IP for device: $MAC_UP to $IPADDR"
+                        fi
+                    fi
+                fi
+            done < "$LEASE_FILE"
+        fi
+        
+        # Show auto-save summary if any devices were processed
+        if [ "$AUTO_SAVED_COUNT" -gt 0 ] || [ "$UPDATED_COUNT" -gt 0 ]; then
+            echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>"
+            echo "Auto-detection complete: $AUTO_SAVED_COUNT new devices saved, $UPDATED_COUNT IP addresses updated."
+            echo "</div>"
+        fi
+
+        echo "<div class='card' style='margin-bottom:20px;'>"
+        echo "<h3>Add Device</h3>"
+        echo "<form method='POST' style='display:grid; grid-template-columns: 1fr 1fr; gap:12px;'>"
+        echo "  <input type='hidden' name='action' value='add_device'>"
+        echo "  <div><label style='display:block; margin-bottom:6px; font-weight:600;'>MAC</label><input name='mac' placeholder='AA:BB:CC:DD:EE:FF' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;' required></div>"
+        echo "  <div><label style='display:block; margin-bottom:6px; font-weight:600;'>IP</label><input name='ip' placeholder='10.0.0.x' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'></div>"
+        echo "  <div><label style='display:block; margin-bottom:6px; font-weight:600;'>Hostname</label><input name='hostname' placeholder='Device name' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'></div>"
+        echo "  <div><label style='display:block; margin-bottom:6px; font-weight:600;'>Notes</label><input name='notes' placeholder='Optional' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'></div>"
+        echo "  <div style='grid-column: span 2;'><button class='btn btn-primary' style='width:100%; padding:12px;'>Save Device</button></div>"
+        echo "</form>"
+        echo "</div>"
+
+        # Auto-save connected devices from DHCP leases
+        AUTO_SAVED=0
+        if [ -f "$LEASE_FILE" ]; then
+            $CAT "$LEASE_FILE" 2>/dev/null | while read EXP MACADDR IPADDR HOSTNAME CLIENTID; do
+                [ -z "$MACADDR" ] && continue
+                MAC_UP=$(echo "$MACADDR" | $TR 'a-z' 'A-Z')
+                HOST="$HOSTNAME"
+                [ "$HOST" = "*" ] && HOST=""
+                [ -z "$HOST" ] && HOST="$(gethostbyip "$IPADDR" 2>/dev/null || echo "Device-$MAC_UP")"
+                
+                # Check if device already exists
+                EXISTS=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM devices WHERE mac='$MAC_UP';" 2>/dev/null)
+                if [ "$EXISTS" = "0" ]; then
+                    # Auto-save new device
+                    MAC_SQL=$(sql_escape "$MAC_UP")
+                    IP_SQL=$(sql_escape "$IPADDR")
+                    HOST_SQL=$(sql_escape "$HOST")
+                    sqlite3 "$DB_FILE" "INSERT INTO devices (mac, ip, hostname, notes, created_at, updated_at) VALUES ('$MAC_SQL', '$IP_SQL', '$HOST_SQL', 'Auto-detected', strftime('%s','now'), strftime('%s','now'));" 2>/dev/null
+                    logger -t pisowifi "Auto-saved new device: $MAC_UP ($HOST)"
+                fi
+            done
+        fi
+
+        echo "<div class='card'>"
+        echo "<h3>Device Manager</h3>"
+        echo "<div style='margin-bottom:16px;'>"
+        echo "<p style='color:#64748b; font-size:14px; margin-bottom:8px;'>Devices are automatically saved when they connect to the network. Online devices show green status.</p>"
+        echo "<button id='sync-all-btn' class='btn btn-primary' style='background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); border:none; padding:8px 16px; border-radius:6px; color:white; cursor:pointer;'>Sync All Devices</button>"
+        echo "</div>"
+        echo "<table><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Status</th><th>Notes</th><th>Actions</th></tr>"
+        
+        # Display all devices with connection status
+        sqlite3 -separator '|' "$DB_FILE" "SELECT mac, ip, hostname, notes FROM devices ORDER BY updated_at DESC;" 2>/dev/null | while IFS='|' read MACADDR IPADDR HOSTNAME NOTES; do
+            [ -z "$MACADDR" ] && continue
+            MAC_UP=$(echo "$MACADDR" | tr 'a-z' 'A-Z')
+            
+            # Check if device is currently connected (has valid lease)
+            IS_CONNECTED=0
+            CURRENT_IP=""
+            for lf in $LEASE_FILES; do
+                if [ -f "$lf" ]; then
+                    LEASE_INFO=$($GREP -i "$MAC_UP" "$lf" 2>/dev/null | $HEAD -1)
+                    if [ -n "$LEASE_INFO" ]; then
+                        IS_CONNECTED=1
+                        CURRENT_IP=$(echo "$LEASE_INFO" | $AWK '{print $3}' 2>/dev/null)
+                        break
+                    fi
+                fi
+            done
+            if [ "$IS_CONNECTED" = "0" ] && command -v iw >/dev/null 2>&1; then
+                for ifc in $(iw dev 2>/dev/null | $AWK '/Interface/ {print $2}'); do
+                    iw dev "$ifc" station dump 2>/dev/null | $GREP -qi "$MAC_UP" && IS_CONNECTED=1 && break
+                done
+            fi
+            if [ "$IS_CONNECTED" = "0" ] && [ -f /proc/net/arp ]; then
+                ARP_LINE=$($GREP -i "$MAC_UP" /proc/net/arp 2>/dev/null | $HEAD -1)
+                if [ -n "$ARP_LINE" ]; then
+                    IS_CONNECTED=1
+                    ARP_IP=$(echo "$ARP_LINE" | $AWK '{print $1}' 2>/dev/null)
+                    [ -n "$ARP_IP" ] && CURRENT_IP="$ARP_IP"
+                fi
+            fi
+            
+            # Get user session info
+            USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
+            END_TS=$(echo "$USER_ROW" | cut -d'|' -f1)
+            PAUSED_TS=$(echo "$USER_ROW" | cut -d'|' -f2)
+            [ -z "$END_TS" ] && END_TS=0
+            [ -z "$PAUSED_TS" ] && PAUSED_TS=0
+            
+            # Determine status and color
+            if [ "$PAUSED_TS" -gt 0 ]; then
+                STATUS="Paused"
+                STATUS_COLOR="#ef4444"
+            elif [ "$END_TS" -gt "$NOW" ]; then
+                REM=$((END_TS - NOW))
+                STATUS="Active ($(fmt_time "$REM"))"
+                STATUS_COLOR="#10b981"
+            elif [ "$IS_CONNECTED" = "1" ]; then
+                STATUS="Online"
+                STATUS_COLOR="#22c55e"
+            else
+                STATUS="Offline"
+                STATUS_COLOR="#6b7280"
+            fi
+            
+            ONLINE_STATUS="Offline"
+            ONLINE_COLOR="#6b7280"
+            if [ "$IS_CONNECTED" = "1" ]; then
+                ONLINE_STATUS="Online"
+                ONLINE_COLOR="#22c55e"
+            fi
+            SESSION_SECS=0
+            SESSION_PAUSED=0
+            if [ "$PAUSED_TS" -gt 0 ]; then
+                SESSION_SECS="$PAUSED_TS"
+                SESSION_PAUSED=1
+            elif [ "$END_TS" -gt "$NOW" ]; then
+                SESSION_SECS=$((END_TS - NOW))
+            fi
+            SH=$((SESSION_SECS / 3600))
+            SM=$(((SESSION_SECS % 3600) / 60))
+            SS=$((SESSION_SECS % 60))
+            SESSION_TEXT=$(printf "%02d:%02d:%02d" "$SH" "$SM" "$SS")
+
+            # Use current IP if device is connected, otherwise use stored IP
+            DISPLAY_IP="$CURRENT_IP"
+            [ -z "$DISPLAY_IP" ] && DISPLAY_IP="$IPADDR"
+
+            EH=$(esc "$HOSTNAME")
+            [ -z "$EH" ] && EH="(unknown)"
+            EIP=$(esc "$DISPLAY_IP")
+            EM=$(esc "$MAC_UP")
+            TOKEN=$(sqlite3 "$DB_FILE" "SELECT session_token FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
+            [ -z "$TOKEN" ] && TOKEN="None"
+            ETOKEN=$(esc "$TOKEN")
+
+            EN=$(esc "$NOTES")
+            
+            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td style='font-size:11px; color:#64748b;'>$ETOKEN</td><td><span style='color:$ONLINE_COLOR; font-weight:600;'>$ONLINE_STATUS</span></td><td><span class='session-timer' data-remaining='$SESSION_SECS' data-paused='$SESSION_PAUSED' style='font-weight:600;'>$SESSION_TEXT</span></td><td>$EN</td><td>"
+            echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center; margin-bottom:6px;'>"
+            echo "    <input type='hidden' name='action' value='update_device'>"
+            echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
+            echo "    <input name='ip' value='$EIP' placeholder='IP' style='width:120px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
+            echo "    <input name='hostname' value='$EH' placeholder='Hostname' style='width:160px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
+            echo "    <input name='notes' value='$EN' placeholder='Notes' style='width:160px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
+            echo "    <button class='btn btn-primary' style='padding:8px 10px;'>Update</button>"
+            echo "  </form>"
+            echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center;'>"
+            echo "    <input type='hidden' name='action' value='device_add_time'>"
+            echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
+            echo "    <input type='hidden' name='ip' value='$DISPLAY_IP'>"
+            echo "    <input type='number' name='add_minutes' min='1' placeholder='+min' style='width:90px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
+            echo "    <button class='btn btn-primary' style='padding:8px 10px;'>Add Time</button>"
+            echo "  </form>"
+            echo "  <form method='POST' style='display:inline; margin-left:10px;'>"
+            echo "    <input type='hidden' name='action' value='delete_device'>"
+            echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
+            echo "    <button class='btn btn-danger' style='padding:8px 10px;'>Delete</button>"
+            echo "  </form>"
+            echo "</td></tr>"
+        done
+        echo "</table>"
+        echo "</div>"
+        
+        # Add sync functionality JavaScript
+        echo "<script>"
+        echo "document.getElementById('sync-all-btn').addEventListener('click', function() {"
+        echo "  var btn = this;"
+        echo "  var originalText = btn.textContent;"
+        echo "  btn.textContent = 'Syncing...';"
+        echo "  btn.disabled = true;"
+        echo "  "
+        echo "  fetch('/cgi-bin/admin', {"
+        echo "    method: 'POST',"
+        echo "    headers: {'Content-Type': 'application/x-www-form-urlencoded'},"
+        echo "    body: 'action=sync_devices'"
+        echo "  })"
+        echo "  .then(response => response.json())"
+        echo "  .then(data => {"
+        echo "    if(data.status === 'success') {"
+        echo "      alert('✅ ' + data.message);"
+        echo "      location.reload();"
+        echo "    } else {"
+        echo "      alert('❌ ' + data.message);"
+        echo "      btn.textContent = originalText;"
+        echo "      btn.disabled = false;"
+        echo "    }"
+        echo "  })"
+        echo "  .catch(error => {"
+        echo "    alert('❌ Sync failed: ' + error);"
+        echo "    btn.textContent = originalText;"
+        echo "    btn.disabled = false;"
+        echo "  });"
+        echo "});"
+        echo "</script>"
+
+    elif [ "$TAB" = "sales" ]; then
+        echo "<div class='header'><h1>Sales Report</h1></div>"
+        
+        # Sales Stats
+        TOTAL_SALES=$(sqlite3 $DB_FILE "SELECT SUM(coins) FROM coins WHERE mac != '00:00:00:00:00:00'" 2>/dev/null || echo 0)
+        [ -z "$TOTAL_SALES" ] && TOTAL_SALES=0
+        
+        TODAY_SALES=$(sqlite3 $DB_FILE "SELECT SUM(coins) FROM coins WHERE mac != '00:00:00:00:00:00' AND timestamp >= strftime('%s', 'now', 'start of day')" 2>/dev/null || echo 0)
+        [ -z "$TODAY_SALES" ] && TODAY_SALES=0
+
+        echo "<div class='grid'>"
+        echo "  <div class='card'><h3>Total Revenue</h3><div class='value'>₱$TOTAL_SALES</div></div>"
+        echo "  <div class='card'><h3>Today's Revenue</h3><div class='value'>₱$TODAY_SALES</div></div>"
+        echo "</div>"
+
+        # Sales History Table
+        echo "<div class='card'>"
+        echo "<h3>Transaction History</h3>"
+        echo "<table><tr><th>ID</th><th>Time</th><th>MAC</th><th>Amount</th></tr>"
+        sqlite3 -separator '</td><td>' $DB_FILE "SELECT id, datetime(timestamp, 'unixepoch', 'localtime'), mac, '₱'||coins FROM coins WHERE mac != '00:00:00:00:00:00' ORDER BY id DESC LIMIT 50;" 2>/dev/null | awk '{print "<tr><td>" $0 "</td></tr>"}'
+        echo "</table>"
+        echo "</div>"
+    
+    elif [ "$TAB" = "qos" ]; then
+        echo "<div class='header'><h1>Bandwidth Manager</h1></div>"
+        
+        if echo "$QUERY_STRING" | grep -q "msg=qos_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Bandwidth Settings Saved!</div>"; fi
+        
+        QOS_MODE=$(uci get pisowifi.qos.mode 2>/dev/null || echo "global")
+        GLOBAL_DOWN=$(uci get pisowifi.qos.global_down 2>/dev/null || echo 0)
+        GLOBAL_UP=$(uci get pisowifi.qos.global_up 2>/dev/null || echo 0)
+        USER_DOWN=$(uci get pisowifi.qos.user_down 2>/dev/null || echo 0)
+        USER_UP=$(uci get pisowifi.qos.user_up 2>/dev/null || echo 0)
+        
+        echo "<div class='card'>"
+        echo "  <h3>Bandwidth Control Policy</h3>"
+        echo "  <form method='POST'>"
+        echo "    <input type='hidden' name='action' value='update_qos'>"
+        
+        echo "    <div style='margin-bottom: 20px;'>"
+        echo "      <label style='display:block; margin-bottom:8px; font-weight:600;'>Control Mode</label>"
+        echo "      <select name='qos_mode' onchange=\"this.value=='global' ? (document.getElementById('global-sec').style.display='block', document.getElementById('user-sec').style.display='none') : (document.getElementById('global-sec').style.display='none', document.getElementById('user-sec').style.display='block')\" style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;'>"
+        if [ "$QOS_MODE" = "per_user" ]; then
+             echo "        <option value='global'>Global Fairness (CAKE)</option>"
+             echo "        <option value='per_user' selected>Per-User Limiting</option>"
+        else
+             echo "        <option value='global' selected>Global Fairness (CAKE)</option>"
+             echo "        <option value='per_user'>Per-User Limiting</option>"
+        fi
+        echo "      </select>"
+        echo "      <p class='sub'><strong>Global Fairness:</strong> Uses CAKE queue management to automatically share bandwidth fairly among all users. No hard limits per user.</p>"
+        echo "      <p class='sub'><strong>Per-User Limiting:</strong> Sets a hard speed limit for every user. Recommended if you sell fixed speeds.</p>"
+        echo "    </div>"
+        
+        echo "    <div id='global-sec' style='display:$([ "$QOS_MODE" = "global" ] && echo "block" || echo "none"); border-top:1px solid #eee; padding-top:20px;'>"
+        echo "      <h4>Global Total Bandwidth (ISP Speed)</h4>"
+        echo "      <div style='display:grid; grid-template-columns: 1fr 1fr; gap:15px;'>"
+        echo "        <div>"
+        echo "          <label style='display:block; margin-bottom:5px; font-weight:600;'>Download (Mbps)</label>"
+        echo "          <input type='number' name='global_down' value='$GLOBAL_DOWN' placeholder='0 = Unlimited' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'>"
+        echo "        </div>"
+        echo "        <div>"
+        echo "          <label style='display:block; margin-bottom:5px; font-weight:600;'>Upload (Mbps)</label>"
+        echo "          <input type='number' name='global_up' value='$GLOBAL_UP' placeholder='0 = Unlimited' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'>"
+        echo "        </div>"
+        echo "      </div>"
+        echo "    </div>"
+        
+        echo "    <div id='user-sec' style='display:$([ "$QOS_MODE" = "per_user" ] && echo "block" || echo "none"); border-top:1px solid #eee; padding-top:20px;'>"
+        echo "      <h4>Per-User Limits</h4>"
+        echo "      <div style='display:grid; grid-template-columns: 1fr 1fr; gap:15px;'>"
+        echo "        <div>"
+        echo "          <label style='display:block; margin-bottom:5px; font-weight:600;'>Max Download (Mbps)</label>"
+        echo "          <input type='number' name='user_down' value='$USER_DOWN' placeholder='e.g. 5' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'>"
+        echo "        </div>"
+        echo "        <div>"
+        echo "          <label style='display:block; margin-bottom:5px; font-weight:600;'>Max Upload (Mbps)</label>"
+        echo "          <input type='number' name='user_up' value='$USER_UP' placeholder='e.g. 1' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'>"
+        echo "        </div>"
+        echo "      </div>"
+        echo "    </div>"
+        
+        echo "    <div style='margin-top:20px;'>"
+        echo "      <button class='btn btn-primary' style='width:100%; padding:12px;'>Save & Apply Bandwidth Rules</button>"
+        echo "    </div>"
+        echo "  </form>"
+        echo "</div>"
+
+    elif [ "$TAB" = "portal" ]; then
+        echo "<div class='header'><h1>Portal Editor</h1></div>"
+        
+        if echo "$QUERY_STRING" | grep -q "msg=portal_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Portal HTML Saved Successfully!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=upload_success"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>File Uploaded Successfully!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=theme_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Theme Saved Successfully!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=theme_deleted"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Theme Deleted!</div>"; fi
+        
+        # HTML Editor
+        # Read current portal html
+        # We need to be careful with escaping HTML inside HTML
+        # Using a simple cat might break the layout if it contains closing tags.
+        # But since we are inside an echo block, we can just cat it? 
+        # No, because we are generating the admin page via echo.
+        # Safest way: Read file content and escape special chars for textarea.
+        
+        # FIX: Explicitly specify UTF-8 charset when reading/handling content
+        PORTAL_CONTENT=$(cat /www/portal.html 2>/dev/null | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+        
+        echo "<div style='display:grid; grid-template-columns: 2fr 1fr; gap:20px; align-items:start;'>"
+        echo "  <div class='card'>"
+        echo "    <h3>HTML Source Code</h3>"
+        echo "    <div style='display:flex; flex-wrap:wrap; gap:10px; margin-bottom:10px;'>"
+        echo "      <button type='button' class='btn btn-primary' style='padding:8px 10px;' onclick=\"loadInstalledPortal()\">Load Installed</button>"
+        echo "      <button type='button' class='btn btn-primary' style='padding:8px 10px; background:#0f172a;' onclick=\"applyTheme('theme_glass')\">Glass</button>"
+        echo "      <button type='button' class='btn btn-primary' style='padding:8px 10px; background:#111827;' onclick=\"applyTheme('theme_dark_neon')\">Dark Neon</button>"
+        echo "      <button type='button' class='btn btn-primary' style='padding:8px 10px; background:#334155;' onclick=\"applyTheme('theme_minimal')\">Minimal</button>"
+        echo "      <button type='button' class='btn btn-primary' style='padding:8px 10px; background:#be123c;' onclick=\"applyTheme('theme_sunset')\">Sunset</button>"
+        echo "    </div>"
+        THEME_FILES=$(ls /www/portal_themes/custom_*.html 2>/dev/null)
+        if [ -n "$THEME_FILES" ]; then
+            echo "    <div style='border:1px solid #e2e8f0; border-radius:10px; padding:10px; margin-bottom:10px;'>"
+            echo "      <div style='font-weight:700; margin-bottom:8px;'>Custom Themes</div>"
+            for f in $THEME_FILES; do
+                NAME=$(basename "$f" .html)
+                LABEL=$(echo "$NAME" | sed 's/^custom_//' | tr '_' ' ')
+                echo "      <div style='display:flex; gap:8px; align-items:center; margin-bottom:8px;'>"
+                echo "        <button type='button' class='btn btn-primary' style='padding:8px 10px; background:#0f172a;' onclick=\"applyTheme('$NAME')\">$LABEL</button>"
+                echo "        <form method='POST' style='margin:0;'>"
+                echo "          <input type='hidden' name='action' value='delete_theme'>"
+                echo "          <input type='hidden' name='theme_id' value='$NAME'>"
+                echo "          <button class='btn btn-danger' type='submit' style='padding:8px 10px;'>Delete</button>"
+                echo "        </form>"
+                echo "      </div>"
+            done
+            echo "    </div>"
+        fi
+
+        echo "    <form id='portal-form' method='POST' accept-charset='UTF-8'>"
+        echo "      <input type='hidden' id='portal-action' name='action' value='save_portal'>"
+        echo "      <div style='display:flex; gap:10px; margin-bottom:10px; align-items:center;'>"
+        echo "        <input id='theme-name' name='theme_name' placeholder='Theme name (e.g. MyTheme)' style='flex:1; padding:10px; border:1px solid #cbd5e1; border-radius:6px;'>"
+        echo "        <button type='button' class='btn btn-primary' style='padding:10px 12px;' onclick=\"submitPortal('save_theme')\">Save as Theme</button>"
+        echo "      </div>"
+        echo "      <textarea id='portal-editor' name='html_content' style='width:100%; height:520px; font-family:monospace; padding:10px; border:1px solid #cbd5e1; border-radius:6px; box-sizing:border-box;' spellcheck='false'>$PORTAL_CONTENT</textarea>"
+        echo "      <div style='margin-top:10px; display:flex; justify-content:flex-end; gap:10px;'>"
+        echo "        <button type='button' class='btn btn-primary' onclick=\"submitPortal('save_portal')\">Save HTML Changes</button>"
+        echo "      </div>"
+        echo "    </form>"
+        echo "  </div>"
+
+        echo "  <div>"
+        echo "    <div class='card' style='margin-bottom:20px;'>"
+        echo "      <h3>Phone Preview</h3>"
+        echo "      <div style='display:flex; justify-content:center;'>"
+        echo "        <div style='width:320px; height:640px; background:#0f172a; border-radius:42px; padding:14px; box-shadow: 0 18px 40px rgba(0,0,0,0.25);'>"
+        echo "          <div style='width:100%; height:100%; background:#fff; border-radius:30px; overflow:hidden;'>"
+        echo "            <iframe id='portal-preview' style='width:100%; height:100%; border:0; background:#fff;'></iframe>"
+        echo "          </div>"
+        echo "        </div>"
+        echo "      </div>"
+        echo "      <p class='sub' style='margin-top:10px;'>Live preview habang nag-e-edit.</p>"
+        echo "    </div>"
+
+        echo "    <div class='card'>"
+        echo "      <h3>Media Manager</h3>"
+        echo "      <p class='sub'>Upload images or audio files for your portal.</p>"
+        echo "      <div style='margin-bottom:20px; border-bottom:1px solid #eee; padding-bottom:20px;'>"
+        echo "        <h4>Background Image</h4>"
+        echo "        <p class='sub'>Replaces <code>bg.jpg</code></p>"
+        echo "        <input type='file' id='file-bg' accept='image/*' style='margin-bottom:10px;'>"
+        echo "        <button onclick=\"uploadFile('file-bg', 'bg.jpg')\" class='btn btn-primary' style='width:100%'>Upload Background</button>"
+        echo "      </div>"
+        echo "      <div style='margin-bottom:20px; border-bottom:1px solid #eee; padding-bottom:20px;'>"
+        echo "        <h4>Insert Coin Audio</h4>"
+        echo "        <p class='sub'>Replaces <code>insert.mp3</code></p>"
+        echo "        <input type='file' id='file-insert' accept='audio/*' style='margin-bottom:10px;'>"
+        echo "        <button onclick=\"uploadFile('file-insert', 'insert.mp3')\" class='btn btn-primary' style='width:100%'>Upload Audio</button>"
+        echo "      </div>"
+        echo "      <div>"
+        echo "        <h4>Connected Audio</h4>"
+        echo "        <p class='sub'>Replaces <code>connected.mp3</code></p>"
+        echo "        <input type='file' id='file-connect' accept='audio/*' style='margin-bottom:10px;'>"
+        echo "        <button onclick=\"uploadFile('file-connect', 'connected.mp3')\" class='btn btn-primary' style='width:100%'>Upload Audio</button>"
+        echo "      </div>"
+        echo "    </div>"
+        echo "  </div>"
+        echo "</div>"
+        
+        echo "<script>"
+        echo "var _previewTimer = null;"
+        echo "function _withBase(html) {"
+        echo "  if(!html) return '';"
+        echo "  if(html.toLowerCase().indexOf('<base ') !== -1) return html;"
+        echo "  if(/<head[^>]*>/i.test(html)) { return html.replace(/<head[^>]*>/i, function(m){ return m + '<base href=\"/\">'; }); }"
+        echo "  return '<base href=\"/\">' + html;"
+        echo "}"
+        echo "function updatePreviewNow() {"
+        echo "  var ta = document.getElementById('portal-editor');"
+        echo "  var fr = document.getElementById('portal-preview');"
+        echo "  if(!ta || !fr) return;"
+        echo "  fr.srcdoc = _withBase(ta.value);"
+        echo "}"
+        echo "function queuePreview() {"
+        echo "  if(_previewTimer) clearTimeout(_previewTimer);"
+        echo "  _previewTimer = setTimeout(updatePreviewNow, 250);"
+        echo "}"
+        echo "function loadInstalledPortal() {"
+        echo "  fetch('/portal.html?ts=' + Date.now())"
+        echo "    .then(function(r){ return r.text(); })"
+        echo "    .then(function(html){ var ta=document.getElementById('portal-editor'); if(ta){ ta.value = html; } updatePreviewNow(); })"
+        echo "    .catch(function(){ updatePreviewNow(); });"
+        echo "}"
+        echo "function applyTheme(name) {"
+        echo "  fetch('/portal_themes/' + name + '.html?ts=' + Date.now())"
+        echo "    .then(function(r){ return r.text(); })"
+        echo "    .then(function(html){ var ta=document.getElementById('portal-editor'); if(ta){ ta.value = html; } updatePreviewNow(); })"
+        echo "    .catch(function(){ alert('Failed to load theme.'); });"
+        echo "}"
+        echo "function submitPortal(actionName) {"
+        echo "  var act = document.getElementById('portal-action');"
+        echo "  var form = document.getElementById('portal-form');"
+        echo "  if(!act || !form) return;"
+        echo "  if(actionName === 'save_theme') {"
+        echo "    var tn = document.getElementById('theme-name');"
+        echo "    if(!tn || !tn.value) { alert('Enter theme name'); return; }"
+        echo "  }"
+        echo "  act.value = actionName;"
+        echo "  form.submit();"
+        echo "}"
+        echo "function uploadFile(inputId, filename) {"
+        echo "  var input = document.getElementById(inputId);"
+        echo "  if(!input.files[0]) { alert('Please select a file first'); return; }"
+        echo "  var file = input.files[0];"
+        echo "  "
+        echo "  var btn = input.nextElementSibling;"
+        echo "  var originalText = btn.innerText;"
+        echo "  btn.innerText = 'Uploading...';"
+        echo "  btn.disabled = true;"
+        echo "  "
+        echo "  // Use Raw Binary Upload to avoid RAM limits"
+        echo "  fetch('/cgi-bin/admin?action=upload_raw&filename=' + filename, {"
+        echo "    method: 'POST',"
+        echo "    body: file"
+        echo "  })"
+        echo "  .then(r => {"
+        echo "      if(r.ok) {"
+        echo "          alert('Upload Successful!');"
+        echo "          window.location.reload();"
+        echo "      } else {"
+        echo "          alert('Upload Failed: ' + r.statusText);"
+        echo "      }"
+        echo "  })"
+        echo "  .catch(e => alert('Error: ' + e))"
+        echo "  .finally(() => {"
+        echo "      btn.innerText = originalText;"
+        echo "      btn.disabled = false;"
+        echo "  });"
+        echo "}"
+        echo "document.addEventListener('DOMContentLoaded', function() {"
+        echo "  var ta = document.getElementById('portal-editor');"
+        echo "  if(ta){ ta.addEventListener('input', queuePreview); }"
+        echo "  loadInstalledPortal();"
+        echo "});"
+        echo "</script>"
+
+    elif [ "$TAB" = "settings" ]; then
+        echo "<div class='header'><h1>Settings</h1></div>"
+        
+        if echo "$QUERY_STRING" | $GREP -q "msg=license_required"; then 
+            echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px; font-weight:700;'>LICENSE REQUIRED: Access to other features is restricted until a valid license is activated.</div>"
+        fi
+
+        if echo "$QUERY_STRING" | $GREP -q "msg=saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Settings Saved Successfully!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_env_loaded"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Supabase Credentials Loaded!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_env_missing"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Missing /etc/pisowifi/supabase.env</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_ok"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>License Activated!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_hw_mismatch"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>License is bound to a different device.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_not_found"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>License key not found.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_fetch_failed"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Could not reach Supabase.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_rls_denied"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Supabase denied access (RLS/permissions).</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_rls_empty"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Supabase returned no rows for anon key (check RLS/policies/grants).</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_bind_failed"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Could not bind license to this device.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_invalid"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Invalid License.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_missing_supabase"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Missing Supabase URL/Key.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_missing_key"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Missing License Key.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_cleared"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>License Cleared.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=centralized_ok"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Centralized Key Activated Successfully!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=centralized_failed"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Failed to activate Centralized Key. Check format or connection.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=centralized_format_error"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Invalid Centralized Key Format. Must be CENTRAL-XXXXXXXX-XXXXXXXX.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=centralized_invalid_format"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Invalid Centralized Key Format. Must be CENTRAL-XXXXXXXX-XXXXXXXX.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=centralized_cleared"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Centralized Key Cleared.</div>"; fi
+        
+        echo "<div class='grid' style='grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));'>"
+
+        echo "  <div class='card'>"
+        echo "    <h3>General Configuration</h3>"
+        echo "    <form method='POST'>"
+        echo "      <input type='hidden' name='action' value='update_settings'>"
+        echo "      <div style='margin-bottom: 20px;'>"
+        echo "        <label style='display:block; margin-bottom:8px; font-weight:600;'>New Admin Password</label>"
+        echo "        <input type='password' name='new_pass' placeholder='Leave blank to keep current' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;'>"
+        echo "      </div>"
+        echo "      <button class='btn btn-primary' style='width:100%; padding: 12px;'>Save Settings</button>"
+        echo "    </form>"
+        echo "  </div>"
+
+        LIC_ENABLED=$("$UCI" get pisowifi.license.enabled 2>/dev/null || echo 0)
+        LIC_VALID=$("$UCI" get pisowifi.license.valid 2>/dev/null || echo 0)
+        LIC_VENDOR=$("$UCI" get pisowifi.license.vendor_id 2>/dev/null)
+        [ -z "$LIC_VENDOR" ] || [ "$LIC_VENDOR" = "null" ] && LIC_VENDOR=$("$UCI" get pisowifi.license.vendor_uuid 2>/dev/null)
+        [ -z "$LIC_VENDOR" ] && LIC_VENDOR=""
+        LIC_VENDOR_NAME=$("$UCI" get pisowifi.license.vendor_name 2>/dev/null || echo "")
+        LIC_KEY=$("$UCI" get pisowifi.license.license_key 2>/dev/null || echo "")
+        LIC_EXPIRES=$("$UCI" get pisowifi.license.expires_at 2>/dev/null || echo "")
+        LIC_LAST=$("$UCI" get pisowifi.license.last_check 2>/dev/null || echo 0)
+        LIC_HW=$("$UCI" get pisowifi.license.hardware_id 2>/dev/null || echo "")
+        LIC_HW_MATCH=$("$UCI" get pisowifi.license.hardware_match 2>/dev/null || echo 0)
+        SUPA_URL=$("$UCI" get pisowifi.license.supabase_url 2>/dev/null || echo "")
+        SUPA_KEY=$("$UCI" get pisowifi.license.supabase_key 2>/dev/null || echo "")
+
+        ROUTER_MAC=$(cat /sys/class/net/br-lan/address 2>/dev/null || cat /sys/class/net/eth0/address 2>/dev/null || echo "unknown")
+        if [ -x "$BB" ]; then
+            ROUTER_HEX=$(printf "%s" "$ROUTER_MAC" | "$BB" tr -d ':' | "$BB" tr 'a-z' 'A-Z')
+        else
+            ROUTER_HEX=$(printf "%s" "$ROUTER_MAC" | tr -d ':' | tr 'a-z' 'A-Z')
+        fi
+        ROUTER_ID="$ROUTER_MAC"
+        if command -v md5sum >/dev/null 2>&1 && [ "$ROUTER_HEX" != "UNKNOWN" ]; then
+            HW_HEX=$(echo -n "$ROUTER_HEX" | md5sum 2>/dev/null | awk '{print toupper(substr($1,1,16))}')
+            [ -n "$HW_HEX" ] && ROUTER_ID="CPU-$HW_HEX"
+        fi
+        [ -n "$LIC_KEY" ] && LIC_DISPLAY="$LIC_KEY" || LIC_DISPLAY="Not set"
+        [ -f /etc/pisowifi/supabase.env ] && ENV_STATUS="Found" || ENV_STATUS="Missing"
+        [ -n "$SUPA_URL" ] && URL_STATUS="Configured" || URL_STATUS="Not set"
+        [ -n "$SUPA_KEY" ] && KEY_STATUS="Configured" || KEY_STATUS="Not set"
+
+        echo "  <div class='card'>"
+        echo "    <h3>OpenWrt License</h3>"
+        echo "    <div class='sub' style='margin-top:-6px; margin-bottom:10px;'>PisoWifi OpenWrt License Management</div>"
+        
+        echo "    <div style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:14px; margin-bottom:16px;'>"
+        echo "      <div style='margin-bottom:10px;'>"
+        echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Status</div>"
+        echo "        <div style='font-weight:900; font-size:1.1rem; color:#0f172a;'>$([ "$LIC_VALID" = "1" ] && echo "<span style='color:#16a34a;'>ACTIVE</span>" || echo "<span style='color:#dc2626;'>INACTIVE</span>")</div>"
+        echo "      </div>"
+        echo "      <div>"
+        echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Hardware ID</div>"
+        echo "        <div style='font-weight:900; font-size:0.95rem; word-break:break-all; font-family:monospace; color:#0f172a;'>$ROUTER_ID</div>"
+        echo "      </div>"
+        if [ -n "$LIC_VENDOR" ] && [ "$LIC_VENDOR" != "null" ]; then
+            echo "      <div style='margin-top:10px;'>"
+            echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Vendor UUID</div>"
+            echo "        <div style='font-weight:700; font-size:0.85rem; word-break:break-all; font-family:monospace; color:#475569;'>$LIC_VENDOR</div>"
+            echo "      </div>"
+        fi
+        [ -n "$LIC_EXPIRES" ] && [ "$LIC_VALID" = "0" ] && [ "$LIC_STATUS" = "trial" ] && echo "      <div style='margin-top:10px; font-size:12px; color:#0369a1; font-weight:600;'>Trial expires: $LIC_EXPIRES</div>"
+        echo "    </div>"
+
+        echo "    <form method='POST' style='margin-bottom:12px;'>"
+        echo "      <input type='hidden' name='action' value='activate_license'>"
+        echo "      <div style='margin-bottom:10px;'>"
+        echo "        <label style='display:block; margin-bottom:6px; font-weight:700; font-size:0.9rem;'>Activation Key</label>"
+        echo "        <input type='text' name='license_key' placeholder='Enter license key' style='width:100%; padding:12px; border:1px solid #cbd5e1; border-radius:8px; font-size:1rem;'> "
+        echo "      </div>"
+        echo "      <button class='btn btn-primary' style='width:100%; padding:14px; font-weight:700;'>Activate License</button>"
+        echo "    </form>"
+
+        echo "    <div style='display:flex; gap:10px;'>"
+        echo "      <form method='POST' style='flex:1;'><input type='hidden' name='action' value='license_check'><button class='btn btn-primary' style='width:100%; padding:12px; background:#0f172a; font-size:0.9rem;'>Check License</button></form>"
+        echo "      <form method='POST' style='flex:1;'><input type='hidden' name='action' value='clear_license'><button class='btn btn-danger' style='width:100%; padding:12px; font-size:0.9rem;'>Clear</button></form>"
+        echo "    </div>"
+        echo "  </div>"
+
+        CENTRAL_KEY=$("$UCI" get pisowifi.license.centralized_key 2>/dev/null || echo "")
+        CENTRAL_VENDOR=$("$UCI" get pisowifi.license.centralized_vendor_id 2>/dev/null || echo "")
+        CENTRAL_STATUS=$("$UCI" get pisowifi.license.centralized_status 2>/dev/null || echo "")
+
+        echo "  <div class='card' id='centralized-card' style='display:block !important;'>"
+        echo "    <h3>Centralized Key</h3>"
+        echo "    <div class='sub' style='margin-top:-6px; margin-bottom:10px;'>Centralized License Management</div>"
+        
+        echo "    <div style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:14px; margin-bottom:16px;'>"
+        echo "      <div style='margin-bottom:10px;'>"
+        echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Status</div>"
+        if [ "$CENTRAL_STATUS" = "active" ]; then
+            echo "        <div style='font-weight:900; font-size:1.1rem; color:#16a34a;'>ACTIVE</div>"
+        else
+            echo "        <div style='font-weight:900; font-size:1.1rem; color:#dc2626;'>INACTIVE</div>"
+        fi
+        echo "      </div>"
+        echo "      <div>"
+        echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Centralized Key</div>"
+        if [ -n "$CENTRAL_KEY" ]; then
+            echo "        <div style='font-weight:900; font-size:0.95rem; word-break:break-all; font-family:monospace; color:#0f172a;'>$CENTRAL_KEY</div>"
+        else
+            echo "        <div style='font-weight:900; font-size:0.95rem; word-break:break-all; font-family:monospace; color:#64748b;'>Not Assigned</div>"
+        fi
+        echo "      </div>"
+        if [ -n "$CENTRAL_VENDOR" ]; then
+            echo "      <div style='margin-top:10px;'>"
+            echo "        <div style='font-size:12px; color:#64748b; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;'>Vendor UUID</div>"
+            echo "        <div style='font-weight:700; font-size:0.85rem; word-break:break-all; font-family:monospace; color:#475569;'>$CENTRAL_VENDOR</div>"
+            echo "      </div>"
+        fi
+        echo "    </div>"
+
+        echo "    <form method='POST' style='margin-bottom:12px;'>"
+        echo "      <input type='hidden' name='action' value='activate_centralized_license'>"
+        echo "      <div style='margin-bottom:10px;'>"
+        echo "        <label style='display:block; margin-bottom:6px; font-weight:700; font-size:0.9rem;'>Centralized Key</label>"
+        echo "        <input type='text' name='centralized_key' placeholder='CENTRAL-XXXXXXXX-XXXXXXXX' style='width:100%; padding:12px; border:1px solid #cbd5e1; border-radius:8px; font-size:1rem;'> "
+        echo "      </div>"
+        echo "      <button class='btn btn-primary' style='width:100%; padding:14px; font-weight:700; background:linear-gradient(135deg, #8b5cf6, #d946ef); border:none;'>Activate Centralized Key</button>"
+        echo "    </form>"
+        
+        echo "    <div style='display:flex; gap:10px;'>"
+        echo "      <form method='POST' style='flex:1;'><input type='hidden' name='action' value='clear_centralized_license'><button class='btn btn-danger' style='width:100%; padding:12px; font-size:0.9rem;'>Clear Centralized Key</button></form>"
+        echo "    </div>"
+        
+        echo "  </div>"
+
+        echo "</div>"
+    fi
+
+    echo "</div>" # End Container
+    echo "</div>" # End Main Content
+
+echo "</body></html>"

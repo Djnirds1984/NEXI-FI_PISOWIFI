@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NEXI-FI PISOWIFI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&family=JetBrains+Mono:wght@700&display=swap" rel="stylesheet">
+<style>
+:root { 
+  --bg: #030712; 
+  --card: rgba(15, 23, 42, 0.8); 
+  --border: rgba(255, 255, 255, 0.08);
+  --text: #f9fafb; 
+  --muted: #94a3b8; 
+  --accent: #3b82f6;
+  --accent-glow: rgba(59, 130, 246, 0.4);
+  --success: #10b981;
+  --success-glow: rgba(16, 185, 129, 0.3);
+  --warn: #f59e0b;
+  --danger: #ef4444;
+  --surface: rgba(255, 255, 255, 0.03);
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+body {
+  margin: 0; 
+  min-height: 100vh; 
+  display: flex; 
+  align-items: center; 
+  justify-content: center; 
+  padding: 16px; 
+  background-color: var(--bg);
+  background-image: 
+    radial-gradient(circle at 10% 10%, rgba(59, 130, 246, 0.12) 0%, transparent 40%),
+    radial-gradient(circle at 90% 90%, rgba(236, 72, 153, 0.08) 0%, transparent 40%);
+  color: var(--text); 
+  font-family: 'Inter', sans-serif;
+  overflow-x: hidden;
+}
+
+.shell { width: 100%; max-width: 420px; position: relative; animation: slideUp 0.6s ease-out; }
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.logo-container { margin-bottom: 24px; text-align: center; }
+.logo-text { 
+  font-size: 32px; 
+  letter-spacing: 3px; 
+  background: linear-gradient(to bottom, #ffffff 30%, #94a3b8 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  font-weight: 900;
+  display: block;
+}
+.logo-sub { 
+  display: block; 
+  font-size: 11px; 
+  color: var(--accent); 
+  text-transform: uppercase; 
+  letter-spacing: 5px;
+  font-weight: 700;
+  margin-top: -2px;
+}
+
+.card { 
+  background: var(--card); 
+  border: 1px solid var(--border); 
+  border-radius: 32px; 
+  padding: 32px 24px; 
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7); 
+  backdrop-filter: blur(24px); 
+  -webkit-backdrop-filter: blur(24px);
+  position: relative;
+  overflow: hidden;
+}
+
+.card::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; width: 100%; height: 4px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0.5;
+}
+
+.h1 { margin: 0 0 8px 0; font-size: 26px; font-weight: 700; letter-spacing: -0.02em; text-align: center;}
+.sub { margin: 0 0 24px 0; color: var(--muted); font-size: 14px; line-height: 1.6; text-align: center;}
+
+.info-grid { 
+  display: grid; 
+  grid-template-columns: 1fr 1fr;
+  gap: 12px; 
+  margin-bottom: 24px; 
+}
+
+.info-chip { 
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px; 
+  padding: 12px; 
+  text-align: center;
+}
+.info-chip label { display: block; font-size: 10px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em;}
+.info-chip span { font-size: 11px; font-family: 'JetBrains Mono', monospace; color: var(--text); }
+
+button { 
+  width: 100%; 
+  padding: 18px; 
+  border-radius: 20px; 
+  border: 1px solid transparent; 
+  font-weight: 700; 
+  cursor: pointer; 
+  transition: all 0.2s ease;
+  font-size: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  outline: none;
+  margin-bottom: 12px;
+}
+
+button:active { transform: scale(0.97); }
+
+.btn-primary { 
+  background: var(--accent); 
+  color: white; 
+  box-shadow: 0 8px 20px -4px var(--accent-glow);
+}
+.btn-primary:hover { background: #4f8ff7; }
+
+.btn-success { 
+  background: var(--success); 
+  color: white; 
+  box-shadow: 0 8px 20px -4px var(--success-glow);
+}
+
+.btn-ghost { background: var(--surface); border-color: var(--border); color: var(--text); }
+.btn-danger-ghost { background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.2); color: var(--danger); }
+.btn-warn-ghost { background: rgba(245, 158, 11, 0.1); border-color: rgba(245, 158, 11, 0.2); color: var(--warn); }
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(16, 185, 129, 0.1);
+  color: var(--success);
+  padding: 6px 16px;
+  border-radius: 99px;
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 20px;
+}
+
+.dot { width: 8px; height: 8px; background: currentColor; border-radius: 50%; box-shadow: 0 0 8px currentColor; }
+
+.timer-display { 
+  font-size: 48px; 
+  font-family: 'JetBrains Mono', monospace; 
+  font-weight: 700; 
+  margin: 10px 0;
+  color: var(--text);
+  text-align: center;
+}
+
+/* Modal Styling */
+.modal { 
+  display: none; 
+  position: fixed; 
+  z-index: 1000; 
+  inset: 0;
+  background: rgba(0, 0, 0, 0.8); 
+  backdrop-filter: blur(12px); 
+  padding: 20px; 
+  align-items: center;
+  justify-content: center;
+}
+
+.modal.active { display: flex; animation: fadeIn 0.3s ease; }
+
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+.modal-content { 
+  background: #0f172a; 
+  border: 1px solid var(--border); 
+  padding: 32px 24px; 
+  width: 100%; 
+  max-width: 380px; 
+  border-radius: 32px; 
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 1);
+  animation: popIn 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes popIn { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+.rate-list { max-height: 300px; overflow-y: auto; padding-right: 4px; }
+.rate-item { 
+  display: flex; 
+  justify-content: space-between; 
+  align-items: center;
+  padding: 16px; 
+  border-radius: 18px; 
+  background: var(--surface); 
+  border: 1px solid var(--border);
+  margin-bottom: 10px;
+}
+.rate-item .price { color: var(--accent); font-size: 18px; font-weight: 800; }
+.rate-item .time { color: var(--text); font-weight: 600; }
+
+#loading { text-align: center; padding: 40px 0; }
+.spinner { 
+  width: 40px; height: 40px; 
+  border: 4px solid rgba(59, 130, 246, 0.1); 
+  border-top-color: var(--accent); 
+  border-radius: 50%; 
+  margin: 0 auto 20px; 
+  animation: spin 0.8s linear infinite; 
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.action-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+
+.connection-stats {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  margin-bottom: 20px;
+  font-size: 10px;
+  color: var(--muted);
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.connection-stats span {
+    color: var(--text);
+}
+</style>
+</head>
+<body>
+
+<div class="shell">
+  <div class="logo-container">
+    <span class="logo-text">NEXI-FI</span>
+    <span class="logo-sub">Future Wireless</span>
+  </div>
+
+  <div class="card">
+    <div id="loading">
+      <div class="spinner"></div>
+      <p class="sub">Authenticating device...</p>
+    </div>
+
+    <!-- LOGIN SECTION -->
+    <div id="login-section" style="display:none;">
+      <div class="h1">Access Portal</div>
+      <p class="sub">Connect to the future. High-speed internet is just a coin away.</p>
+      
+      <div class="info-grid">
+        <div class="info-chip"><label>Device MAC</label><span id="login-mac">...</span></div>
+        <div class="info-chip"><label>Assigned IP</label><span id="login-ip">...</span></div>
+      </div>
+
+      <button onclick="playAudio('insert'); startCoin()" class="btn-success">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/></svg>
+        INSERT COIN
+      </button>
+      <button onclick="openRates()" class="btn-ghost">View Pricing Rates</button>
+    </div>
+
+    <!-- PAUSED SECTION -->
+    <div id="resume-section" style="display:none;">
+      <div class="h1">Session Paused</div>
+      <p class="sub">Your time is safely stored in our system.</p>
+      
+      <div class="info-chip" style="margin-bottom: 24px; padding: 20px; background: rgba(245, 158, 11, 0.05); border-color: rgba(245, 158, 11, 0.2);">
+        <label>Remaining Time</label>
+        <span id="paused-time" style="color: var(--warn); font-size: 28px;">00:00:00</span>
+      </div>
+
+      <button onclick="resumeTime()" class="btn-primary">RESUME SESSION</button>
+    </div>
+
+    <!-- ACTIVE SECTION -->
+    <div id="connected-section" style="display:none; text-align: center;">
+      <div class="status-badge">
+        <div class="dot"></div>
+        SYSTEM ACTIVE
+      </div>
+      
+      <div class="connection-stats">
+        <div>IP: <span id="status-ip">...</span></div>
+        <div style="opacity: 0.3">|</div>
+        <div>MAC: <span id="status-mac">...</span></div>
+      </div>
+      
+      <div class="timer-display" id="time-remaining">00:00:00</div>
+      <p id="internet-status" class="sub" style="margin-bottom: 24px; font-weight: 600;">Verifying link...</p>
+
+      <button onclick="playAudio('insert'); startCoin()" class="btn-success">ADD MORE TIME</button>
+      
+      <div class="action-row">
+        <button onclick="confirmAction('pause')" class="btn-warn-ghost">PAUSE</button>
+        <button onclick="confirmAction('logout')" class="btn-danger-ghost">LOGOUT</button>
+      </div>
+      
+      <button onclick="openRates()" class="btn-ghost" style="margin-top: 12px;">VIEW RATES</button>
+    </div>
+  </div>
+</div>
+
+<!-- COIN MODAL -->
+<div id="coin-modal" class="modal">
+  <div class="modal-content">
+    <div class="h1">Insert Coin</div>
+    <p class="sub">Hardware is active. Please drop coins.</p>
+    <div class="info-grid">
+      <div class="info-chip"><label>PHP Amount</label><span id="coin-count" style="font-size: 24px; font-weight: 800; color: var(--accent);">0</span></div>
+      <div class="info-chip"><label>Minutes</label><span id="coin-time" style="font-size: 24px; font-weight: 800; color: var(--accent);">0</span></div>
+    </div>
+    <button id="connect-btn" onclick="connect()" class="btn-primary" style="display:none;">ACTIVATE INTERNET</button>
+    <button onclick="closeModal()" class="btn-ghost" style="margin-top: 12px; border:none; text-decoration: underline;">Cancel</button>
+  </div>
+</div>
+
+<!-- RATES MODAL -->
+<div id="rates-modal" class="modal">
+  <div class="modal-content">
+    <div class="h1">WiFi Rates</div>
+    <p class="sub">Pricing for our premium network</p>
+    <div id="rates-body" class="rate-list"></div>
+    <button onclick="closeRates()" class="btn-primary" style="margin-top: 20px;">CLOSE</button>
+  </div>
+</div>
+
+<!-- CONFIRMATION MODAL -->
+<div id="confirm-modal" class="modal">
+  <div class="modal-content" style="text-align: center;">
+    <div class="h1" id="confirm-title">Are you sure?</div>
+    <p class="sub" id="confirm-msg">This action will change your connection state.</p>
+    <div class="action-row" style="margin-top: 24px;">
+        <button onclick="closeConfirm()" class="btn-ghost">CANCEL</button>
+        <button id="confirm-exec" class="btn-primary">YES</button>
+    </div>
+  </div>
+</div>
+
+<audio id="audio-insert" src="/insert.mp3"></audio>
+<audio id="audio-connect" src="/connected.mp3"></audio>
+
+<script>
+const apiUrl = "/cgi-bin/pisowifi";
+let coinInterval;
+let timerInterval;
+let timeLeft = 0;
+let pendingAction = null;
+
+const $ = (id) => document.getElementById(id);
+
+function openRates() { $("rates-modal").classList.add("active"); loadRates(); }
+function closeRates() { $("rates-modal").classList.remove("active"); }
+
+function confirmAction(type) {
+    pendingAction = type;
+    $("confirm-modal").classList.add("active");
+    if(type === 'pause') {
+        $("confirm-title").innerText = "Pause Session?";
+        $("confirm-msg").innerText = "This will disconnect your device but save your remaining time.";
+        $("confirm-exec").onclick = pauseTime;
+    } else {
+        $("confirm-title").innerText = "Logout Device?";
+        $("confirm-msg").innerText = "This will end your current session completely.";
+        $("confirm-exec").onclick = logout;
+    }
+}
+
+function closeConfirm() { $("confirm-modal").classList.remove("active"); }
+
+function loadRates() {
+    fetch(apiUrl+"?action=rates")
+    .then(r=>r.json())
+    .then(d => {
+        const el = $("rates-body");
+        if(!el) return;
+        if(!d || !d.rates || !d.rates.length) {
+            el.innerHTML = "<p class='sub'>No pricing configuration found.</p>";
+            return;
+        }
+        el.innerHTML = d.rates.map(x => `
+            <div class="rate-item">
+                <span class="price">₱${x.amount}</span>
+                <span class="time">${x.minutes} Mins</span>
+            </div>
+        `).join('');
+    }).catch(() => {
+        $("rates-body").innerHTML = "<p class='sub'>Network error loading rates.</p>";
+    });
+}
+
+function playAudio(type) {
+    try {
+        const a = $("audio-"+type);
+        if(a) { a.currentTime = 0; a.play().catch(()=>{}); }
+    } catch(e){}
+}
+
+function formatTime(s) {
+    if(s <= 0) return "00:00:00";
+    const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+    return [h,m,sec].map(v => v < 10 ? "0" + v : v).join(":");
+}
+
+function startTimer() {
+    if(timerInterval) clearInterval(timerInterval);
+    timerInterval = setInterval(() => {
+        if(timeLeft > 0) {
+            timeLeft--;
+            $("time-remaining").innerText = formatTime(timeLeft);
+        } else {
+            clearInterval(timerInterval);
+            checkStatus();
+        }
+    }, 1000);
+}
+
+function checkInternet() {
+    const img = new Image();
+    img.src = "https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png?t=" + Date.now();
+    img.onload = () => {
+        $("internet-status").innerText = "INTERNET: ONLINE";
+        $("internet-status").style.color = "var(--success)";
+    };
+    img.onerror = () => {
+        $("internet-status").innerText = "WIFI ONLY: LIMITED";
+        $("internet-status").style.color = "var(--warn)";
+    };
+}
+
+function checkStatus() {
+    fetch(apiUrl+"?action=status").then(r=>r.json()).then(data => {
+        // Update all MAC/IP display points
+        if(data.mac) {
+            $("login-mac").innerText = data.mac;
+            $("status-mac").innerText = data.mac;
+        }
+        if(data.ip) {
+            $("login-ip").innerText = data.ip;
+            $("status-ip").innerText = data.ip;
+        }
+
+        $("loading").style.display = "none";
+        
+        const views = ["login-section", "resume-section", "connected-section"];
+        views.forEach(v => $(v).style.display = "none");
+
+        if(data.authenticated === "true") {
+            $("connected-section").style.display = "block";
+            timeLeft = parseInt(data.time_remaining);
+            $("time-remaining").innerText = formatTime(timeLeft);
+            startTimer();
+            checkInternet();
+            setTimeout(checkStatus, 10000);
+        } else if(data.authenticated === "paused") {
+            $("resume-section").style.display = "block";
+            $("paused-time").innerText = formatTime(data.time_remaining);
+            if(timerInterval) clearInterval(timerInterval);
+            setTimeout(checkStatus, 10000);
+        } else {
+            $("login-section").style.display = "block";
+            if(timerInterval) clearInterval(timerInterval);
+        }
+    }).catch(() => {
+        $("loading").style.display = "none";
+        $("login-section").style.display = "block";
+    });
+}
+
+function pauseTime() {
+    closeConfirm();
+    fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d => {
+        if(d.status === "paused") checkStatus();
+    });
+}
+
+function resumeTime() {
+    fetch(apiUrl+"?action=resume").then(r=>r.json()).then(d => {
+        if(d.status === "resumed") checkStatus();
+    });
+}
+
+function startCoin() {
+    fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(() => {
+        $("coin-modal").classList.add("active");
+        $("coin-count").innerText = "0";
+        $("coin-time").innerText = "0";
+        $("connect-btn").style.display = "none";
+        if(coinInterval) clearInterval(coinInterval);
+        coinInterval = setInterval(() => {
+            fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d => {
+                $("coin-count").innerText = d.count;
+                $("coin-time").innerText = d.minutes;
+                if(d.count > 0) $("connect-btn").style.display = "flex";
+            });
+        }, 1000);
+    });
+}
+
+function connect() {
+    playAudio("connect");
+    fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d => {
+        closeModal();
+        if(d.status === "connected") checkStatus();
+    });
+}
+
+function logout() {
+    closeConfirm();
+    fetch(apiUrl+"?action=logout").then(() => checkStatus());
+}
+
+function closeModal() {
+    $("coin-modal").classList.remove("active");
+    if(coinInterval) clearInterval(coinInterval);
+}
+
+window.onclick = function(event) {
+    if (event.target.classList.contains('modal')) {
+        event.target.classList.remove('active');
+        if(event.target.id === 'coin-modal') closeModal();
+    }
+}
+
+checkStatus();
+</script>
+</body>
+</html>

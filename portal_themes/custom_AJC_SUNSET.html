@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>NEXI-FI PISOWIFI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root { --bg1:#fb7185; --bg2:#f59e0b; --bg3:#22c55e; --card:rgba(255,255,255,0.92); --text:#0f172a; --muted:#475569; --primary:#2563eb; --success:#16a34a; --danger:#dc2626; --warn:#f59e0b; }
+*{box-sizing:border-box}
+body{margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:22px; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+background: radial-gradient(1100px 700px at 10% 0%, rgba(255,255,255,0.45), transparent 55%),
+linear-gradient(135deg, var(--bg1), var(--bg2) 55%, var(--bg3));}
+.shell{width:100%; max-width:520px; text-align:center;} /* Centered all text here */
+.card{background:var(--card); border-radius:18px; padding:24px; box-shadow: 0 18px 50px rgba(0,0,0,0.25);}
+.hero{display:block; margin-bottom:15px} /* Changed to block for vertical stacking */
+.hero h1{margin:0; font-size:32px; font-weight:900; text-transform:uppercase; letter-spacing:.15em; color:var(--text); line-height:1;} /* Increased NEXI-FI size */
+.hero span{font-size:12px; color:var(--muted); display:block; margin-top:4px;}
+.banner{border-radius:14px; padding:12px; background: linear-gradient(135deg, rgba(37,99,235,0.10), rgba(34,197,94,0.10)); border:1px solid rgba(15,23,42,0.08); margin-bottom:12px}
+.banner strong{display:block; margin-bottom:4px}
+.banner div{font-size:12px; color:var(--muted); line-height:1.4}
+.h2{margin:0; font-size:20px; font-weight:700;}
+.sub{margin:6px 0 0 0; color:var(--muted); font-size:13px}
+button{width:100%; padding:14px; border-radius:14px; border:0; color:white; font-weight:900; cursor:pointer; transition: transform .08s ease;}
+button:active{transform:scale(0.99)}
+.primary{background: linear-gradient(135deg, rgba(37,99,235,0.95), rgba(14,165,233,0.95));}
+.success{background: linear-gradient(135deg, rgba(22,163,74,0.95), rgba(34,197,94,0.95));}
+.danger{background: linear-gradient(135deg, rgba(220,38,38,0.95), rgba(244,63,94,0.95));}
+.warn{background: linear-gradient(135deg, rgba(245,158,11,0.95), rgba(251,191,36,0.95));}
+.row{display:flex; gap:10px; margin-top:10px}
+.row button{width:100%}
+.note{margin-top:10px; font-size:12px; color:var(--muted); text-align:center}
+.modal{display:none; position:fixed; z-index:10; left:0; top:0; width:100%; height:100%; background: rgba(2,6,23,0.6); padding:18px; align-items:center; justify-content:center;}
+.modal-content{background:var(--card); padding:18px; width:100%; max-width:420px; border-radius:16px; text-align:center;}
+.modal-content h2{margin:0 0 8px 0}
+.modal-content p{margin:0 0 12px 0; color:var(--muted)}
+.stats{display:flex; gap:12px; margin:14px 0}
+.stats div{flex:1; border-radius:14px; padding:12px; background: rgba(15,23,42,0.04); border:1px solid rgba(15,23,42,0.08);}
+.stats div b{display:block; font-size:11px; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:.08em}
+.link{background:none; border:none; color:var(--danger); padding:10px; font-weight:900; cursor:pointer;}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="card">
+    <div class="hero">
+      <h1>NEXI-FI</h1>
+      <span>Sunset Theme</span>
+    </div>
+    <div class="banner">
+      <strong>Device Info</strong>
+      <div>MAC: <span id="info-mac">Loading...</span></div>
+      <div>IP: <span id="info-ip">Loading...</span></div>
+    </div>
+    <div class="h2">Get Connected</div>
+    <p class="sub">Insert coin to start. Pause and resume anytime.</p>
+    <div id="loading" class="sub" style="margin-top:10px">Loading...</div>
+    
+    <div id="login-section" style="display:none; margin-top:15px;">
+      <button onclick="startCoin()" class="success">INSERT COIN</button>
+      <div class="note">Press WPS button on router when prompted.</div>
+    </div>
+    
+    <div id="resume-section" style="display:none; margin-top:15px;">
+      <div class="h2" style="font-size:16px">Session Paused</div>
+      <p class="sub">Time Remaining: <strong id="paused-time"></strong></p>
+      <button onclick="resumeTime()" class="primary" style="margin-top:10px">RESUME TIME</button>
+    </div>
+    
+    <div id="connected-section" style="display:none; margin-top:15px;">
+      <div class="h2" style="font-size:16px">Connected</div>
+      <p class="sub">MAC: <span id="client-mac"></span></p>
+      <p class="sub">Time Remaining: <strong id="time-remaining">Loading...</strong></p>
+      <p id="internet-status" class="sub">Checking internet...</p>
+      <div class="row">
+        <button onclick="startCoin()" class="success">ADD TIME</button>
+        <button onclick="pauseTime()" class="warn">PAUSE</button>
+      </div>
+      <div style="margin-top:10px">
+        <button onclick="logout()" class="danger">LOGOUT</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="coin-modal" class="modal">
+  <div class="modal-content">
+    <h2>Insert Coin</h2>
+    <p>Press WPS button on router</p>
+    <div class="stats">
+      <div><b>Coins</b><span id="coin-count">0</span></div>
+      <div><b>Minutes</b><span id="coin-time">0</span></div>
+    </div>
+    <button id="connect-btn" onclick="connect()" class="primary" style="display:none; margin-bottom:10px;">START INTERNET</button>
+    <button onclick="closeModal()" class="link">Cancel</button>
+  </div>
+</div>
+
+<audio id="audio-insert" src="/insert.mp3" loop></audio>
+<audio id="audio-connect" src="/connected.mp3"></audio>
+
+<script>
+var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;
+function playAudio(t){try{var a=document.getElementById("audio-"+t);if(a){a.currentTime=0;a.play().catch(()=>{});}}catch(e){}}
+function stopAudio(){try{document.querySelectorAll("audio").forEach(function(s){s.pause();s.currentTime=0;});}catch(e){}}
+function formatTime(s){if(s<=0)return"Expired";var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60,t="";if(d>0)t+=d+"d ";if(h>0)t+=h+"h ";if(m>0)t+=m+"m ";t+=sec+"s";return t.trim();}
+function startTimer(){if(timerInterval)clearInterval(timerInterval);timerInterval=setInterval(function(){if(timeLeft>0){timeLeft--;var el=document.getElementById("time-remaining");if(el)el.innerText=formatTime(timeLeft);}else{clearInterval(timerInterval);checkStatus();}},1000);}
+function checkInternet(){var img=new Image();var now=new Date().getTime();img.src="https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png?t="+now;img.onload=function(){var el=document.getElementById("internet-status");if(el){el.innerText="Internet: ONLINE";el.style.color="#16a34a";}};img.onerror=function(){var el=document.getElementById("internet-status");if(el){el.innerText="Internet: OFFLINE";el.style.color="#dc2626";}};}
+function checkStatus(){fetch(apiUrl+"?action=status").then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(d=>{if(d.mac){var a=document.getElementById("info-mac");if(a)a.innerText=d.mac;}if(d.ip){var b=document.getElementById("info-ip");if(b)b.innerText=d.ip;}var loading=document.getElementById("loading");if(loading)loading.style.display="none";if(d.authenticated==="true"){document.getElementById("login-section").style.display="none";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="block";timeLeft=parseInt(d.time_remaining);document.getElementById("time-remaining").innerText=formatTime(timeLeft);if(d.mac)document.getElementById("client-mac").innerText=d.mac;startTimer();checkInternet();setTimeout(checkStatus,5000);}else if(d.authenticated==="paused"){document.getElementById("login-section").style.display="none";document.getElementById("connected-section").style.display="none";document.getElementById("resume-section").style.display="block";document.getElementById("paused-time").innerText=formatTime(d.time_remaining);if(timerInterval)clearInterval(timerInterval);setTimeout(checkStatus,10000);}else{document.getElementById("login-section").style.display="block";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="none";if(timerInterval)clearInterval(timerInterval);}}).catch(()=>{var loading=document.getElementById("loading");if(loading)loading.style.display="none";document.getElementById("login-section").style.display="block";});}
+function pauseTime(){if(!confirm("Pause Internet? You can resume later."))return;fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d=>{if(d.status==="paused"){checkStatus();}else{alert("Error: "+(d.error||"Failed to pause"));}}).catch(()=>{});}
+function resumeTime(){fetch(apiUrl+"?action=resume").then(r=>r.json()).then(d=>{if(d.status==="resumed")checkStatus();else alert("Error: "+(d.error||"Failed to resume"));}).catch(()=>{});}
+function startCoin(){stopAudio();playAudio('insert');fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(()=>{document.getElementById("coin-modal").style.display="flex";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session.");});}
+function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{closeModal();if(d.status==="connected"){checkStatus();}else{alert(d.error||"Connection failed");}}).catch(()=>{alert("Failed to connect.");});}
+function logout(){fetch(apiUrl+"?action=logout").then(r=>r.json()).then(()=>checkStatus()).catch(()=>checkStatus());}
+function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);stopAudio();}
+checkStatus();
+</script>
+</body>
+</html>

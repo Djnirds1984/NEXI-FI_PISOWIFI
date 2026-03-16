@@ -12,8 +12,6 @@ local COIN_FILE = "/tmp/pisowifi_coins"
 local SESSION_FILE = "/tmp/pisowifi.sessions"
 local MINUTES_PER_PESO = 12
 local FIREWALL_SCRIPT = "/usr/bin/pisowifi_firewall.sh"
-local DB_FILE = "/etc/pisowifi/pisowifi.db"
-local LOCK_FILE = "/tmp/coin_lock"
 
 function index()
 	-- Public Landing Page
@@ -28,7 +26,6 @@ function index()
 	-- Coin Logic Endpoints
 	entry({"pisowifi", "api", "start_coin"}, call("api_start_coin"), nil).sysauth = false
 	entry({"pisowifi", "api", "check_coin"}, call("api_check_coin"), nil).sysauth = false
-	entry({"pisowifi", "api", "cancel_coin"}, call("api_cancel_coin"), nil).sysauth = false
 	entry({"pisowifi", "api", "connect"}, call("api_connect"), nil).sysauth = false
 	
 	-- License API endpoints
@@ -51,64 +48,7 @@ local function get_client_mac()
 	local ip = http.getenv("REMOTE_ADDR")
 	if not ip then return nil end
 	local mac = sys.net.ip4mac(ip)
-	if not mac or mac == "" then
-		local cmd = string.format("grep %q /proc/net/arp 2>/dev/null | awk '{print $4}' | head -n 1", ip .. " ")
-		mac = sys.exec(cmd)
-	end
 	return mac and mac:upper() or nil
-end
-
-local function uci_get_number(path, fallback)
-	local v = sys.exec("uci -q get " .. path):match("(%d+)")
-	return tonumber(v) or fallback
-end
-
-local function lock_read()
-	local line = sys.exec("cat " .. LOCK_FILE .. " 2>/dev/null"):gsub("[\r\n]+", "")
-	local mac, exp = line:match("^([^%s]+)%s+(%d+)$")
-	return mac, tonumber(exp) or 0
-end
-
-local function lock_clear()
-	sys.call("rm -f " .. LOCK_FILE .. " 2>/dev/null")
-end
-
-local function lock_set(mac, exp)
-	sys.call(string.format("printf '%%s %%d' %q %d > %s 2>/dev/null", mac, exp, LOCK_FILE))
-end
-
-local function lock_try_acquire(mac)
-	local now = os.time()
-	local timeout = uci_get_number("pisowifi.settings.coin_lock_timeout", 20)
-	local locked_mac, exp = lock_read()
-	if locked_mac and exp and exp > now and locked_mac ~= mac then
-		return false
-	end
-	if locked_mac and exp and exp <= now then
-		lock_clear()
-	end
-	local new_exp = now + timeout
-	lock_set(mac, new_exp)
-	return true, new_exp, timeout
-end
-
-local function db_exec(sql)
-	return sys.exec(string.format("sqlite3 %s %q 2>/dev/null", DB_FILE, sql))
-end
-
-local function db_get_coin_count(mac)
-	local out = db_exec(string.format("SELECT COALESCE(SUM(coins),0) FROM coins WHERE mac=%q", mac))
-	return tonumber(out:match("(%d+)")) or 0
-end
-
-local function db_clear_coins(mac)
-	db_exec(string.format("DELETE FROM coins WHERE mac=%q", mac))
-end
-
-local function db_transfer_coins(mac)
-	local c = db_get_coin_count(mac)
-	if c > 0 then db_clear_coins(mac) end
-	return c
 end
 
 local function firewall_allow(mac)
@@ -180,75 +120,20 @@ end
 
 -- API Implementations
 function api_start_coin()
+	reset_coin_count()
+	-- Ensure firewall is initialized when someone tries to use it
+	init_firewall()
 	http.prepare_content("application/json")
-	local mac = get_client_mac()
-	if not mac then
-		http.status(400, "Bad Request")
-		http.write_json({error = "No MAC"})
-		return
-	end
-	local ok, exp, timeout = lock_try_acquire(mac)
-	if not ok then
-		http.write_json({status = "busy", message = "SOMEONE IS PAYING, WAIT FOR YOUR TURN"})
-		return
-	end
-	db_clear_coins(mac)
-	http.write_json({
-		status = "started",
-		lock_timeout = timeout,
-		lock_expiry = exp,
-		lock_remaining = exp - os.time()
-	})
+	http.write_json({status = "started"})
 end
 
 function api_check_coin()
+	local count = read_coin_count()
 	http.prepare_content("application/json")
-	local mac = get_client_mac()
-	if not mac then
-		http.status(400, "Bad Request")
-		http.write_json({error = "No MAC"})
-		return
-	end
-	local locked_mac, exp = lock_read()
-	local now = os.time()
-	if locked_mac and exp and exp > now and locked_mac ~= mac then
-		http.write_json({
-			status = "busy",
-			message = "SOMEONE IS PAYING, WAIT FOR YOUR TURN",
-			lock_expiry = exp,
-			lock_remaining = exp - now
-		})
-		return
-	end
-	local remaining = 0
-	if locked_mac and exp and exp > now and locked_mac == mac then
-		remaining = exp - now
-	end
-	local count = db_get_coin_count(mac)
-	local mpp = uci_get_number("pisowifi.settings.minutes_per_peso", MINUTES_PER_PESO)
 	http.write_json({
 		count = count,
-		minutes = count * mpp,
-		lock_expiry = exp,
-		lock_remaining = remaining
+		minutes = count * MINUTES_PER_PESO
 	})
-end
-
-function api_cancel_coin()
-	http.prepare_content("application/json")
-	local mac = get_client_mac()
-	if not mac then
-		http.status(400, "Bad Request")
-		http.write_json({error = "No MAC"})
-		return
-	end
-	local locked_mac, exp = lock_read()
-	local now = os.time()
-	if locked_mac and exp and exp > now and locked_mac == mac then
-		lock_clear()
-		db_clear_coins(mac)
-	end
-	http.write_json({status = "cancelled"})
 end
 
 function api_connect()
@@ -258,13 +143,6 @@ function api_connect()
 		http.write_json({error = "No MAC"})
 		return
 	end
-	local locked_mac, exp = lock_read()
-	local now = os.time()
-	if locked_mac and exp and exp > now and locked_mac ~= mac then
-		http.write_json({status = "busy", message = "SOMEONE IS PAYING, WAIT FOR YOUR TURN"})
-		return
-	end
-	lock_clear()
 	
 	-- Check license first
 	local hardware_id = license_model.get_hardware_id()
@@ -277,15 +155,14 @@ function api_connect()
 		return
 	end
 	
-	local count = db_transfer_coins(mac)
+	local count = read_coin_count()
 	if count <= 0 then
 		http.status(400, "Bad Request")
 		http.write_json({error = "No coins inserted"})
 		return
 	end
 	
-	local mpp = uci_get_number("pisowifi.settings.minutes_per_peso", MINUTES_PER_PESO)
-	local added_minutes = count * mpp
+	local added_minutes = count * MINUTES_PER_PESO
 	local now = os.time()
 	local sessions = load_sessions()
 	
@@ -295,6 +172,8 @@ function api_connect()
 	local new_expiry = current_expiry + (added_minutes * 60)
 	sessions[mac] = new_expiry
 	save_sessions(sessions)
+	
+	reset_coin_count()
 	
 	init_firewall()
 	firewall_allow(mac)

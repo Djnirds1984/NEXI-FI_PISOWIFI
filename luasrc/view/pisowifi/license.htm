@@ -1,0 +1,172 @@
+<%+header%>
+<h2 name="content">License Management</h2>
+
+<div class="cbi-map">
+    <fieldset class="cbi-section">
+        <legend>License Information</legend>
+        <div id="license-status">
+            <div id="loading-license">Checking license status...</div>
+            <div id="license-info" style="display:none;">
+                <table class="cbi-section-table">
+                    <tr class="cbi-section-table-row">
+                        <th class="cbi-section-table-cell">Hardware ID</th>
+                        <td class="cbi-section-table-cell"><span id="hardware-id"></span></td>
+                    </tr>
+                    <tr class="cbi-section-table-row">
+                        <th class="cbi-section-table-cell">License Status</th>
+                        <td class="cbi-section-table-cell"><span id="license-status-text"></span></td>
+                    </tr>
+                    <tr class="cbi-section-table-row" id="license-key-row" style="display:none;">
+                        <th class="cbi-section-table-cell">License Key</th>
+                        <td class="cbi-section-table-cell"><span id="license-key"></span></td>
+                    </tr>
+                    <tr class="cbi-section-table-row" id="vendor-uuid-row" style="display:none;">
+                        <th class="cbi-section-table-cell">Vendor UUID</th>
+                        <td class="cbi-section-table-cell"><span id="vendor-uuid"></span></td>
+                    </tr>
+                    <tr class="cbi-section-table-row" id="expires-row" style="display:none;">
+                        <th class="cbi-section-table-cell">Expires At</th>
+                        <td class="cbi-section-table-cell"><span id="expires-at"></span></td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+    </fieldset>
+
+    <fieldset class="cbi-section" id="activation-section" style="display:none;">
+        <legend>License Activation</legend>
+        <div class="cbi-section-descr">Enter your license key to activate the full version.</div>
+        
+        <div class="cbi-value">
+            <label class="cbi-value-title" for="license-key-input">License Key:</label>
+            <div class="cbi-value-field">
+                <input type="text" id="license-key-input" class="cbi-input-text" placeholder="Enter license key" />
+                <button id="activate-btn" class="cbi-button cbi-button-apply">Activate License</button>
+            </div>
+        </div>
+        
+        <div id="activation-message"></div>
+    </fieldset>
+
+    <fieldset class="cbi-section" id="trial-info" style="display:none;">
+        <legend>Trial Information</legend>
+        <div class="cbi-section-descr">
+            You are currently using a 7-day trial license. 
+            <span id="trial-days-remaining"></span>
+        </div>
+    </fieldset>
+</div>
+
+<script type="text/javascript">
+(function() {
+    var apiUrl = "<%=luci.dispatcher.build_url('pisowifi', 'api')%>";
+    
+    function formatDate(dateString) {
+        if (!dateString) return "N/A";
+        var date = new Date(dateString);
+        return date.toLocaleString();
+    }
+    
+    function formatDaysRemaining(expiresAt) {
+        if (!expiresAt) return "";
+        var expires = new Date(expiresAt);
+        var now = new Date();
+        var diffTime = expires - now;
+        var diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        
+        if (diffDays > 0) {
+            return "Days remaining: " + diffDays;
+        } else {
+            return "Trial has expired";
+        }
+    }
+    
+    function checkLicenseStatus() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', apiUrl + '/license_status', true);
+        xhr.onload = function() {
+            if (xhr.status === 200) {
+                var data = JSON.parse(xhr.responseText);
+                displayLicenseStatus(data);
+            } else {
+                document.getElementById('loading-license').style.display = 'none';
+                document.getElementById('license-info').style.display = 'block';
+                document.getElementById('license-status-text').innerHTML = '<span style="color: red;">Error checking license</span>';
+            }
+        };
+        xhr.send();
+    }
+    
+    function displayLicenseStatus(data) {
+        document.getElementById('loading-license').style.display = 'none';
+        document.getElementById('license-info').style.display = 'block';
+        
+        document.getElementById('hardware-id').innerText = data.hardware_id || 'Unknown';
+        
+        if (data.status === 'valid') {
+            document.getElementById('license-status-text').innerHTML = '<span style="color: green;">✓ Valid</span>';
+            
+            if (data.license_data) {
+                if (data.license_data.status === 'trial') {
+                    document.getElementById('trial-info').style.display = 'block';
+                    document.getElementById('trial-days-remaining').innerText = formatDaysRemaining(data.license_data.expires_at);
+                } else if (data.license_data.status === 'active') {
+                    document.getElementById('license-key-row').style.display = 'table-row';
+                    document.getElementById('vendor-uuid-row').style.display = 'table-row';
+                    document.getElementById('license-key').innerText = data.license_data.license_key || 'N/A';
+                    document.getElementById('vendor-uuid').innerText = data.license_data.vendor_uuid || 'N/A';
+                }
+                
+                if (data.license_data.expires_at) {
+                    document.getElementById('expires-row').style.display = 'table-row';
+                    document.getElementById('expires-at').innerText = formatDate(data.license_data.expires_at);
+                }
+            }
+        } else if (data.status === 'no_license') {
+            document.getElementById('license-status-text').innerHTML = '<span style="color: orange;">No license found</span>';
+            document.getElementById('activation-section').style.display = 'block';
+        } else {
+            document.getElementById('license-status-text').innerHTML = '<span style="color: red;">✗ Invalid</span>';
+            document.getElementById('activation-section').style.display = 'block';
+        }
+    }
+    
+    function activateLicense() {
+        var licenseKey = document.getElementById('license-key-input').value.trim();
+        if (!licenseKey) {
+            alert('Please enter a license key');
+            return;
+        }
+        
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', apiUrl + '/license_activate', true);
+        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+        xhr.onload = function() {
+            var messageDiv = document.getElementById('activation-message');
+            
+            if (xhr.status === 200) {
+                var data = JSON.parse(xhr.responseText);
+                messageDiv.innerHTML = '<div style="color: green;">License activated successfully!</div>';
+                messageDiv.innerHTML += '<div>Vendor UUID: ' + (data.vendor_uuid || 'N/A') + '</div>';
+                
+                // Reload license status after successful activation
+                setTimeout(function() {
+                    location.reload();
+                }, 2000);
+            } else {
+                var error = JSON.parse(xhr.responseText);
+                messageDiv.innerHTML = '<div style="color: red;">Activation failed: ' + (error.error || 'Unknown error') + '</div>';
+            }
+        };
+        xhr.send('license_key=' + encodeURIComponent(licenseKey));
+    }
+    
+    // Event listeners
+    document.getElementById('activate-btn').addEventListener('click', activateLicense);
+    
+    // Check license status on page load
+    checkLicenseStatus();
+})();
+</script>
+
+<%+footer%>
