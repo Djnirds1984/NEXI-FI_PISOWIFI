@@ -45,15 +45,7 @@ init() {
     # Hook: prerouting, Priority: -100 (Before routing)
     nft add chain inet $TABLE $CHAIN_NAT { type nat hook prerouting priority -100 \; }
 
-    # 3. Postrouting (Masquerade)
-    # Hook: postrouting, Priority: 100
-    nft add chain inet $TABLE postrouting { type nat hook postrouting priority 100 \; }
-    
-    # GLOBAL MASQUERADE - CRITICAL FOR INTERNET ACCESS
-    # Ensure 10.0.0.0/8 traffic is NAT'd when leaving
-    nft add rule inet $TABLE postrouting ip saddr 10.0.0.0/8 masquerade
-    
-    # 4. Input Chain (Allow access to Router Services)
+    # 3. Input Chain (Allow access to Router Services)
     nft add chain inet $TABLE input { type filter hook input priority 0 \; policy accept \; }
     nft add rule inet $TABLE input tcp dport 80 accept
     nft add rule inet $TABLE input udp dport 53 accept
@@ -181,9 +173,6 @@ allow() {
              nft insert rule inet $TABLE $CHAIN_FILTER ip daddr $IP_ARG accept comment \"MAC:$MAC\"
         fi
         
-        # Masquerade (Specific - ensure NAT works)
-        nft insert rule inet $TABLE postrouting ip saddr $IP_ARG masquerade comment \"MAC:$MAC\"
-        
         # FW4/Firewall Forwarding (External Tables) - CRITICAL
     # We must allow BOTH directions for forwarding to work properly
     # Apply QoS limits here too if possible? 
@@ -276,7 +265,6 @@ deny() {
     
     delete_by_comment "$CHAIN_FILTER"
     delete_by_comment "$CHAIN_NAT"
-    delete_by_comment "postrouting"
     
     # Also clean up fw4 fallback
     HANDLES=$(nft -a list chain inet fw4 forward 2>/dev/null | grep "MAC:$MAC" | awk '{print $NF}')
@@ -421,12 +409,68 @@ STOP=10
 FIREWALL_SCRIPT="/usr/bin/pisowifi_nftables.sh"
 SESSIOND="/usr/bin/pisowifi_sessiond.sh"
 PIDFILE="/var/run/pisowifi_sessiond.pid"
+HW_FILE="/etc/pisowifi/hardware_id"
 
 boot() {
     start
 }
 
+compute_hw_id() {
+    BOARD_TAG=""
+    if command -v jsonfilter >/dev/null 2>&1 && [ -f /etc/board.json ]; then
+        BOARD_TAG="$(jsonfilter -i /etc/board.json -e '@.model.id' 2>/dev/null)"
+        [ -z "$BOARD_TAG" ] && BOARD_TAG="$(jsonfilter -i /etc/board.json -e '@.model.name' 2>/dev/null)"
+    fi
+    [ -z "$BOARD_TAG" ] && [ -f /tmp/sysinfo/board_name ] && BOARD_TAG="$(cat /tmp/sysinfo/board_name 2>/dev/null | tr -d '\r\n')"
+    [ -z "$BOARD_TAG" ] && BOARD_TAG="$(uname -n 2>/dev/null | tr -d '\r\n')"
+
+    MAC_TAG=""
+    for i in br-lan eth0 wan lan1 lan2 lan3 phy0-ap0 phy1-ap0 wlan0 wlan1; do
+        [ -z "$MAC_TAG" ] && [ -f "/sys/class/net/$i/address" ] && MAC_TAG="$(cat "/sys/class/net/$i/address" 2>/dev/null | tr -d '\r\n')"
+    done
+    if [ -z "$MAC_TAG" ]; then
+        for f in /sys/class/net/*/address; do
+            m="$(cat "$f" 2>/dev/null | tr -d '\r\n')"
+            case "$m" in
+                ""|"00:00:00:00:00:00") ;;
+                *) MAC_TAG="$m"; break ;;
+            esac
+        done
+    fi
+    MAC_TAG="$(echo "$MAC_TAG" | tr 'a-f' 'A-F')"
+    SEED="$(printf '%s|%s' "$BOARD_TAG" "$MAC_TAG")"
+    if command -v md5sum >/dev/null 2>&1; then
+        H="$(printf '%s' "$SEED" | md5sum | awk '{print $1}' | cut -c1-16 | tr 'a-f' 'A-F')"
+        echo "CPU-$H"
+        return
+    fi
+    H="$(printf '%s' "$SEED" | tr -dc '0-9A-Fa-f' | cut -c1-16 | tr 'a-f' 'A-F')"
+    [ -z "$H" ] && H="0000000000000000"
+    echo "CPU-$H"
+}
+
+ensure_hw_id() {
+    NEW_HW="$(compute_hw_id)"
+    [ -z "$NEW_HW" ] && return
+    CUR_HW="$(cat "$HW_FILE" 2>/dev/null | tr -d '\r\n')"
+    if [ "$CUR_HW" != "$NEW_HW" ]; then
+        mkdir -p /etc/pisowifi 2>/dev/null || true
+        echo "$NEW_HW" > "$HW_FILE" 2>/dev/null || true
+        chmod 600 "$HW_FILE" 2>/dev/null || true
+        uci set pisowifi.license=license
+        uci set pisowifi.license.hardware_id="$NEW_HW"
+        if [ -n "$CUR_HW" ] && [ -n "$(uci -q get pisowifi.license.license_key 2>/dev/null)" ]; then
+            uci set pisowifi.license.valid='0'
+            uci set pisowifi.license.license_key=''
+            uci set pisowifi.license.expires_at=''
+            uci set pisowifi.license.hardware_match='0'
+        fi
+        uci commit pisowifi
+    fi
+}
+
 start() {
+    ensure_hw_id
     logger -t pisowifi "Starting PisoWifi Firewall..."
     $FIREWALL_SCRIPT init
     /usr/bin/pisowifi_qos.sh init
@@ -533,10 +577,22 @@ DB_FILE="/etc/pisowifi/pisowifi.db"
 mkdir -p /etc/pisowifi
 chmod 777 /etc/pisowifi
 
-# Insert coin into database for any user (global coin counter)
-sqlite3 $DB_FILE "INSERT INTO coins (mac, coins) VALUES ('00:00:00:00:00:00', 1)"
-COUNT=$(sqlite3 $DB_FILE "SELECT SUM(coins) FROM coins WHERE mac='00:00:00:00:00:00'")
-logger -t pisowifi "Coin inserted via $BUTTON button. Total: $COUNT"
+LOCK_FILE="/tmp/coin_lock"
+LOCK_TIMEOUT="$(uci get pisowifi.settings.coin_lock_timeout 2>/dev/null)"
+[ -z "$LOCK_TIMEOUT" ] && LOCK_TIMEOUT=20
+NOW="$(date +%s)"
+LINE="$(cat "$LOCK_FILE" 2>/dev/null | tr -d '\r\n')"
+LOCKED_MAC="$(echo "$LINE" | awk '{print $1}')"
+LOCK_EXP="$(echo "$LINE" | awk '{print $2}')"
+[ -z "$LOCK_EXP" ] && LOCK_EXP=0
+if [ -z "$LOCKED_MAC" ] || [ "$LOCK_EXP" -le "$NOW" ] 2>/dev/null; then
+    rm -f "$LOCK_FILE" 2>/dev/null
+    exit 0
+fi
+echo "$LOCKED_MAC $((NOW + LOCK_TIMEOUT))" > "$LOCK_FILE" 2>/dev/null
+sqlite3 $DB_FILE "INSERT INTO coins (mac, coins) VALUES ('$LOCKED_MAC', 1)"
+COUNT=$(sqlite3 $DB_FILE "SELECT COALESCE(SUM(coins),0) FROM coins WHERE mac='$LOCKED_MAC'")
+logger -t pisowifi "Coin inserted for $LOCKED_MAC via $BUTTON button. Total: $COUNT"
 
 # Ensure permissions are correct just in case they were reset
 chmod 666 $DB_FILE
@@ -568,6 +624,7 @@ GREP="/bin/grep"
 uci set pisowifi.settings=settings
 uci set pisowifi.settings.minutes_per_peso='12'
 uci set pisowifi.settings.admin_password='admin'
+uci set pisowifi.settings.coin_lock_timeout='20'
 
 # Initialize QoS config
 uci set pisowifi.qos=qos
@@ -577,19 +634,86 @@ uci set pisowifi.qos.global_up='0'
 uci set pisowifi.qos.user_down='0'
 uci set pisowifi.qos.user_up='0'
 
+compute_hw_id() {
+    BOARD_TAG=""
+    if command -v jsonfilter >/dev/null 2>&1 && [ -f /etc/board.json ]; then
+        BOARD_TAG="$(jsonfilter -i /etc/board.json -e '@.model.id' 2>/dev/null)"
+        [ -z "$BOARD_TAG" ] && BOARD_TAG="$(jsonfilter -i /etc/board.json -e '@.model.name' 2>/dev/null)"
+    fi
+    [ -z "$BOARD_TAG" ] && [ -f /tmp/sysinfo/board_name ] && BOARD_TAG="$(cat /tmp/sysinfo/board_name 2>/dev/null | tr -d '\r\n')"
+    [ -z "$BOARD_TAG" ] && BOARD_TAG="$(uname -n 2>/dev/null | tr -d '\r\n')"
+
+    MAC_TAG=""
+    for i in br-lan eth0 wan lan1 lan2 lan3 phy0-ap0 phy1-ap0 wlan0 wlan1; do
+        [ -z "$MAC_TAG" ] && [ -f "/sys/class/net/$i/address" ] && MAC_TAG="$(cat "/sys/class/net/$i/address" 2>/dev/null | tr -d '\r\n')"
+    done
+    if [ -z "$MAC_TAG" ]; then
+        for f in /sys/class/net/*/address; do
+            m="$(cat "$f" 2>/dev/null | tr -d '\r\n')"
+            case "$m" in
+                ""|"00:00:00:00:00:00") ;;
+                *) MAC_TAG="$m"; break ;;
+            esac
+        done
+    fi
+    MAC_TAG="$(echo "$MAC_TAG" | tr 'a-f' 'A-F')"
+    SEED="$(printf '%s|%s' "$BOARD_TAG" "$MAC_TAG")"
+    if command -v md5sum >/dev/null 2>&1; then
+        H="$(printf '%s' "$SEED" | md5sum | awk '{print $1}' | cut -c1-16 | tr 'a-f' 'A-F')"
+        echo "CPU-$H"
+        return
+    fi
+    H="$(printf '%s' "$SEED" | tr -dc '0-9A-Fa-f' | cut -c1-16 | tr 'a-f' 'A-F')"
+    [ -z "$H" ] && H="0000000000000000"
+    echo "CPU-$H"
+}
+
+EXIST_LIC_VALID="$(uci -q get pisowifi.license.valid 2>/dev/null)"
+EXIST_LIC_KEY="$(uci -q get pisowifi.license.license_key 2>/dev/null)"
+EXIST_LIC_STATUS="$(uci -q get pisowifi.license.status 2>/dev/null)"
+EXIST_LIC_VENDOR="$(uci -q get pisowifi.license.vendor_id 2>/dev/null)"
+[ -z "$EXIST_LIC_VENDOR" ] && EXIST_LIC_VENDOR="$(uci -q get pisowifi.license.vendor_uuid 2>/dev/null)"
+EXIST_LIC_EXP="$(uci -q get pisowifi.license.expires_at 2>/dev/null)"
+EXIST_LIC_HW="$(uci -q get pisowifi.license.hardware_id 2>/dev/null)"
+
 uci set pisowifi.license=license
-uci set pisowifi.license.enabled='0'
-uci set pisowifi.license.supabase_url=''
-uci set pisowifi.license.supabase_key=''
-uci set pisowifi.license.vendor_id=''
-uci set pisowifi.license.vendor_name=''
-uci set pisowifi.license.license_key=''
-uci set pisowifi.license.license_id=''
-uci set pisowifi.license.last_check='0'
-uci set pisowifi.license.valid='0'
-uci set pisowifi.license.expires_at=''
-uci set pisowifi.license.hardware_id=''
-uci set pisowifi.license.hardware_match='0'
+NEW_HW_ID="$(compute_hw_id)"
+[ -n "$NEW_HW_ID" ] && echo "$NEW_HW_ID" > /etc/pisowifi/hardware_id 2>/dev/null || true
+[ -f /etc/pisowifi/hardware_id ] && chmod 600 /etc/pisowifi/hardware_id 2>/dev/null || true
+[ -n "$NEW_HW_ID" ] && uci set pisowifi.license.hardware_id="$NEW_HW_ID"
+
+CLONED_LICENSE=0
+if [ -n "$EXIST_LIC_HW" ] && [ -n "$NEW_HW_ID" ] && [ "$EXIST_LIC_HW" != "$NEW_HW_ID" ]; then
+    CLONED_LICENSE=1
+fi
+
+if [ "$CLONED_LICENSE" = "1" ]; then
+    echo "Cloned config detected; resetting license for this device."
+    uci set pisowifi.license.enabled='0'
+    uci set pisowifi.license.vendor_id=''
+    uci set pisowifi.license.vendor_name=''
+    uci set pisowifi.license.license_key=''
+    uci set pisowifi.license.license_id=''
+    uci set pisowifi.license.last_check='0'
+    uci set pisowifi.license.valid='0'
+    uci set pisowifi.license.expires_at=''
+    uci set pisowifi.license.hardware_match='0'
+elif [ "$EXIST_LIC_VALID" = "1" ] || [ -n "$EXIST_LIC_KEY" ] || [ -n "$EXIST_LIC_STATUS" ] || [ -n "$EXIST_LIC_VENDOR" ] || [ -n "$EXIST_LIC_EXP" ] || [ -n "$EXIST_LIC_HW" ]; then
+    echo "Existing license detected; preserving license config."
+else
+    uci set pisowifi.license.enabled='0'
+    uci set pisowifi.license.supabase_url=''
+    uci set pisowifi.license.supabase_key=''
+    uci set pisowifi.license.vendor_id=''
+    uci set pisowifi.license.vendor_name=''
+    uci set pisowifi.license.license_key=''
+    uci set pisowifi.license.license_id=''
+    uci set pisowifi.license.last_check='0'
+    uci set pisowifi.license.valid='0'
+    uci set pisowifi.license.expires_at=''
+    uci set pisowifi.license.hardware_id=''
+    uci set pisowifi.license.hardware_match='0'
+fi
 
     if [ -f /etc/pisowifi/supabase.env ]; then
         SUPA_URL=$($GREP -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | cut -d= -f2- | tr -d '\r')
@@ -859,22 +983,17 @@ supa_insert() {
 
 get_coin_count() {
     local mac="$1"
-    # Get coins from global counter (mac 00:00:00:00:00:00)
-    local result=$(query_db "SELECT SUM(coins) FROM coins WHERE mac='00:00:00:00:00:00'")
+    local result=$(query_db "SELECT COALESCE(SUM(coins),0) FROM coins WHERE mac='$mac'")
     echo "$result" | head -1
 }
 
 transfer_coins_to_user() {
     local mac="$1"
-    local global_coins=$(get_coin_count)
-    [ -z "$global_coins" ] && global_coins=0
-    
-    if [ "$global_coins" -gt 0 ]; then
-        # Transfer coins from global counter to user
-        query_db "INSERT INTO coins (mac, coins) VALUES ('$mac', $global_coins)"
-        # Clear global counter
-        query_db "DELETE FROM coins WHERE mac='00:00:00:00:00:00'"
-        echo $global_coins
+    local coins=$(get_coin_count "$mac")
+    [ -z "$coins" ] && coins=0
+    if [ "$coins" -gt 0 ]; then
+        query_db "DELETE FROM coins WHERE mac='$mac'"
+        echo "$coins"
     else
         echo 0
     fi
@@ -903,6 +1022,9 @@ handle_api() {
     
     SID=$(echo "$QUERY_STRING" | grep -o "sid=[^&]*" | cut -d= -f2 | sed 's/%3A/:/g; s/%2D/-/g; s/%2d/-/g')
     [ "$SID" = "UNKNOWN" ] && SID=""
+    if [ -z "$SID" ] && [ -n "$MAC" ]; then
+        SID="$(sqlite3 "$DB_FILE" "SELECT session_token FROM users WHERE mac='$MAC' AND session_token IS NOT NULL AND session_token!='' LIMIT 1" 2>/dev/null | head -1)"
+    fi
     
     # Supabase Config for Roaming
     SUPA_URL=$(uci get pisowifi.supabase.url 2>/dev/null)
@@ -918,15 +1040,19 @@ handle_api() {
     }
 
     gen_sid() {
-        if [ -r /proc/sys/kernel/random/uuid ]; then
-            echo "SID-$(cat /proc/sys/kernel/random/uuid | tr -d '\r\n')"
-            return
-        fi
         if [ -r /dev/urandom ] && command -v hexdump >/dev/null 2>&1; then
-            echo "SID-$(hexdump -n 16 -e '16/1 \"%02x\"' /dev/urandom 2>/dev/null)-$(date +%s)"
+            hexdump -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null | tr -d '\r\n'
             return
         fi
-        echo "SID-$(date +%s)-$$"
+        if [ -r /proc/sys/kernel/random/uuid ]; then
+            cat /proc/sys/kernel/random/uuid | tr -d '\r\n-' | tr 'A-F' 'a-f'
+            return
+        fi
+        if command -v md5sum >/dev/null 2>&1; then
+            echo "$(date +%s)-$$-$(cat /proc/uptime 2>/dev/null)" | md5sum | awk '{print $1}'
+            return
+        fi
+        echo "$(date +%s)$$$(date +%s)" | tr -dc '0-9a-f' | cut -c1-32
     }
     
     case "$QUERY_STRING" in
@@ -988,6 +1114,7 @@ handle_api() {
                             REM_SEC=$(echo "$SUPA_BODY" | grep -o '"remaining_seconds":[0-9]*' | cut -d: -f2)
                             IS_PAUSED=$(echo "$SUPA_BODY" | grep -o '"is_paused":[^,}]*' | cut -d: -f2)
                             [ -z "$REM_SEC" ] && REM_SEC=0
+                            sqlite3 $DB_FILE "DELETE FROM users WHERE session_token='$SID' AND mac!='$MAC';" 2>/dev/null || true
                             if [ "$IS_PAUSED" = "true" ]; then
                                 AUTH="paused"
                                 TIME_REMAINING=$REM_SEC
@@ -1009,25 +1136,92 @@ handle_api() {
             ;;
             
         "action=start_coin")
+            LOCK_FILE="/tmp/coin_lock"
+            LOCK_TIMEOUT="$(uci get pisowifi.settings.coin_lock_timeout 2>/dev/null)"
+            [ -z "$LOCK_TIMEOUT" ] && LOCK_TIMEOUT=20
+            NOW="$(date +%s)"
+            if [ -f "$LOCK_FILE" ]; then
+                LINE="$(cat "$LOCK_FILE" 2>/dev/null | tr -d '\r\n')"
+                LOCKED_MAC="$(echo "$LINE" | awk '{print $1}')"
+                LOCK_EXP="$(echo "$LINE" | awk '{print $2}')"
+                [ -z "$LOCK_EXP" ] && LOCK_EXP=0
+                if [ -n "$LOCKED_MAC" ] && [ "$LOCK_EXP" -gt "$NOW" ] 2>/dev/null; then
+                    if [ "$LOCKED_MAC" != "$MAC" ]; then
+                        json_response "{\"status\": \"busy\", \"message\": \"SOMEONE IS PAYING, WAIT FOR YOUR TURN\"}"
+                    fi
+                else
+                    rm -f "$LOCK_FILE" 2>/dev/null
+                fi
+            fi
+            LOCK_EXP="$((NOW + LOCK_TIMEOUT))"
+            echo "$MAC $LOCK_EXP" > "$LOCK_FILE"
+
             # Clear coins from database for this user
             query_db "DELETE FROM coins WHERE mac='$MAC'"
             
             # REMOVED AUTO-INIT.
             # We assume firewall is ready. This prevents disconnecting other users.
             
-            json_response "{\"status\": \"started\"}"
+            json_response "{\"status\": \"started\", \"lock_timeout\": $LOCK_TIMEOUT, \"lock_expiry\": $LOCK_EXP, \"lock_remaining\": $LOCK_TIMEOUT}"
+            ;;
+            
+        "action=cancel_coin")
+            if [ -f /tmp/coin_lock ]; then
+                LINE="$(cat /tmp/coin_lock 2>/dev/null | tr -d '\r\n')"
+                LOCKED_MAC="$(echo "$LINE" | awk '{print $1}')"
+                LOCKED_MAC="$(echo "$LOCKED_MAC" | tr -d ' ')"
+                if [ "$LOCKED_MAC" = "$MAC" ]; then
+                    rm -f /tmp/coin_lock
+                    query_db "DELETE FROM coins WHERE mac='$MAC'"
+                fi
+            fi
+            json_response "{\"status\": \"cancelled\"}"
             ;;
             
         "action=check_coin")
+            NOW="$(date +%s)"
+            LOCK_EXP=0
+            LOCK_REMAINING=0
+            if [ -f /tmp/coin_lock ]; then
+                LINE="$(cat /tmp/coin_lock 2>/dev/null | tr -d '\r\n')"
+                LOCKED_MAC="$(echo "$LINE" | awk '{print $1}')"
+                LOCK_EXP="$(echo "$LINE" | awk '{print $2}')"
+                [ -z "$LOCK_EXP" ] && LOCK_EXP=0
+                if [ -n "$LOCKED_MAC" ] && [ "$LOCK_EXP" -gt "$NOW" ] 2>/dev/null; then
+                    if [ "$LOCKED_MAC" != "$MAC" ]; then
+                        json_response "{\"status\": \"busy\", \"message\": \"SOMEONE IS PAYING, WAIT FOR YOUR TURN\", \"lock_expiry\": $LOCK_EXP, \"lock_remaining\": $((LOCK_EXP - NOW))}"
+                    fi
+                    LOCK_REMAINING=$((LOCK_EXP - NOW))
+                else
+                    rm -f /tmp/coin_lock 2>/dev/null
+                    LOCK_EXP=0
+                    LOCK_REMAINING=0
+                fi
+            fi
             COUNT=$(get_coin_count "$MAC")
             [ -z "$COUNT" ] && COUNT=0
             logger -t pisowifi "Coin check for $MAC: $COUNT coins"
             MINUTES=$((COUNT * MINUTES_PER_PESO))
-            json_response "{\"count\": $COUNT, \"minutes\": $MINUTES}"
+            json_response "{\"count\": $COUNT, \"minutes\": $MINUTES, \"lock_expiry\": $LOCK_EXP, \"lock_remaining\": $LOCK_REMAINING}"
             ;;
             
         "action=connect"*)
-            # Transfer coins from global counter to user
+            if [ -f /tmp/coin_lock ]; then
+                NOW="$(date +%s)"
+                LINE="$(cat /tmp/coin_lock 2>/dev/null | tr -d '\r\n')"
+                LOCKED_MAC="$(echo "$LINE" | awk '{print $1}')"
+                LOCK_EXP="$(echo "$LINE" | awk '{print $2}')"
+                [ -z "$LOCK_EXP" ] && LOCK_EXP=0
+                if [ -n "$LOCKED_MAC" ] && [ "$LOCK_EXP" -gt "$NOW" ] 2>/dev/null; then
+                    if [ "$LOCKED_MAC" != "$MAC" ]; then
+                        json_response "{\"status\": \"busy\", \"message\": \"SOMEONE IS PAYING, WAIT FOR YOUR TURN\"}"
+                    fi
+                    rm -f /tmp/coin_lock
+                else
+                    rm -f /tmp/coin_lock
+                fi
+            fi
+
             COUNT=$(transfer_coins_to_user "$MAC")
             [ -z "$COUNT" ] && COUNT=0
             
@@ -1058,6 +1252,7 @@ handle_api() {
                 
                 # Update user session in database
                 [ -z "$SID" ] && SID="$(gen_sid)"
+                sqlite3 $DB_FILE "DELETE FROM users WHERE session_token='$SID' AND mac!='$MAC';" 2>/dev/null || true
                 update_user_session "$MAC" "$REMOTE_ADDR" $NEW_EXPIRY $COUNT "$SID"
                 
                 # Sync to Supabase for Roaming
@@ -1080,6 +1275,9 @@ handle_api() {
                 $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
                 logger -t pisowifi "User $MAC connected successfully. Time added: $ADDED_MINUTES mins. New Expiry: $NEW_EXPIRY"
                 
+                # Release lock
+                rm -f /tmp/coin_lock
+
                 json_response "{\"status\": \"connected\", \"expiry\": $NEW_EXPIRY, \"sid\": \"$SID\", \"redirect_url\": \"https://www.google.com\"}"
             else
                 json_response "{\"error\": \"No coins\"}"
@@ -1176,8 +1374,8 @@ handle_api() {
             
         "action=insert_coin")
             # Manual coin insertion for testing
-            sqlite3 $DB_FILE "INSERT INTO coins (mac, coins) VALUES ('00:00:00:00:00:00', 1)"
-            COUNT=$(sqlite3 $DB_FILE "SELECT SUM(coins) FROM coins WHERE mac='00:00:00:00:00:00'")
+            sqlite3 $DB_FILE "INSERT INTO coins (mac, coins) VALUES ('$MAC', 1)"
+            COUNT=$(sqlite3 $DB_FILE "SELECT COALESCE(SUM(coins),0) FROM coins WHERE mac='$MAC'")
             logger -t pisowifi "Manual coin inserted. Total: $COUNT"
             json_response "{\"status\": \"coin_inserted\", \"total\": $COUNT}"
             ;;
@@ -1227,6 +1425,9 @@ handle_api() {
 }
 
 # Check if it's an API call
+if [ -z "$QUERY_STRING" ] && echo "$REQUEST_URI" | grep -q "\\?"; then
+    QUERY_STRING="${REQUEST_URI#*\\?}"
+fi
 echo "$QUERY_STRING" | grep -q "action=" && handle_api
 
 # If not API, serve HTML Landing Page
@@ -1306,6 +1507,9 @@ button:active { transform: scale(0.98); }
             <span id="coin-count">0</span> Pesos<br>
             <span id="coin-time">0</span> Minutes
         </div>
+        <div style="font-size: 0.9em; color: gray; margin-top: 10px;">
+            Coinslot Lock Timeout: <span id="coin-lock-remaining">--</span>
+        </div>
         <button id="connect-btn" onclick="playAudio('connect'); connect()" class="btn-blue" style="display:none;">START INTERNET</button>
         <button onclick="closeModal()" style="background:none; color:red; margin-top:10px;">Cancel</button>
     </div>
@@ -1328,12 +1532,37 @@ var apiUrl = "/cgi-bin/pisowifi";
 var interval;
 var timerInterval;
 var timeLeft = 0;
+var lockExpiry = 0;
+var lockTicker;
+
+function updateLockCountdown() {
+    var el = document.getElementById("coin-lock-remaining");
+    if(!el) return;
+    if(!lockExpiry || lockExpiry <= 0) { el.innerText = "--"; return; }
+    var now = Math.floor(Date.now() / 1000);
+    var rem = lockExpiry - now;
+    if(rem < 0) rem = 0;
+    el.innerText = rem + "s";
+    if(rem === 0) {
+        if(lockTicker) { clearInterval(lockTicker); lockTicker = null; }
+        if(interval) { clearInterval(interval); interval = null; }
+        var m = document.getElementById("coin-modal");
+        if(m) m.style.display = "none";
+        lockExpiry = 0;
+        fetch(apiUrl + "?action=cancel_coin" + getSidParam()).catch(() => {});
+    }
+}
 
 function getSessionId() {
     var sid = localStorage.getItem('pisowifi_sid');
     var expiry = localStorage.getItem('pisowifi_sid_expiry');
     var now = Date.now();
-    if (!sid || !expiry) return "";
+    if (!sid) return "";
+    if (!expiry) {
+        var oneYear = 365 * 24 * 60 * 60 * 1000;
+        localStorage.setItem('pisowifi_sid_expiry', (now + oneYear).toString());
+        return sid;
+    }
     if (now > parseInt(expiry)) {
         localStorage.removeItem('pisowifi_sid');
         localStorage.removeItem('pisowifi_sid_expiry');
@@ -1343,7 +1572,20 @@ function getSessionId() {
 }
 
 function generateSessionId() {
-    return 'SID-' + Math.random().toString(36).substr(2, 9) + '-' + Date.now();
+    if (window.crypto && window.crypto.getRandomValues) {
+        var bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        var hex = "";
+        for (var i = 0; i < bytes.length; i++) {
+            hex += bytes[i].toString(16).padStart(2, '0');
+        }
+        return hex;
+    }
+    var out = "";
+    for (var j = 0; j < 32; j++) {
+        out += Math.floor(Math.random() * 16).toString(16);
+    }
+    return out;
 }
 
 function saveSessionId(sid) {
@@ -1389,15 +1631,52 @@ function loadRates() {
 
 function playAudio(type) {
     try {
-        // Stop any currently playing audio first
         stopAudio();
-        
+
         var audio = document.getElementById("audio-" + type);
-        if(audio) {
-            audio.currentTime = 0; // Reset to start
-            audio.play().catch(e => console.log("Audio play failed", e));
+        var fallback = function() {
+            try {
+                var AC = window.AudioContext || window.webkitAudioContext;
+                if (!AC) return;
+                if (!window.__pwAudioCtx) window.__pwAudioCtx = new AC();
+                var ctx = window.__pwAudioCtx;
+                if (ctx.state === "suspended") ctx.resume().catch(() => {});
+
+                var now = ctx.currentTime;
+                var freq = (type === "connect") ? 660 : 880;
+                var dur = (type === "connect") ? 0.22 : 0.28;
+                var o = ctx.createOscillator();
+                var g = ctx.createGain();
+                o.type = "sine";
+                o.frequency.setValueAtTime(freq, now);
+                g.gain.setValueAtTime(0, now);
+
+                if (type === "connect") {
+                    g.gain.linearRampToValueAtTime(0.25, now + 0.02);
+                    g.gain.linearRampToValueAtTime(0, now + dur);
+                } else {
+                    g.gain.linearRampToValueAtTime(0.25, now + 0.01);
+                    g.gain.linearRampToValueAtTime(0, now + 0.08);
+                    g.gain.setValueAtTime(0, now + 0.12);
+                    g.gain.linearRampToValueAtTime(0.25, now + 0.13);
+                    g.gain.linearRampToValueAtTime(0, now + 0.21);
+                }
+
+                o.connect(g);
+                g.connect(ctx.destination);
+                o.start(now);
+                o.stop(now + dur);
+            } catch(e) {}
+        };
+
+        if (audio) {
+            audio.currentTime = 0;
+            var p = audio.play();
+            if (p && p.catch) p.catch(fallback);
+        } else {
+            fallback();
         }
-    } catch(e) { console.error(e); }
+    } catch(e) {}
 }
 
 function stopAudio() {
@@ -1554,6 +1833,14 @@ function startCoin() {
     fetch(apiUrl + "?action=start_coin" + getSidParam())
     .then(r => r.json())
     .then(data => {
+        if(data.status === "busy") {
+            alert(data.message);
+            return;
+        }
+        if(typeof data.lock_expiry === "number") lockExpiry = data.lock_expiry;
+        updateLockCountdown();
+        if(lockTicker) clearInterval(lockTicker);
+        lockTicker = setInterval(updateLockCountdown, 250);
         document.getElementById("coin-modal").style.display = "block";
         document.getElementById("coin-count").innerText = "0";
         document.getElementById("coin-time").innerText = "0";
@@ -1564,6 +1851,13 @@ function startCoin() {
             fetch(apiUrl + "?action=check_coin" + getSidParam())
             .then(r => r.json())
             .then(d => {
+                if(d.status === "busy") {
+                    alert(d.message || "SOMEONE IS PAYING, WAIT FOR YOUR TURN");
+                    closeModal();
+                    return;
+                }
+                if(typeof d.lock_expiry === "number") lockExpiry = d.lock_expiry;
+                updateLockCountdown();
                 document.getElementById("coin-count").innerText = d.count;
                 document.getElementById("coin-time").innerText = d.minutes;
                 if(d.count > 0) document.getElementById("connect-btn").style.display = "block";
@@ -1590,6 +1884,10 @@ function connect() {
     .then(r => r.json())
     .then(data => {
         closeModal();
+        if (data.status === "busy") {
+            alert(data.message || "SOMEONE IS PAYING, WAIT FOR YOUR TURN");
+            return;
+        }
         if (data.status === "connected") {
             if (!existingSid) saveSessionId(data.sid || candidateSid);
             checkStatus();
@@ -1621,7 +1919,12 @@ function logout() {
 function closeModal() {
     document.getElementById("coin-modal").style.display = "none";
     if(interval) clearInterval(interval);
+    if(lockTicker) { clearInterval(lockTicker); lockTicker = null; }
+    lockExpiry = 0;
+    updateLockCountdown();
     stopAudio(); // Stop audio when closing modal
+    // Release lock
+    fetch(apiUrl + "?action=cancel_coin");
 }
 
 function checkCoinCount() {
@@ -2632,6 +2935,85 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              HTML_CONTENT=$(get_post_var "html_content")
              # Write to file
              echo "$HTML_CONTENT" > /www/portal.html
+             if ! $GREP -q "action=cancel_coin" /www/portal.html 2>/dev/null; then
+                 cat << 'HTML' >> /www/portal.html
+<script>
+(function(){
+  function releaseLock(){
+    try{
+      var base=(window.apiUrl||"/cgi-bin/pisowifi");
+      var url=base+"?action=cancel_coin";
+      if(navigator.sendBeacon){navigator.sendBeacon(url,"");return;}
+      fetch(url,{method:"GET",keepalive:true}).catch(function(){});
+    }catch(e){}
+  }
+  window.closeModal=function(){
+    try{var m=document.getElementById("coin-modal");if(m)m.style.display="none";}catch(e){}
+    try{if(window.interval)clearInterval(window.interval);}catch(e){}
+    try{if(window.stopAudio)window.stopAudio();}catch(e){}
+    releaseLock();
+  };
+  document.addEventListener("click",function(e){
+    try{
+      var t=e.target;
+      if(!t) return;
+      var txt=(t.textContent||"").trim().toLowerCase();
+      if(txt!=="cancel" && txt!=="close") return;
+      var el=t;
+      while(el){
+        if(el.id==="coin-modal"){releaseLock();break;}
+        el=el.parentElement;
+      }
+    }catch(err){}
+  },true);
+  window.addEventListener("pagehide",releaseLock);
+})();
+</script>
+HTML
+             fi
+             if ! $GREP -q "pisowifi_sid" /www/portal.html 2>/dev/null; then
+                 cat << 'HTML' >> /www/portal.html
+<script>
+(function(){
+  function getSid(){
+    try{
+      var sid=localStorage.getItem("pisowifi_sid");
+      if(sid && sid.length>=16) return sid;
+      var out="";
+      if(window.crypto && window.crypto.getRandomValues){
+        var b=new Uint8Array(16);window.crypto.getRandomValues(b);
+        for(var i=0;i<b.length;i++) out+=b[i].toString(16).padStart(2,"0");
+      }else{
+        for(var j=0;j<32;j++) out+=Math.floor(Math.random()*16).toString(16);
+      }
+      localStorage.setItem("pisowifi_sid",out);
+      return out;
+    }catch(e){return "";}
+  }
+  function withSid(url){
+    try{
+      if(typeof url!=="string") return url;
+      if(url.indexOf("sid=")!==-1) return url;
+      if(url.indexOf("cgi-bin/pisowifi")===-1) return url;
+      if(url.indexOf("action=")===-1) return url;
+      var sid=getSid(); if(!sid) return url;
+      return url + (url.indexOf("?")===-1 ? "?" : "&") + "sid=" + encodeURIComponent(sid);
+    }catch(e){return url;}
+  }
+  if(window.fetch){
+    var _f=window.fetch;
+    window.fetch=function(resource,init){
+      try{
+        if(typeof resource==="string") resource=withSid(resource);
+        else if(resource && resource.url) resource=withSid(resource.url);
+      }catch(e){}
+      return _f.call(this,resource,init);
+    };
+  }
+})();
+</script>
+HTML
+             fi
              
              echo "Status: 302 Found"
              echo "Location: /cgi-bin/admin?tab=portal&msg=portal_saved"
@@ -2646,6 +3028,85 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              HTML_CONTENT=$(get_post_var "html_content")
              mkdir -p /www/portal_themes
              echo "$HTML_CONTENT" > "/www/portal_themes/custom_${SLUG}.html"
+             if ! $GREP -q "action=cancel_coin" "/www/portal_themes/custom_${SLUG}.html" 2>/dev/null; then
+                 cat << 'HTML' >> "/www/portal_themes/custom_${SLUG}.html"
+<script>
+(function(){
+  function releaseLock(){
+    try{
+      var base=(window.apiUrl||"/cgi-bin/pisowifi");
+      var url=base+"?action=cancel_coin";
+      if(navigator.sendBeacon){navigator.sendBeacon(url,"");return;}
+      fetch(url,{method:"GET",keepalive:true}).catch(function(){});
+    }catch(e){}
+  }
+  window.closeModal=function(){
+    try{var m=document.getElementById("coin-modal");if(m)m.style.display="none";}catch(e){}
+    try{if(window.interval)clearInterval(window.interval);}catch(e){}
+    try{if(window.stopAudio)window.stopAudio();}catch(e){}
+    releaseLock();
+  };
+  document.addEventListener("click",function(e){
+    try{
+      var t=e.target;
+      if(!t) return;
+      var txt=(t.textContent||"").trim().toLowerCase();
+      if(txt!=="cancel" && txt!=="close") return;
+      var el=t;
+      while(el){
+        if(el.id==="coin-modal"){releaseLock();break;}
+        el=el.parentElement;
+      }
+    }catch(err){}
+  },true);
+  window.addEventListener("pagehide",releaseLock);
+})();
+</script>
+HTML
+             fi
+             if ! $GREP -q "pisowifi_sid" "/www/portal_themes/custom_${SLUG}.html" 2>/dev/null; then
+                 cat << 'HTML' >> "/www/portal_themes/custom_${SLUG}.html"
+<script>
+(function(){
+  function getSid(){
+    try{
+      var sid=localStorage.getItem("pisowifi_sid");
+      if(sid && sid.length>=16) return sid;
+      var out="";
+      if(window.crypto && window.crypto.getRandomValues){
+        var b=new Uint8Array(16);window.crypto.getRandomValues(b);
+        for(var i=0;i<b.length;i++) out+=b[i].toString(16).padStart(2,"0");
+      }else{
+        for(var j=0;j<32;j++) out+=Math.floor(Math.random()*16).toString(16);
+      }
+      localStorage.setItem("pisowifi_sid",out);
+      return out;
+    }catch(e){return "";}
+  }
+  function withSid(url){
+    try{
+      if(typeof url!=="string") return url;
+      if(url.indexOf("sid=")!==-1) return url;
+      if(url.indexOf("cgi-bin/pisowifi")===-1) return url;
+      if(url.indexOf("action=")===-1) return url;
+      var sid=getSid(); if(!sid) return url;
+      return url + (url.indexOf("?")===-1 ? "?" : "&") + "sid=" + encodeURIComponent(sid);
+    }catch(e){return url;}
+  }
+  if(window.fetch){
+    var _f=window.fetch;
+    window.fetch=function(resource,init){
+      try{
+        if(typeof resource==="string") resource=withSid(resource);
+        else if(resource && resource.url) resource=withSid(resource.url);
+      }catch(e){}
+      return _f.call(this,resource,init);
+    };
+  }
+})();
+</script>
+HTML
+             fi
 
              echo "Status: 302 Found"
              echo "Location: /cgi-bin/admin?tab=portal&msg=theme_saved"
@@ -3841,6 +4302,9 @@ button:active{transform: scale(0.99);}
       <div><span id="coin-count">0</span> Pesos</div>
       <div><span id="coin-time">0</span> Minutes</div>
     </div>
+    <div class="sub" style="margin-top:8px;">
+      Coinslot Lock Timeout: <span id="coin-lock-remaining">--</span>
+    </div>
     <button id="connect-btn" onclick="playAudio('connect'); connect()" class="btn-primary" style="display:none;">START INTERNET</button>
     <button onclick="closeModal()" class="link-btn">Cancel</button>
   </div>
@@ -3862,6 +4326,26 @@ var apiUrl = "/cgi-bin/pisowifi";
 var interval;
 var timerInterval;
 var timeLeft = 0;
+var lockExpiry = 0;
+var lockTicker;
+
+function updateLockCountdown() {
+  var el = document.getElementById("coin-lock-remaining");
+  if(!el) return;
+  if(!lockExpiry || lockExpiry <= 0) { el.innerText = "--"; return; }
+  var now = Math.floor(Date.now() / 1000);
+  var rem = lockExpiry - now;
+  if(rem < 0) rem = 0;
+  el.innerText = rem + "s";
+  if(rem === 0) {
+    if(lockTicker) { clearInterval(lockTicker); lockTicker = null; }
+    if(interval) { clearInterval(interval); interval = null; }
+    var m = document.getElementById("coin-modal");
+    if(m) m.style.display = "none";
+    lockExpiry = 0;
+    fetch(apiUrl + "?action=cancel_coin").catch(function(){});
+  }
+}
 
 function openRates() {
   var m = document.getElementById("rates-modal");
@@ -3901,7 +4385,44 @@ function playAudio(type) {
   try {
     stopAudio();
     var audio = document.getElementById("audio-" + type);
-    if (audio) { audio.currentTime = 0; audio.play().catch(() => {}); }
+    var fallback = function() {
+      try {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        if (!window.__pwAudioCtx) window.__pwAudioCtx = new AC();
+        var ctx = window.__pwAudioCtx;
+        if (ctx.state === "suspended") ctx.resume().catch(function(){});
+        var now = ctx.currentTime;
+        var freq = (type === "connect") ? 660 : 880;
+        var dur = (type === "connect") ? 0.22 : 0.28;
+        var o = ctx.createOscillator();
+        var g = ctx.createGain();
+        o.type = "sine";
+        o.frequency.setValueAtTime(freq, now);
+        g.gain.setValueAtTime(0, now);
+        if (type === "connect") {
+          g.gain.linearRampToValueAtTime(0.25, now + 0.02);
+          g.gain.linearRampToValueAtTime(0, now + dur);
+        } else {
+          g.gain.linearRampToValueAtTime(0.25, now + 0.01);
+          g.gain.linearRampToValueAtTime(0, now + 0.08);
+          g.gain.setValueAtTime(0, now + 0.12);
+          g.gain.linearRampToValueAtTime(0.25, now + 0.13);
+          g.gain.linearRampToValueAtTime(0, now + 0.21);
+        }
+        o.connect(g);
+        g.connect(ctx.destination);
+        o.start(now);
+        o.stop(now + dur);
+      } catch(e) {}
+    };
+    if (audio) {
+      audio.currentTime = 0;
+      var p = audio.play();
+      if (p && p.catch) p.catch(fallback);
+    } else {
+      fallback();
+    }
   } catch(e) {}
 }
 
@@ -4009,7 +4530,12 @@ function resumeTime() {
 }
 
 function startCoin() {
-  fetch(apiUrl + "?action=start_coin").then(r => r.json()).then(() => {
+  fetch(apiUrl + "?action=start_coin").then(r => r.json()).then(data => {
+    if(data.status === "busy") { alert(data.message); return; }
+    if(typeof data.lock_expiry === "number") lockExpiry = data.lock_expiry;
+    updateLockCountdown();
+    if(lockTicker) clearInterval(lockTicker);
+    lockTicker = setInterval(updateLockCountdown, 250);
     document.getElementById("coin-modal").style.display="block";
     document.getElementById("coin-count").innerText="0";
     document.getElementById("coin-time").innerText="0";
@@ -4017,6 +4543,9 @@ function startCoin() {
     if(interval) clearInterval(interval);
     interval = setInterval(() => {
       fetch(apiUrl + "?action=check_coin").then(r => r.json()).then(d => {
+        if(d.status === "busy") { alert(d.message || "SOMEONE IS PAYING, WAIT FOR YOUR TURN"); closeModal(); return; }
+        if(typeof d.lock_expiry === "number") lockExpiry = d.lock_expiry;
+        updateLockCountdown();
         document.getElementById("coin-count").innerText = d.count;
         document.getElementById("coin-time").innerText = d.minutes;
         if(d.count > 0) document.getElementById("connect-btn").style.display="block";
@@ -4030,6 +4559,7 @@ function connect() {
   playAudio('connect');
   fetch(apiUrl + "?action=connect").then(r => r.json()).then(data => {
     closeModal();
+    if(data.status === "busy") { alert(data.message || "SOMEONE IS PAYING, WAIT FOR YOUR TURN"); return; }
     if(data.status === "connected") {
       checkStatus();
       if(data.redirect_url) setTimeout(() => { window.location.href = data.redirect_url; }, 2000);
@@ -4046,7 +4576,11 @@ function logout() {
 function closeModal() {
   document.getElementById("coin-modal").style.display="none";
   if(interval) clearInterval(interval);
+  if(lockTicker) { clearInterval(lockTicker); lockTicker = null; }
+  lockExpiry = 0;
+  updateLockCountdown();
   stopAudio();
+  fetch(apiUrl + "?action=cancel_coin");
 }
 
 setTimeout(function() {
@@ -4160,6 +4694,7 @@ button:active{transform:scale(0.99)}
       <div><b>Coins</b><span id="coin-count">0</span></div>
       <div><b>Minutes</b><span id="coin-time">0</span></div>
     </div>
+    <p class="sub" style="margin-top:-2px;">Coinslot Lock Timeout: <span id="coin-lock-remaining">--</span></p>
     <button id="connect-btn" onclick="playAudio('connect'); connect()" class="primary" style="display:none;">START INTERNET</button>
     <button onclick="closeModal()" class="link">Cancel</button>
   </div>
@@ -4182,12 +4717,16 @@ var apiUrl = "/cgi-bin/pisowifi";
 var interval;
 var timerInterval;
 var timeLeft = 0;
+var lockExpiry = 0;
+var lockTicker;
+
+function updateLockCountdown(){var el=document.getElementById("coin-lock-remaining");if(!el)return;if(!lockExpiry||lockExpiry<=0){el.innerText="--";return;}var now=Math.floor(Date.now()/1000);var rem=lockExpiry-now;if(rem<0)rem=0;el.innerText=rem+"s";if(rem===0){if(lockTicker){clearInterval(lockTicker);lockTicker=null;}if(interval){clearInterval(interval);interval=null;}var m=document.getElementById("coin-modal");if(m)m.style.display="none";lockExpiry=0;fetch(apiUrl+"?action=cancel_coin").catch(function(){});}}
 
 function openRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="block";loadRates();}
 function closeRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="none";}
 function loadRates(){fetch(apiUrl+"?action=rates").then(r=>r.json()).then(function(d){var el=document.getElementById("rates-body");if(!el)return;if(!d||!d.rates||!d.rates.length){el.innerHTML="<div>No rates set.</div>";return;}var html="<div style='display:grid; gap:8px; margin-top:10px;'>";d.rates.forEach(function(x){html+="<div style='display:flex; justify-content:space-between; padding:10px; border-radius:12px; border:1px solid rgba(31,42,68,0.85); background: rgba(2,6,23,0.35);'><div style='font-weight:800;'>₱"+x.amount+"</div><div>"+x.minutes+" min</div></div>";});html+="</div>";el.innerHTML=html;}).catch(function(){var el=document.getElementById("rates-body");if(el)el.innerHTML="<div>Failed to load rates.</div>";});}
 
-function playAudio(type){try{stopAudio();var a=document.getElementById("audio-"+type);if(a){a.currentTime=0;a.play().catch(()=>{});}}catch(e){}}
+function playAudio(type){try{stopAudio();var a=document.getElementById("audio-"+type);var f=function(){try{var AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;if(!window.__pwAudioCtx)window.__pwAudioCtx=new AC();var c=window.__pwAudioCtx;if(c.state==="suspended")c.resume().catch(function(){});var n=c.currentTime;var q=(type==="connect")?660:880;var d=(type==="connect")?0.22:0.28;var o=c.createOscillator();var g=c.createGain();o.type="sine";o.frequency.setValueAtTime(q,n);g.gain.setValueAtTime(0,n);if(type==="connect"){g.gain.linearRampToValueAtTime(0.25,n+0.02);g.gain.linearRampToValueAtTime(0,n+d);}else{g.gain.linearRampToValueAtTime(0.25,n+0.01);g.gain.linearRampToValueAtTime(0,n+0.08);g.gain.setValueAtTime(0,n+0.12);g.gain.linearRampToValueAtTime(0.25,n+0.13);g.gain.linearRampToValueAtTime(0,n+0.21);}o.connect(g);g.connect(c.destination);o.start(n);o.stop(n+d);}catch(e){}};if(a){a.currentTime=0;var p=a.play();if(p&&p.catch)p.catch(f);}else{f();}}catch(e){}}
 function stopAudio(){try{document.querySelectorAll("audio").forEach(function(s){s.pause();s.currentTime=0;});}catch(e){}}
 function formatTime(s){if(s<=0)return"Expired";var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60,t="";if(d>0)t+=d+"d ";if(h>0)t+=h+"h ";if(m>0)t+=m+"m ";t+=sec+"s";return t.trim();}
 function startTimer(){if(timerInterval)clearInterval(timerInterval);timerInterval=setInterval(function(){if(timeLeft>0){timeLeft--;var el=document.getElementById("time-remaining");if(el)el.innerText=formatTime(timeLeft);}else{clearInterval(timerInterval);checkStatus();}},1000);}
@@ -4195,10 +4734,10 @@ function checkInternet(){var img=new Image();var now=new Date().getTime();img.sr
 function checkStatus(){fetch(apiUrl+"?action=status").then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(data=>{if(data.mac){var a=document.getElementById("info-mac");if(a)a.innerText=data.mac;}if(data.ip){var b=document.getElementById("info-ip");if(b)b.innerText=data.ip;}var loading=document.getElementById("loading");if(loading)loading.style.display="none";if(data.authenticated==="true"){document.getElementById("login-section").style.display="none";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="block";timeLeft=parseInt(data.time_remaining);document.getElementById("time-remaining").innerText=formatTime(timeLeft);if(data.mac)document.getElementById("client-mac").innerText=data.mac;startTimer();checkInternet();setTimeout(checkStatus,5000);}else if(data.authenticated==="paused"){document.getElementById("login-section").style.display="none";document.getElementById("connected-section").style.display="none";document.getElementById("resume-section").style.display="block";document.getElementById("paused-time").innerText=formatTime(data.time_remaining);if(timerInterval)clearInterval(timerInterval);setTimeout(checkStatus,10000);}else{document.getElementById("login-section").style.display="block";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="none";if(timerInterval)clearInterval(timerInterval);}}).catch(()=>{var loading=document.getElementById("loading");if(loading)loading.style.display="none";document.getElementById("login-section").style.display="block";});}
 function pauseTime(){if(!confirm("Pause Internet? You can resume later."))return;fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d=>{if(d.status==="paused"){alert("Internet Paused. Time saved: "+formatTime(d.remaining));checkStatus();}else{alert("Error: "+(d.error||"Failed to pause"));}}).catch(()=>{});}
 function resumeTime(){fetch(apiUrl+"?action=resume").then(r=>r.json()).then(d=>{if(d.status==="resumed")checkStatus();else alert("Error: "+(d.error||"Failed to resume"));}).catch(()=>{});}
-function startCoin(){fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(()=>{document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
-function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{closeModal();if(d.status==="connected"){checkStatus();if(d.redirect_url)setTimeout(()=>{window.location.href=d.redirect_url;},2000);}else{alert(d.error||"Connection failed");}}).catch(()=>{alert("Failed to connect. Please try again.");});}
+function startCoin(){fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(d=>{if(d.status==="busy"){alert(d.message||"SOMEONE IS PAYING, WAIT FOR YOUR TURN");return;}if(typeof d.lock_expiry==="number")lockExpiry=d.lock_expiry;updateLockCountdown();if(lockTicker)clearInterval(lockTicker);lockTicker=setInterval(updateLockCountdown,250);document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{if(d.status==="busy"){alert(d.message||"SOMEONE IS PAYING, WAIT FOR YOUR TURN");closeModal();return;}if(typeof d.lock_expiry==="number")lockExpiry=d.lock_expiry;updateLockCountdown();document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
+function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{if(d.status==="busy"){closeModal();alert(d.message||"SOMEONE IS PAYING, WAIT FOR YOUR TURN");return;}if(d.status==="connected"){closeModal();checkStatus();if(d.redirect_url)setTimeout(()=>{window.location.href=d.redirect_url;},2000);}else{closeModal();alert(d.error||"Connection failed");}}).catch(()=>{closeModal();alert("Failed to connect. Please try again.");});}
 function logout(){fetch(apiUrl+"?action=logout").then(r=>r.json()).then(()=>checkStatus()).catch(()=>checkStatus());}
-function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);stopAudio();}
+function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);if(lockTicker){clearInterval(lockTicker);lockTicker=null;}lockExpiry=0;updateLockCountdown();stopAudio();fetch(apiUrl+"?action=cancel_coin");}
 setTimeout(function(){fetch(apiUrl+"?action=test_dns").then(r=>r.json()).then(()=>{}).catch(()=>{});},3000);
 checkStatus();
 </script>
@@ -4298,6 +4837,7 @@ button:active{transform:scale(0.99)}
       <div><b>Coins</b><span id="coin-count">0</span></div>
       <div><b>Minutes</b><span id="coin-time">0</span></div>
     </div>
+    <p class="sub" style="margin-top:-2px;">Coinslot Lock Timeout: <span id="coin-lock-remaining">--</span></p>
     <button id="connect-btn" onclick="playAudio('connect'); connect()" class="primary" style="display:none;">START INTERNET</button>
     <button onclick="closeModal()" class="link">Cancel</button>
   </div>
@@ -4316,11 +4856,12 @@ button:active{transform:scale(0.99)}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;
+var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;var lockExpiry=0;var lockTicker;
+function updateLockCountdown(){var el=document.getElementById("coin-lock-remaining");if(!el)return;if(!lockExpiry||lockExpiry<=0){el.innerText="--";return;}var now=Math.floor(Date.now()/1000);var rem=lockExpiry-now;if(rem<0)rem=0;el.innerText=rem+"s";if(rem===0){if(lockTicker){clearInterval(lockTicker);lockTicker=null;}if(interval){clearInterval(interval);interval=null;}var m=document.getElementById("coin-modal");if(m)m.style.display="none";lockExpiry=0;fetch(apiUrl+"?action=cancel_coin").catch(function(){});}}
 function openRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="block";loadRates();}
 function closeRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="none";}
 function loadRates(){fetch(apiUrl+"?action=rates").then(r=>r.json()).then(function(d){var el=document.getElementById("rates-body");if(!el)return;if(!d||!d.rates||!d.rates.length){el.innerHTML="<div>No rates set.</div>";return;}var html="<div style='display:grid; gap:8px; margin-top:10px;'>";d.rates.forEach(function(x){html+="<div style='display:flex; justify-content:space-between; padding:10px; border-radius:12px; border:1px solid #e2e8f0; background:#f8fafc;'><div style='font-weight:800;'>₱"+x.amount+"</div><div>"+x.minutes+" min</div></div>";});html+="</div>";el.innerHTML=html;}).catch(function(){var el=document.getElementById("rates-body");if(el)el.innerHTML="<div>Failed to load rates.</div>";});}
-function playAudio(t){try{stopAudio();var a=document.getElementById("audio-"+t);if(a){a.currentTime=0;a.play().catch(()=>{});}}catch(e){}}
+function playAudio(t){try{stopAudio();var a=document.getElementById("audio-"+t);var f=function(){try{var AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;if(!window.__pwAudioCtx)window.__pwAudioCtx=new AC();var c=window.__pwAudioCtx;if(c.state==="suspended")c.resume().catch(function(){});var n=c.currentTime;var q=(t==="connect")?660:880;var d=(t==="connect")?0.22:0.28;var o=c.createOscillator();var g=c.createGain();o.type="sine";o.frequency.setValueAtTime(q,n);g.gain.setValueAtTime(0,n);if(t==="connect"){g.gain.linearRampToValueAtTime(0.25,n+0.02);g.gain.linearRampToValueAtTime(0,n+d);}else{g.gain.linearRampToValueAtTime(0.25,n+0.01);g.gain.linearRampToValueAtTime(0,n+0.08);g.gain.setValueAtTime(0,n+0.12);g.gain.linearRampToValueAtTime(0.25,n+0.13);g.gain.linearRampToValueAtTime(0,n+0.21);}o.connect(g);g.connect(c.destination);o.start(n);o.stop(n+d);}catch(e){}};if(a){a.currentTime=0;var p=a.play();if(p&&p.catch)p.catch(f);}else{f();}}catch(e){}}
 function stopAudio(){try{document.querySelectorAll("audio").forEach(function(s){s.pause();s.currentTime=0;});}catch(e){}}
 function formatTime(s){if(s<=0)return"Expired";var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60,t="";if(d>0)t+=d+"d ";if(h>0)t+=h+"h ";if(m>0)t+=m+"m ";t+=sec+"s";return t.trim();}
 function startTimer(){if(timerInterval)clearInterval(timerInterval);timerInterval=setInterval(function(){if(timeLeft>0){timeLeft--;var el=document.getElementById("time-remaining");if(el)el.innerText=formatTime(timeLeft);}else{clearInterval(timerInterval);checkStatus();}},1000);}
@@ -4328,10 +4869,10 @@ function checkInternet(){var img=new Image();var now=new Date().getTime();img.sr
 function checkStatus(){fetch(apiUrl+"?action=status").then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(d=>{if(d.mac){var a=document.getElementById("info-mac");if(a)a.innerText=d.mac;}if(d.ip){var b=document.getElementById("info-ip");if(b)b.innerText=d.ip;}var loading=document.getElementById("loading");if(loading)loading.style.display="none";if(d.authenticated==="true"){document.getElementById("login-section").style.display="none";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="block";timeLeft=parseInt(d.time_remaining);document.getElementById("time-remaining").innerText=formatTime(timeLeft);if(d.mac)document.getElementById("client-mac").innerText=d.mac;startTimer();checkInternet();setTimeout(checkStatus,5000);}else if(d.authenticated==="paused"){document.getElementById("login-section").style.display="none";document.getElementById("connected-section").style.display="none";document.getElementById("resume-section").style.display="block";document.getElementById("paused-time").innerText=formatTime(d.time_remaining);if(timerInterval)clearInterval(timerInterval);setTimeout(checkStatus,10000);}else{document.getElementById("login-section").style.display="block";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="none";if(timerInterval)clearInterval(timerInterval);}}).catch(()=>{var loading=document.getElementById("loading");if(loading)loading.style.display="none";document.getElementById("login-section").style.display="block";});}
 function pauseTime(){if(!confirm("Pause Internet? You can resume later."))return;fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d=>{if(d.status==="paused"){alert("Internet Paused. Time saved: "+formatTime(d.remaining));checkStatus();}else{alert("Error: "+(d.error||"Failed to pause"));}}).catch(()=>{});}
 function resumeTime(){fetch(apiUrl+"?action=resume").then(r=>r.json()).then(d=>{if(d.status==="resumed")checkStatus();else alert("Error: "+(d.error||"Failed to resume"));}).catch(()=>{});}
-function startCoin(){fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(()=>{document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
-function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{closeModal();if(d.status==="connected"){checkStatus();if(d.redirect_url)setTimeout(()=>{window.location.href=d.redirect_url;},2000);}else{alert(d.error||"Connection failed");}}).catch(()=>{alert("Failed to connect. Please try again.");});}
+function startCoin(){fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(d=>{if(d.status==="busy"){alert(d.message||"SOMEONE IS PAYING, WAIT FOR YOUR TURN");return;}if(typeof d.lock_expiry==="number")lockExpiry=d.lock_expiry;updateLockCountdown();if(lockTicker)clearInterval(lockTicker);lockTicker=setInterval(updateLockCountdown,250);document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{if(d.status==="busy"){alert(d.message||"SOMEONE IS PAYING, WAIT FOR YOUR TURN");closeModal();return;}if(typeof d.lock_expiry==="number")lockExpiry=d.lock_expiry;updateLockCountdown();document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
+function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{if(d.status==="busy"){closeModal();alert(d.message||"SOMEONE IS PAYING, WAIT FOR YOUR TURN");return;}if(d.status==="connected"){closeModal();checkStatus();if(d.redirect_url)setTimeout(()=>{window.location.href=d.redirect_url;},2000);}else{closeModal();alert(d.error||"Connection failed");}}).catch(()=>{closeModal();alert("Failed to connect. Please try again.");});}
 function logout(){fetch(apiUrl+"?action=logout").then(r=>r.json()).then(()=>checkStatus()).catch(()=>checkStatus());}
-function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);stopAudio();}
+function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);if(lockTicker){clearInterval(lockTicker);lockTicker=null;}lockExpiry=0;updateLockCountdown();stopAudio();fetch(apiUrl+"?action=cancel_coin");}
 setTimeout(function(){fetch(apiUrl+"?action=test_dns").then(r=>r.json()).then(()=>{}).catch(()=>{});},3000);
 checkStatus();
 </script>
@@ -4433,6 +4974,7 @@ button:active{transform:scale(0.99)}
       <div><b>Coins</b><span id="coin-count">0</span></div>
       <div><b>Minutes</b><span id="coin-time">0</span></div>
     </div>
+    <p class="sub" style="margin-top:-2px;">Coinslot Lock Timeout: <span id="coin-lock-remaining">--</span></p>
     <button id="connect-btn" onclick="playAudio('connect'); connect()" class="primary" style="display:none;">START INTERNET</button>
     <button onclick="closeModal()" class="link">Cancel</button>
   </div>
@@ -4451,11 +4993,12 @@ button:active{transform:scale(0.99)}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;
+var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;var lockExpiry=0;var lockTicker;
+function updateLockCountdown(){var el=document.getElementById("coin-lock-remaining");if(!el)return;if(!lockExpiry||lockExpiry<=0){el.innerText="--";return;}var now=Math.floor(Date.now()/1000);var rem=lockExpiry-now;if(rem<0)rem=0;el.innerText=rem+"s";if(rem===0){if(lockTicker){clearInterval(lockTicker);lockTicker=null;}if(interval){clearInterval(interval);interval=null;}var m=document.getElementById("coin-modal");if(m)m.style.display="none";lockExpiry=0;fetch(apiUrl+"?action=cancel_coin").catch(function(){});}}
 function openRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="block";loadRates();}
 function closeRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="none";}
 function loadRates(){fetch(apiUrl+"?action=rates").then(r=>r.json()).then(function(d){var el=document.getElementById("rates-body");if(!el)return;if(!d||!d.rates||!d.rates.length){el.innerHTML="<div>No rates set.</div>";return;}var html="<div style='display:grid; gap:8px; margin-top:10px;'>";d.rates.forEach(function(x){html+="<div style='display:flex; justify-content:space-between; padding:10px; border-radius:14px; background: rgba(15,23,42,0.04); border:1px solid rgba(15,23,42,0.08);'><div style='font-weight:900;'>₱"+x.amount+"</div><div>"+x.minutes+" min</div></div>";});html+="</div>";el.innerHTML=html;}).catch(function(){var el=document.getElementById("rates-body");if(el)el.innerHTML="<div>Failed to load rates.</div>";});}
-function playAudio(t){try{stopAudio();var a=document.getElementById("audio-"+t);if(a){a.currentTime=0;a.play().catch(()=>{});}}catch(e){}}
+function playAudio(t){try{stopAudio();var a=document.getElementById("audio-"+t);var f=function(){try{var AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;if(!window.__pwAudioCtx)window.__pwAudioCtx=new AC();var c=window.__pwAudioCtx;if(c.state==="suspended")c.resume().catch(function(){});var n=c.currentTime;var q=(t==="connect")?660:880;var d=(t==="connect")?0.22:0.28;var o=c.createOscillator();var g=c.createGain();o.type="sine";o.frequency.setValueAtTime(q,n);g.gain.setValueAtTime(0,n);if(t==="connect"){g.gain.linearRampToValueAtTime(0.25,n+0.02);g.gain.linearRampToValueAtTime(0,n+d);}else{g.gain.linearRampToValueAtTime(0.25,n+0.01);g.gain.linearRampToValueAtTime(0,n+0.08);g.gain.setValueAtTime(0,n+0.12);g.gain.linearRampToValueAtTime(0.25,n+0.13);g.gain.linearRampToValueAtTime(0,n+0.21);}o.connect(g);g.connect(c.destination);o.start(n);o.stop(n+d);}catch(e){}};if(a){a.currentTime=0;var p=a.play();if(p&&p.catch)p.catch(f);}else{f();}}catch(e){}}
 function stopAudio(){try{document.querySelectorAll("audio").forEach(function(s){s.pause();s.currentTime=0;});}catch(e){}}
 function formatTime(s){if(s<=0)return"Expired";var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60,t="";if(d>0)t+=d+"d ";if(h>0)t+=h+"h ";if(m>0)t+=m+"m ";t+=sec+"s";return t.trim();}
 function startTimer(){if(timerInterval)clearInterval(timerInterval);timerInterval=setInterval(function(){if(timeLeft>0){timeLeft--;var el=document.getElementById("time-remaining");if(el)el.innerText=formatTime(timeLeft);}else{clearInterval(timerInterval);checkStatus();}},1000);}
@@ -4463,10 +5006,10 @@ function checkInternet(){var img=new Image();var now=new Date().getTime();img.sr
 function checkStatus(){fetch(apiUrl+"?action=status").then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(d=>{if(d.mac){var a=document.getElementById("info-mac");if(a)a.innerText=d.mac;}if(d.ip){var b=document.getElementById("info-ip");if(b)b.innerText=d.ip;}var loading=document.getElementById("loading");if(loading)loading.style.display="none";if(d.authenticated==="true"){document.getElementById("login-section").style.display="none";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="block";timeLeft=parseInt(d.time_remaining);document.getElementById("time-remaining").innerText=formatTime(timeLeft);if(d.mac)document.getElementById("client-mac").innerText=d.mac;startTimer();checkInternet();setTimeout(checkStatus,5000);}else if(d.authenticated==="paused"){document.getElementById("login-section").style.display="none";document.getElementById("connected-section").style.display="none";document.getElementById("resume-section").style.display="block";document.getElementById("paused-time").innerText=formatTime(d.time_remaining);if(timerInterval)clearInterval(timerInterval);setTimeout(checkStatus,10000);}else{document.getElementById("login-section").style.display="block";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="none";if(timerInterval)clearInterval(timerInterval);}}).catch(()=>{var loading=document.getElementById("loading");if(loading)loading.style.display="none";document.getElementById("login-section").style.display="block";});}
 function pauseTime(){if(!confirm("Pause Internet? You can resume later."))return;fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d=>{if(d.status==="paused"){alert("Internet Paused. Time saved: "+formatTime(d.remaining));checkStatus();}else{alert("Error: "+(d.error||"Failed to pause"));}}).catch(()=>{});}
 function resumeTime(){fetch(apiUrl+"?action=resume").then(r=>r.json()).then(d=>{if(d.status==="resumed")checkStatus();else alert("Error: "+(d.error||"Failed to resume"));}).catch(()=>{});}
-function startCoin(){fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(()=>{document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
-function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{closeModal();if(d.status==="connected"){checkStatus();if(d.redirect_url)setTimeout(()=>{window.location.href=d.redirect_url;},2000);}else{alert(d.error||"Connection failed");}}).catch(()=>{alert("Failed to connect. Please try again.");});}
+function startCoin(){fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(d=>{if(d.status==="busy"){alert(d.message||"SOMEONE IS PAYING, WAIT FOR YOUR TURN");return;}if(typeof d.lock_expiry==="number")lockExpiry=d.lock_expiry;updateLockCountdown();if(lockTicker)clearInterval(lockTicker);lockTicker=setInterval(updateLockCountdown,250);document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{if(d.status==="busy"){alert(d.message||"SOMEONE IS PAYING, WAIT FOR YOUR TURN");closeModal();return;}if(typeof d.lock_expiry==="number")lockExpiry=d.lock_expiry;updateLockCountdown();document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
+function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{if(d.status==="busy"){closeModal();alert(d.message||"SOMEONE IS PAYING, WAIT FOR YOUR TURN");return;}if(d.status==="connected"){closeModal();checkStatus();if(d.redirect_url)setTimeout(()=>{window.location.href=d.redirect_url;},2000);}else{closeModal();alert(d.error||"Connection failed");}}).catch(()=>{closeModal();alert("Failed to connect. Please try again.");});}
 function logout(){fetch(apiUrl+"?action=logout").then(r=>r.json()).then(()=>checkStatus()).catch(()=>checkStatus());}
-function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);stopAudio();}
+function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);if(lockTicker){clearInterval(lockTicker);lockTicker=null;}lockExpiry=0;updateLockCountdown();stopAudio();fetch(apiUrl+"?action=cancel_coin");}
 setTimeout(function(){fetch(apiUrl+"?action=test_dns").then(r=>r.json()).then(()=>{}).catch(()=>{});},3000);
 checkStatus();
 </script>
