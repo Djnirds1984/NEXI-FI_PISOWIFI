@@ -1,7 +1,8 @@
 #!/bin/sh
 
 # FIX SYNC FUNCTIONALITY - Single file solution
-echo "=== FIXING SYNC FUNCTIONALITY ==="
+APP_VERSION="NEXI-FI V1"
+echo "=== FIXING SYNC FUNCTIONALITY ($APP_VERSION) ==="
 echo "Fixing centralized key detection for sync..."
 
 # Get current directory
@@ -99,6 +100,79 @@ if [ -n "$SYNC_START" ]; then
                  echo '{"status":"error","message":"Sync script not found. Please reinstall device sync functionality."}'
              fi
              exit 0
+
+        elif [ "$ACTION" = "sync_get_interval" ]; then
+             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+             MIN="$($UCI_BIN -q get pisowifi.license.auto_sync_minutes 2>/dev/null)"
+             [ -z "$MIN" ] && MIN="30"
+             case "$MIN" in
+                 ''|*[!0-9]*) MIN="30" ;;
+             esac
+             echo "Content-type: application/json"
+             echo ""
+             echo "{\"status\":\"success\",\"minutes\":$MIN}"
+             exit 0
+
+        elif [ "$ACTION" = "sync_set_interval" ]; then
+             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+             MIN="$(get_post_var "minutes")"
+             case "$MIN" in
+                 ''|*[!0-9]*) MIN="" ;;
+             esac
+             if [ -z "$MIN" ]; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Invalid minutes value"}'
+                 exit 0
+             fi
+
+             CRON_EXPR=""
+             if [ "$MIN" = "0" ]; then
+                 CRON_EXPR=""
+             else
+                 case "$MIN" in
+                     15) CRON_EXPR="*/15 * * * *" ;;
+                     30) CRON_EXPR="*/30 * * * *" ;;
+                     60) CRON_EXPR="0 * * * *" ;;
+                     120) CRON_EXPR="0 */2 * * *" ;;
+                     360) CRON_EXPR="0 */6 * * *" ;;
+                     720) CRON_EXPR="0 */12 * * *" ;;
+                     1440) CRON_EXPR="0 0 * * *" ;;
+                     *) CRON_EXPR="" ;;
+                 esac
+             fi
+
+             if [ "$MIN" != "0" ] && [ -z "$CRON_EXPR" ]; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Unsupported interval. Use 0, 15, 30, 60, 120, 360, 720, or 1440."}'
+                 exit 0
+             fi
+
+             $UCI_BIN set pisowifi.license.auto_sync_minutes="$MIN" 2>/dev/null || true
+             $UCI_BIN commit pisowifi 2>/dev/null || true
+
+             CRON_FILE="/etc/crontabs/root"
+             [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
+             TMP_CRON="/tmp/pisowifi_cron_root_$$"
+             if [ -f "$CRON_FILE" ]; then
+                 $CAT "$CRON_FILE" | $GREP -v "pisowifi_auto_sync" > "$TMP_CRON" 2>/dev/null
+             else
+                 $CAT /dev/null > "$TMP_CRON" 2>/dev/null
+             fi
+
+             if [ "$MIN" != "0" ]; then
+                 echo "$CRON_EXPR sh /usr/bin/wifi_devices_sync_auto.sh >/tmp/pisowifi_auto_sync.log 2>&1 # pisowifi_auto_sync" >> "$TMP_CRON"
+             fi
+
+             mv "$TMP_CRON" "$CRON_FILE" 2>/dev/null || true
+             chmod 600 "$CRON_FILE" 2>/dev/null || true
+             [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
+
+             echo "Content-type: application/json"
+             echo ""
+             echo "{\"status\":\"success\",\"minutes\":$MIN}"
+             exit 0
 EOF
     
     # Add everything after sync function
@@ -179,6 +253,79 @@ else
                  echo ""
                  echo '{"status":"error","message":"Sync script not found. Please reinstall device sync functionality."}'
              fi
+             exit 0
+
+        elif [ "$ACTION" = "sync_get_interval" ]; then
+             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+             MIN="$($UCI_BIN -q get pisowifi.license.auto_sync_minutes 2>/dev/null)"
+             [ -z "$MIN" ] && MIN="30"
+             case "$MIN" in
+                 ''|*[!0-9]*) MIN="30" ;;
+             esac
+             echo "Content-type: application/json"
+             echo ""
+             echo "{\"status\":\"success\",\"minutes\":$MIN}"
+             exit 0
+
+        elif [ "$ACTION" = "sync_set_interval" ]; then
+             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+             MIN="$(get_post_var "minutes")"
+             case "$MIN" in
+                 ''|*[!0-9]*) MIN="" ;;
+             esac
+             if [ -z "$MIN" ]; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Invalid minutes value"}'
+                 exit 0
+             fi
+
+             CRON_EXPR=""
+             if [ "$MIN" = "0" ]; then
+                 CRON_EXPR=""
+             else
+                 case "$MIN" in
+                     15) CRON_EXPR="*/15 * * * *" ;;
+                     30) CRON_EXPR="*/30 * * * *" ;;
+                     60) CRON_EXPR="0 * * * *" ;;
+                     120) CRON_EXPR="0 */2 * * *" ;;
+                     360) CRON_EXPR="0 */6 * * *" ;;
+                     720) CRON_EXPR="0 */12 * * *" ;;
+                     1440) CRON_EXPR="0 0 * * *" ;;
+                     *) CRON_EXPR="" ;;
+                 esac
+             fi
+
+             if [ "$MIN" != "0" ] && [ -z "$CRON_EXPR" ]; then
+                 echo "Content-type: application/json"
+                 echo ""
+                 echo '{"status":"error","message":"Unsupported interval. Use 0, 15, 30, 60, 120, 360, 720, or 1440."}'
+                 exit 0
+             fi
+
+             $UCI_BIN set pisowifi.license.auto_sync_minutes="$MIN" 2>/dev/null || true
+             $UCI_BIN commit pisowifi 2>/dev/null || true
+
+             CRON_FILE="/etc/crontabs/root"
+             [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
+             TMP_CRON="/tmp/pisowifi_cron_root_$$"
+             if [ -f "$CRON_FILE" ]; then
+                 $CAT "$CRON_FILE" | $GREP -v "pisowifi_auto_sync" > "$TMP_CRON" 2>/dev/null
+             else
+                 $CAT /dev/null > "$TMP_CRON" 2>/dev/null
+             fi
+
+             if [ "$MIN" != "0" ]; then
+                 echo "$CRON_EXPR sh /usr/bin/wifi_devices_sync_auto.sh >/tmp/pisowifi_auto_sync.log 2>&1 # pisowifi_auto_sync" >> "$TMP_CRON"
+             fi
+
+             mv "$TMP_CRON" "$CRON_FILE" 2>/dev/null || true
+             chmod 600 "$CRON_FILE" 2>/dev/null || true
+             [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
+
+             echo "Content-type: application/json"
+             echo ""
+             echo "{\"status\":\"success\",\"minutes\":$MIN}"
              exit 0
 EOF
         
@@ -410,17 +557,66 @@ fi
 SYNC_TOTAL=0
 SYNC_UPDATED=0
 SYNC_INSERTED=0
+LEASE_FILES="/tmp/dhcp.leases /tmp/dnsmasq.leases /var/dhcp.leases"
 while IFS='|' read -r MAC IP DEV SSTART SEND; do
     [ -z "$MAC" ] && continue
     SYNC_TOTAL=$((SYNC_TOTAL + 1))
-    MAC_ESC="$(printf '%s' "$MAC" | sed 's/"/\\"/g')"
+    MAC_UP="$(printf '%s' "$MAC" | tr 'a-z' 'A-Z')"
+    MAC_ESC="$(printf '%s' "$MAC_UP" | sed 's/"/\\"/g')"
     IP_ESC="$(printf '%s' "$IP" | sed 's/"/\\"/g')"
     DEV_ESC="$(printf '%s' "$DEV" | sed 's/"/\\"/g')"
+    END_TS=0
+    PAUSED_TS=0
+    SESSION_ROW="$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)"
+    END_TS="$(printf '%s' "$SESSION_ROW" | cut -d'|' -f1)"
+    PAUSED_TS="$(printf '%s' "$SESSION_ROW" | cut -d'|' -f2)"
+    [ -z "$END_TS" ] && END_TS=0
+    [ -z "$PAUSED_TS" ] && PAUSED_TS=0
     REM=0
-    if [ -n "$SEND" ] && [ "$SEND" -gt "$NOW_EPOCH" ] 2>/dev/null; then
-        REM=$((SEND - NOW_EPOCH))
+    if [ "$PAUSED_TS" -gt 0 ] 2>/dev/null; then
+        REM="$PAUSED_TS"
+    elif [ "$END_TS" -gt "$NOW_EPOCH" ] 2>/dev/null; then
+        REM=$((END_TS - NOW_EPOCH))
     fi
-    BODY="{\"vendor_id\":\"$VENDOR_ID\",\"machine_id\":\"$MACHINE_ID\",\"mac_address\":\"$MAC_ESC\",\"ip_address\":\"$IP_ESC\",\"device_name\":\"$DEV_ESC\",\"remaining_seconds\":$REM,\"last_heartbeat\":\"$NOW_ISO\",\"last_sync_attempt\":\"$NOW_ISO\",\"sync_status\":\"success\",\"is_connected\":true}"
+
+    IS_CONN_JSON=false
+    for lf in $LEASE_FILES; do
+        if [ -f "$lf" ]; then
+            LEASE_INFO="$(grep -i "$MAC_UP" "$lf" 2>/dev/null | head -n1)"
+            if [ -n "$LEASE_INFO" ]; then
+                set -- $LEASE_INFO
+                LEASE_IP="$3"
+                LEASE_NAME="$4"
+                [ -n "$LEASE_IP" ] && IP_ESC="$(printf '%s' "$LEASE_IP" | sed 's/"/\\"/g')"
+                if [ -n "$LEASE_NAME" ] && [ "$LEASE_NAME" != "*" ]; then
+                    DEV_ESC="$(printf '%s' "$LEASE_NAME" | sed 's/"/\\"/g')"
+                fi
+                IS_CONN_JSON=true
+                break
+            fi
+        fi
+    done
+    if [ "$IS_CONN_JSON" = "false" ] && command -v iw >/dev/null 2>&1; then
+        for ifc in $(iw dev 2>/dev/null | awk '/Interface/ {print $2}'); do
+            iw dev "$ifc" station dump 2>/dev/null | grep -qi "$MAC_UP" && IS_CONN_JSON=true && break
+        done
+    fi
+    if [ "$IS_CONN_JSON" = "false" ] && [ -f /proc/net/arp ]; then
+        ARP_LINE="$(grep -i "$MAC_UP" /proc/net/arp 2>/dev/null | head -n1)"
+        if [ -n "$ARP_LINE" ]; then
+            ARP_IP="$(echo "$ARP_LINE" | awk '{print $1}')"
+            [ -n "$ARP_IP" ] && IP_ESC="$(printf '%s' "$ARP_IP" | sed 's/"/\\"/g')"
+            IS_CONN_JSON=true
+        fi
+    fi
+
+    TOKEN="$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_token FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null | head -n1)"
+    TOKEN_ESC="$(printf '%s' "$TOKEN" | sed 's/\"/\\\"/g')"
+    BODY="{\"vendor_id\":\"$VENDOR_ID\",\"machine_id\":\"$MACHINE_ID\",\"mac_address\":\"$MAC_ESC\",\"ip_address\":\"$IP_ESC\",\"device_name\":\"$DEV_ESC\",\"remaining_seconds\":$REM"
+    if [ -n "$TOKEN_ESC" ]; then
+        BODY="$BODY,\"session_token\":\"$TOKEN_ESC\""
+    fi
+    BODY="$BODY,\"last_heartbeat\":\"$NOW_ISO\",\"last_sync_attempt\":\"$NOW_ISO\",\"sync_status\":\"success\",\"is_connected\":$IS_CONN_JSON}"
     T="/tmp/wifi_devices_sync_resp.$$"
     CODE="$(curl -sS -o "$T" -w "%{http_code}" --connect-timeout 8 --max-time 15 \
         -H "apikey: $SUPA_KEY" -H "Authorization: Bearer $SUPA_KEY" -H "Accept: application/json" \
@@ -491,6 +687,20 @@ if ! grep -q "sync-all-btn" "$CGI_FILE"; then
         print "        echo \"<div style=\\\"margin-bottom:16px;\\\">\""
         print "        echo \"<p style=\\\"color:#64748b; font-size:14px; margin-bottom:8px;\\\">Devices are automatically saved when they connect to the network. Online devices show green status.</p>\""
         print "        echo \"<button id=\\\"sync-all-btn\\\" class=\\\"btn btn-primary\\\" style=\\\"background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); border:none; padding:8px 16px; border-radius:6px; color:white; cursor:pointer;\\\">Sync All Devices</button>\""
+        print "        echo \"<div style=\\\"margin-top:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;\\\">\""
+        print "        echo \"<label style=\\\"font-size:13px; color:#475569;\\\">Auto Sync</label>\""
+        print "        echo \"<select id=\\\"auto-sync-select\\\" style=\\\"padding:6px 10px; border:1px solid #cbd5e1; border-radius:6px;\\\">\""
+        print "        echo \"  <option value=\\\"0\\\">Disabled</option>\""
+        print "        echo \"  <option value=\\\"15\\\">Every 15 minutes</option>\""
+        print "        echo \"  <option value=\\\"30\\\">Every 30 minutes</option>\""
+        print "        echo \"  <option value=\\\"60\\\">Every 1 hour</option>\""
+        print "        echo \"  <option value=\\\"120\\\">Every 2 hours</option>\""
+        print "        echo \"  <option value=\\\"360\\\">Every 6 hours</option>\""
+        print "        echo \"  <option value=\\\"720\\\">Every 12 hours</option>\""
+        print "        echo \"  <option value=\\\"1440\\\">Every 24 hours</option>\""
+        print "        echo \"</select>\""
+        print "        echo \"<button id=\\\"auto-sync-save\\\" class=\\\"btn btn-secondary\\\" style=\\\"padding:6px 12px; border-radius:6px; border:1px solid #cbd5e1; background:#f8fafc; cursor:pointer;\\\">Save</button>\""
+        print "        echo \"</div>\""
         print "        echo \"</div>\""
         next
     }
@@ -503,6 +713,36 @@ if ! grep -q "sync-all-btn" "$CGI_FILE"; then
     echo "✅ Sync All button added"
 else
     echo "✅ Sync All button already exists"
+fi
+
+echo "Adding Auto Sync selector to device manager..."
+if grep -q "sync-all-btn" "$CGI_FILE" && ! grep -q "auto-sync-select" "$CGI_FILE"; then
+    awk '
+    /id=\\"sync-all-btn\\"/ {
+        print
+        print "        echo \"<div style=\\\"margin-top:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;\\\">\""
+        print "        echo \"<label style=\\\"font-size:13px; color:#475569;\\\">Auto Sync</label>\""
+        print "        echo \"<select id=\\\"auto-sync-select\\\" style=\\\"padding:6px 10px; border:1px solid #cbd5e1; border-radius:6px;\\\">\""
+        print "        echo \"  <option value=\\\"0\\\">Disabled</option>\""
+        print "        echo \"  <option value=\\\"15\\\">Every 15 minutes</option>\""
+        print "        echo \"  <option value=\\\"30\\\">Every 30 minutes</option>\""
+        print "        echo \"  <option value=\\\"60\\\">Every 1 hour</option>\""
+        print "        echo \"  <option value=\\\"120\\\">Every 2 hours</option>\""
+        print "        echo \"  <option value=\\\"360\\\">Every 6 hours</option>\""
+        print "        echo \"  <option value=\\\"720\\\">Every 12 hours</option>\""
+        print "        echo \"  <option value=\\\"1440\\\">Every 24 hours</option>\""
+        print "        echo \"</select>\""
+        print "        echo \"<button id=\\\"auto-sync-save\\\" class=\\\"btn btn-secondary\\\" style=\\\"padding:6px 12px; border-radius:6px; border:1px solid #cbd5e1; background:#f8fafc; cursor:pointer;\\\">Save</button>\""
+        print "        echo \"</div>\""
+        next
+    }
+    { print }
+    ' "$CGI_FILE" > "$TEMP_FILE"
+    mv "$TEMP_FILE" "$CGI_FILE"
+    chmod +x "$CGI_FILE"
+    echo "✅ Auto Sync selector added"
+else
+    echo "✅ Auto Sync selector already exists"
 fi
 
 # Add JavaScript for sync functionality if not exists
@@ -559,6 +799,170 @@ if ! grep -q "sync-all-btn.*addEventListener" "$CGI_FILE"; then
     echo "✅ Sync JavaScript added"
 else
     echo "✅ Sync JavaScript already exists"
+fi
+
+echo "Hardening Sync All JSON handling..."
+if grep -q "echo \"  \\.then(response => response\\.json())\"" "$CGI_FILE" 2>/dev/null; then
+    sed -i 's/echo \"  \\.then(response => response\\.json())\"/echo \"  .then(response => response.text())\"/g' "$CGI_FILE" 2>/dev/null || true
+    if ! grep -q "JSON.parse(text)" "$CGI_FILE" 2>/dev/null; then
+        sed -i '/echo \"  \\.then(response => response\\.text())\"/a\        echo \"  .then(function(text){ var data; try { data = JSON.parse(text); } catch(e){ throw new Error(text.slice(0,120)); } return data; })\"' "$CGI_FILE" 2>/dev/null || true
+    fi
+fi
+if ! grep -q "credentials:" "$CGI_FILE" 2>/dev/null; then
+    sed -i '/echo \"    method: \\\\\"POST\\\\\",\\\"/a\        echo \"    credentials: \\\\\"same-origin\\\\\",\\\"' "$CGI_FILE" 2>/dev/null || true
+    sed -i '/echo \"    method: '\\''POST'\\''\",/a\        echo \"    credentials: '\\''same-origin'\\''\",' "$CGI_FILE" 2>/dev/null || true
+fi
+
+echo "Updating Device Manager status/time columns..."
+if grep -q "<th>Status</th>" "$CGI_FILE" && ! grep -q "<th>Session Time</th>" "$CGI_FILE"; then
+    awk '
+    /echo "<table><tr><th>Hostname<\/th><th>IP<\/th><th>MAC<\/th><th>Token<\/th><th>Status<\/th><th>Notes<\/th><th>Actions<\/th><\/tr>"/ {
+        print "        echo \"<table><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Token</th><th>Online</th><th>Session Time</th><th>Notes</th><th>Actions</th></tr>\""
+        next
+    }
+    { print }
+    ' "$CGI_FILE" > "$TEMP_FILE"
+    mv "$TEMP_FILE" "$CGI_FILE"
+    chmod +x "$CGI_FILE"
+    echo "✅ Columns updated"
+else
+    echo "✅ Columns already updated"
+fi
+
+echo "Updating Device Manager session timer logic..."
+if grep -q "# Use current IP if device is connected" "$CGI_FILE" && ! grep -q "SESSION_TEXT=" "$CGI_FILE"; then
+    sed -i '/# Use current IP if device is connected/ i\
+            ONLINE_STATUS="Offline"\
+            ONLINE_COLOR="#6b7280"\
+            if [ "$IS_CONNECTED" = "1" ]; then\
+                ONLINE_STATUS="Online"\
+                ONLINE_COLOR="#22c55e"\
+            fi\
+            SESSION_SECS=0\
+            SESSION_PAUSED=0\
+            if [ "$PAUSED_TS" -gt 0 ]; then\
+                SESSION_SECS="$PAUSED_TS"\
+                SESSION_PAUSED=1\
+            elif [ "$END_TS" -gt "$NOW" ]; then\
+                SESSION_SECS=$((END_TS - NOW))\
+            fi\
+            SH=$((SESSION_SECS / 3600))\
+            SM=$(((SESSION_SECS % 3600) / 60))\
+            SS=$((SESSION_SECS % 60))\
+            SESSION_TEXT=$(printf "%02d:%02d:%02d" "$SH" "$SM" "$SS")\
+' "$CGI_FILE"
+    echo "✅ Session variables added"
+else
+    echo "✅ Session variables already exist"
+fi
+
+echo "Adding Session Token display to Device Manager..."
+if grep -q "<th>MAC</th><th>Online</th>" "$CGI_FILE" && ! grep -q "<th>Token</th>" "$CGI_FILE"; then
+    sed -i 's/<th>MAC<\/th><th>Online<\/th>/<th>MAC<\/th><th>Token<\/th><th>Online<\/th>/' "$CGI_FILE"
+fi
+if grep -q 'EM=$(esc "$MAC_UP")' "$CGI_FILE" && ! grep -q 'ETOKEN=' "$CGI_FILE"; then
+    sed -i '/EM=$(esc "\$MAC_UP")/a\
+            TOKEN=$(sqlite3 "$DB_FILE" "SELECT session_token FROM users WHERE mac='\''$MAC_UP'\'' LIMIT 1;" 2>/dev/null)\
+            [ -z "$TOKEN" ] && TOKEN="None"\
+            ETOKEN=$(esc "$TOKEN")\
+' "$CGI_FILE"
+fi
+if grep -q "session-timer" "$CGI_FILE" && grep -q "ONLINE_STATUS" "$CGI_FILE" && ! grep -q "\\$ETOKEN" "$CGI_FILE"; then
+    sed -i 's|<td>\$EM</td><td><span style='\''color:\$ONLINE_COLOR; font-weight:600;'\''>\$ONLINE_STATUS</span>|<td>\$EM</td><td style='\''font-size:11px; color:#64748b;'\''>\$ETOKEN</td><td><span style='\''color:\$ONLINE_COLOR; font-weight:600;'\''>\$ONLINE_STATUS</span>|' "$CGI_FILE"
+fi
+echo "✅ Token column updated"
+
+if grep -q "STATUS_COLOR" "$CGI_FILE" && grep -q "font-weight:600" "$CGI_FILE" && ! grep -q "session-timer" "$CGI_FILE"; then
+    sed -i '/STATUS_COLOR; font-weight:600.*\$STATUS<\/span><\/td><td>\$EN<\/td><td>"/c\            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td style='\''font-size:11px; color:#64748b;'\''>$ETOKEN</td><td><span style='\''color:$ONLINE_COLOR; font-weight:600;'\''>$ONLINE_STATUS</span></td><td><span class='\''session-timer'\'' data-remaining='\''$SESSION_SECS'\'' data-paused='\''$SESSION_PAUSED'\'' style='\''font-weight:600;'\''>$SESSION_TEXT</span></td><td>$EN</td><td>"' "$CGI_FILE"
+    echo "✅ Row output updated"
+else
+    echo "✅ Row output already updated"
+fi
+
+echo "Adding Session Time animation..."
+if ! grep -q "session-timer" "$CGI_FILE" || ! grep -q "setInterval" "$CGI_FILE" || ! grep -q "data-remaining" "$CGI_FILE"; then
+    if grep -q "setInterval(t,1000)" "$CGI_FILE" 2>/dev/null; then
+        echo "✅ Session Time animation already exists"
+    else
+        sed -i '/elif \[ "\$TAB" = "sales" \]; then/i\
+        echo "<script>"\
+        echo "(function(){function f(s){s=Math.max(0,parseInt(s||0,10));var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;var hh=(h<10?\"0\":\"\")+h,mm=(m<10?\"0\":\"\")+m,sc=(ss<10?\"0\":\"\")+ss;return hh+\":\"+mm+\":\"+sc;}function t(){var els=document.querySelectorAll(\".session-timer\");for(var i=0;i<els.length;i++){var el=els[i];var p=(el.getAttribute(\"data-paused\")===\"1\");var r=parseInt(el.getAttribute(\"data-remaining\")||\"0\",10);if(!p&&r>0){r=r-1;el.setAttribute(\"data-remaining\",String(r));}el.textContent=f(r);}}t();setInterval(t,1000);})();"\
+        echo "</script>"\
+' "$CGI_FILE"
+        echo "✅ Session Time animation added"
+    fi
+fi
+
+echo "Adding auto sync JavaScript..."
+if grep -q "auto-sync-select" "$CGI_FILE" && ! grep -q "action=sync_set_interval&minutes=" "$CGI_FILE"; then
+    sed -i '/elif \[ "\$TAB" = "sales" \]; then/i\
+        echo "<script>"\
+        echo "(function(){function post(b){return fetch(\"/cgi-bin/admin\",{method:\"POST\",headers:{\"Content-Type\":\"application/x-www-form-urlencoded\"},body:b});}var sel=document.getElementById(\"auto-sync-select\");var save=document.getElementById(\"auto-sync-save\");if(!sel||!save){return;}post(\"action=sync_get_interval\").then(function(r){return r.json();}).then(function(d){if(d&&d.minutes!==undefined){sel.value=String(d.minutes);}}).catch(function(){});save.addEventListener(\"click\",function(){var m=sel.value;save.disabled=true;post(\"action=sync_set_interval&minutes=\"+encodeURIComponent(m)).then(function(r){return r.json();}).then(function(d){alert(((d.status===\"success\")?\"✅ \":\"❌ \")+(d.message||(\"Auto Sync set to \"+m+\" minutes\")));}).catch(function(e){alert(\"❌ Auto Sync failed: \"+e);}).then(function(){save.disabled=false;});});})();"\
+        echo "</script>"\
+' "$CGI_FILE"
+    echo "✅ Auto Sync JavaScript added"
+else
+    echo "✅ Auto Sync JavaScript already exists"
+fi
+
+echo "Configuring auto sync schedule..."
+UCI_BIN_LOCAL="$(command -v uci 2>/dev/null || echo /sbin/uci)"
+CUR_AUTO_MIN="$($UCI_BIN_LOCAL -q get pisowifi.license.auto_sync_minutes 2>/dev/null)"
+AUTO_MIN="$CUR_AUTO_MIN"
+[ -z "$AUTO_MIN" ] && AUTO_MIN="30"
+if [ "$AUTO_MIN" = "60" ]; then
+    AUTO_MIN="30"
+fi
+case "$AUTO_MIN" in
+    ''|*[!0-9]*) AUTO_MIN="30" ;;
+esac
+if [ -z "$CUR_AUTO_MIN" ] || [ "$CUR_AUTO_MIN" = "60" ]; then
+    $UCI_BIN_LOCAL set pisowifi.license.auto_sync_minutes="$AUTO_MIN" 2>/dev/null || true
+    $UCI_BIN_LOCAL commit pisowifi 2>/dev/null || true
+fi
+CRON_EXPR=""
+if [ "$AUTO_MIN" = "0" ]; then
+    CRON_EXPR=""
+else
+    case "$AUTO_MIN" in
+        15) CRON_EXPR="*/15 * * * *" ;;
+        30) CRON_EXPR="*/30 * * * *" ;;
+        60) CRON_EXPR="0 * * * *" ;;
+        120) CRON_EXPR="0 */2 * * *" ;;
+        360) CRON_EXPR="0 */6 * * *" ;;
+        720) CRON_EXPR="0 */12 * * *" ;;
+        1440) CRON_EXPR="0 0 * * *" ;;
+        *) CRON_EXPR="0 * * * *" ;;
+    esac
+fi
+[ -d /etc/crontabs ] || mkdir -p /etc/crontabs
+CRON_FILE="/etc/crontabs/root"
+TMP_CRON="/tmp/pisowifi_cron_root_fix_$$"
+if [ -f "$CRON_FILE" ]; then
+    grep -v "pisowifi_auto_sync" "$CRON_FILE" > "$TMP_CRON" 2>/dev/null
+else
+    : > "$TMP_CRON" 2>/dev/null || true
+fi
+if [ "$AUTO_MIN" != "0" ]; then
+    echo "$CRON_EXPR sh /usr/bin/wifi_devices_sync_auto.sh >/tmp/pisowifi_auto_sync.log 2>&1 # pisowifi_auto_sync" >> "$TMP_CRON"
+fi
+mv "$TMP_CRON" "$CRON_FILE" 2>/dev/null || true
+chmod 600 "$CRON_FILE" 2>/dev/null || true
+[ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
+echo "✅ Auto Sync schedule configured ($AUTO_MIN minutes)"
+
+echo "Fixing admin CGI exec format..."
+if [ -f "$CGI_FILE" ]; then
+    sed -i 's/\r$//' "$CGI_FILE" 2>/dev/null || true
+    FIRST_LINE="$(head -n 1 "$CGI_FILE" 2>/dev/null | tr -d '\r')"
+    if [ "$FIRST_LINE" != "#!/bin/sh" ]; then
+        TMP_ADMIN="/tmp/admin_fix_exec_$$"
+        echo '#!/bin/sh' > "$TMP_ADMIN"
+        cat "$CGI_FILE" >> "$TMP_ADMIN"
+        mv "$TMP_ADMIN" "$CGI_FILE"
+        sed -i 's/\r$//' "$CGI_FILE" 2>/dev/null || true
+    fi
+    chmod +x "$CGI_FILE" 2>/dev/null || true
 fi
 
 echo ""

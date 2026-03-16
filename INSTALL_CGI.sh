@@ -1,6 +1,7 @@
 #!/bin/sh
 
-echo "=== INSTALLING PISOWIFI (CGI VERSION) ==="
+APP_VERSION="NEXI-FI V1"
+echo "=== INSTALLING PISOWIFI (CGI VERSION) [$APP_VERSION] ==="
 
 # 1. Ensure Firewall Script is Present
 # Force overwrite to ensure fixes are applied
@@ -612,6 +613,7 @@ cat << 'EOF' | sqlite3 $DB_FILE
 CREATE TABLE IF NOT EXISTS users (
     mac TEXT PRIMARY KEY,
     ip TEXT,
+    session_token TEXT,
     session_start INTEGER,
     session_end INTEGER,
     coins_inserted INTEGER DEFAULT 0,
@@ -670,6 +672,8 @@ sqlite3 $DB_FILE "INSERT INTO rates (amount, minutes) SELECT 1, 12 WHERE NOT EXI
 # Attempt to add paused_time column to existing installations (ignore error if exists)
 # This is done OUTSIDE the heredoc block because it is a shell command
 sqlite3 $DB_FILE "ALTER TABLE users ADD COLUMN paused_time INTEGER DEFAULT 0;" 2>/dev/null || true
+sqlite3 $DB_FILE "ALTER TABLE users ADD COLUMN session_token TEXT;" 2>/dev/null || true
+sqlite3 $DB_FILE "CREATE INDEX IF NOT EXISTS idx_users_session_token ON users(session_token);" 2>/dev/null || true
 
 # Ensure database is writable by everyone (so CGI and Button scripts can both access it)
 chmod 666 $DB_FILE
@@ -783,7 +787,7 @@ FIREWALL_SCRIPT="/usr/bin/pisowifi_nftables.sh"
 if [ ! -f "$DB_FILE" ]; then
     echo "Warning: Database not found at $DB_FILE, creating default database" >&2
     # Create minimal database schema
-    sqlite3 $DB_FILE "CREATE TABLE IF NOT EXISTS users (mac TEXT PRIMARY KEY, ip TEXT, session_end INTEGER, coins_inserted INTEGER DEFAULT 0);"
+    sqlite3 $DB_FILE "CREATE TABLE IF NOT EXISTS users (mac TEXT PRIMARY KEY, ip TEXT, session_token TEXT, session_end INTEGER, coins_inserted INTEGER DEFAULT 0);"
     sqlite3 $DB_FILE "CREATE TABLE IF NOT EXISTS coins (id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT, coins INTEGER, timestamp INTEGER DEFAULT (strftime('%s', 'now')));"
 fi
 chmod 666 $DB_FILE
@@ -804,8 +808,10 @@ update_user_session() {
     local ip="$2"
     local session_end="$3"
     local coins="$4"
+    local token="$5"
     
-    query_db "INSERT OR REPLACE INTO users (mac, ip, session_end, coins_inserted) VALUES ('$mac', '$ip', $session_end, $coins)"
+    sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, coins_inserted, session_token) VALUES ('$mac', '$ip', $session_end, $coins, '$token');" 2>/dev/null \
+    || sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, coins_inserted) VALUES ('$mac', '$ip', $session_end, $coins);" 2>/dev/null || true
 }
 
 insert_coin_record() {
@@ -895,9 +901,8 @@ get_client_mac() {
 handle_api() {
     MAC=$(get_client_mac)
     
-    # Extract SID from Query String
-    SID=$(echo "$QUERY_STRING" | grep -o "sid=[^&]*" | cut -d= -f2 | sed 's/%3A/:/g' | sed 's/%2D/-/g')
-    [ -z "$SID" ] && SID="UNKNOWN"
+    SID=$(echo "$QUERY_STRING" | grep -o "sid=[^&]*" | cut -d= -f2 | sed 's/%3A/:/g; s/%2D/-/g; s/%2d/-/g')
+    [ "$SID" = "UNKNOWN" ] && SID=""
     
     # Supabase Config for Roaming
     SUPA_URL=$(uci get pisowifi.supabase.url 2>/dev/null)
@@ -910,6 +915,18 @@ handle_api() {
     json_response() {
         echo "$1"
         exit 0
+    }
+
+    gen_sid() {
+        if [ -r /proc/sys/kernel/random/uuid ]; then
+            echo "SID-$(cat /proc/sys/kernel/random/uuid | tr -d '\r\n')"
+            return
+        fi
+        if [ -r /dev/urandom ] && command -v hexdump >/dev/null 2>&1; then
+            echo "SID-$(hexdump -n 16 -e '16/1 \"%02x\"' /dev/urandom 2>/dev/null)-$(date +%s)"
+            return
+        fi
+        echo "SID-$(date +%s)-$$"
     }
     
     case "$QUERY_STRING" in
@@ -925,49 +942,64 @@ handle_api() {
             # logger -t pisowifi "Status check - MAC: $MAC, IP: $REMOTE_ADDR"
             
             if [ -n "$MAC" ]; then
-                # Check database for active session
-                # Fetch both expiry and paused_time
-                RESULT=$(sqlite3 $DB_FILE "SELECT session_end, paused_time FROM users WHERE mac='$MAC' LIMIT 1")
-                EXPIRY=$(echo "$RESULT" | cut -d'|' -f1)
-                PAUSED_TIME=$(echo "$RESULT" | cut -d'|' -f2)
-                
-                [ -z "$EXPIRY" ] && EXPIRY=0
-                [ -z "$PAUSED_TIME" ] && PAUSED_TIME=0
-                
                 NOW=$(date +%s)
-                
-                # Check if paused time exists (higher priority than expired session)
-                if [ "$PAUSED_TIME" -gt 0 ]; then
+                TOKEN_FOUND=0
+                if [ -n "$SID" ]; then
+                    TOKEN_ROW=$(sqlite3 $DB_FILE "SELECT mac, session_end, paused_time FROM users WHERE session_token='$SID' LIMIT 1" 2>/dev/null)
+                    TOKEN_MAC=$(echo "$TOKEN_ROW" | cut -d'|' -f1)
+                    TOKEN_EXPIRY=$(echo "$TOKEN_ROW" | cut -d'|' -f2)
+                    TOKEN_PAUSED=$(echo "$TOKEN_ROW" | cut -d'|' -f3)
+                    [ -z "$TOKEN_EXPIRY" ] && TOKEN_EXPIRY=0
+                    [ -z "$TOKEN_PAUSED" ] && TOKEN_PAUSED=0
+                    if [ -n "$TOKEN_MAC" ]; then
+                        TOKEN_FOUND=1
+                        if [ "$TOKEN_MAC" != "$MAC" ]; then
+                            sqlite3 $DB_FILE "DELETE FROM users WHERE mac='$MAC' AND session_token!='$SID';" 2>/dev/null || true
+                            sqlite3 $DB_FILE "UPDATE users SET mac='$MAC', ip='$REMOTE_ADDR' WHERE session_token='$SID';" 2>/dev/null || true
+                        else
+                            sqlite3 $DB_FILE "UPDATE users SET ip='$REMOTE_ADDR' WHERE session_token='$SID';" 2>/dev/null || true
+                        fi
+                        EXPIRY="$TOKEN_EXPIRY"
+                        PAUSED_TIME="$TOKEN_PAUSED"
+                    fi
+                fi
+
+                if [ "$TOKEN_FOUND" = "0" ]; then
+                    RESULT=$(sqlite3 $DB_FILE "SELECT session_end, paused_time FROM users WHERE mac='$MAC' LIMIT 1" 2>/dev/null)
+                    EXPIRY=$(echo "$RESULT" | cut -d'|' -f1)
+                    PAUSED_TIME=$(echo "$RESULT" | cut -d'|' -f2)
+                    [ -z "$EXPIRY" ] && EXPIRY=0
+                    [ -z "$PAUSED_TIME" ] && PAUSED_TIME=0
+                    if [ -n "$SID" ] && { [ "$PAUSED_TIME" -gt 0 ] 2>/dev/null || [ "$EXPIRY" -gt "$NOW" ] 2>/dev/null; }; then
+                        sqlite3 $DB_FILE "UPDATE users SET session_token='$SID' WHERE mac='$MAC' AND (session_token IS NULL OR session_token='');" 2>/dev/null || true
+                    fi
+                fi
+
+                if [ "$PAUSED_TIME" -gt 0 ] 2>/dev/null; then
                     AUTH="paused"
                     TIME_REMAINING=$PAUSED_TIME
-                    # logger -t pisowifi "User $MAC is PAUSED. Remaining: $PAUSED_TIME"
-                elif [ "$EXPIRY" -gt "$NOW" ]; then
+                elif [ "$EXPIRY" -gt "$NOW" ] 2>/dev/null; then
                     AUTH="true"
                     TIME_REMAINING=$((EXPIRY - NOW))
-                    # logger -t pisowifi "User $MAC authenticated, time remaining: $TIME_REMAINING"
                 else
-                    # Local check failed, check Supabase for roaming session
-                    if [ -n "$SUPA_URL" ] && [ "$SID" != "UNKNOWN" ]; then
-                        # Try to find a persistent session bound to this MAC and SID
-                        supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=remaining_seconds,connected_at,is_paused&mac=eq.$MAC&session_uuid=eq.$SID&limit=1"
+                    if [ -n "$SUPA_URL" ] && [ -n "$SID" ]; then
+                        supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=remaining_seconds,connected_at,is_paused&session_uuid=eq.$SID&limit=1"
                         if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
-                            # Session found in Supabase!
                             REM_SEC=$(echo "$SUPA_BODY" | grep -o '"remaining_seconds":[0-9]*' | cut -d: -f2)
-                            CONN_AT=$(echo "$SUPA_BODY" | grep -o '"connected_at":[0-9]*' | cut -d: -f2)
                             IS_PAUSED=$(echo "$SUPA_BODY" | grep -o '"is_paused":[^,}]*' | cut -d: -f2)
-                            
+                            [ -z "$REM_SEC" ] && REM_SEC=0
                             if [ "$IS_PAUSED" = "true" ]; then
                                 AUTH="paused"
                                 TIME_REMAINING=$REM_SEC
-                                query_db "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time) VALUES ('$MAC', '$REMOTE_ADDR', 0, $REM_SEC)"
-                                logger -t pisowifi "Roaming session synced (PAUSED) for MAC: $MAC SID: $SID"
-                            elif [ "$REM_SEC" -gt 0 ]; then
+                                sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time, session_token) VALUES ('$MAC', '$REMOTE_ADDR', 0, $REM_SEC, '$SID');" 2>/dev/null \
+                                || sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time) VALUES ('$MAC', '$REMOTE_ADDR', 0, $REM_SEC);" 2>/dev/null || true
+                            elif [ "$REM_SEC" -gt 0 ] 2>/dev/null; then
                                 NEW_EXPIRY=$((NOW + REM_SEC))
                                 AUTH="true"
                                 TIME_REMAINING=$REM_SEC
-                                query_db "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time) VALUES ('$MAC', '$REMOTE_ADDR', $NEW_EXPIRY, 0)"
+                                sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time, session_token) VALUES ('$MAC', '$REMOTE_ADDR', $NEW_EXPIRY, 0, '$SID');" 2>/dev/null \
+                                || sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time) VALUES ('$MAC', '$REMOTE_ADDR', $NEW_EXPIRY, 0);" 2>/dev/null || true
                                 $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
-                                logger -t pisowifi "Roaming session synced (ACTIVE) for MAC: $MAC SID: $SID"
                             fi
                         fi
                     fi
@@ -1025,30 +1057,22 @@ handle_api() {
                 NEW_EXPIRY=$((EXPIRY + (ADDED_MINUTES * 60)))
                 
                 # Update user session in database
-                update_user_session "$MAC" "$REMOTE_ADDR" $NEW_EXPIRY $COUNT
+                [ -z "$SID" ] && SID="$(gen_sid)"
+                update_user_session "$MAC" "$REMOTE_ADDR" $NEW_EXPIRY $COUNT "$SID"
                 
                 # Sync to Supabase for Roaming
-                if [ -n "$SUPA_URL" ] && [ "$SID" != "UNKNOWN" ]; then
+                if [ -n "$SUPA_URL" ] && [ -n "$SID" ]; then
                     REM_SEC=$((NEW_EXPIRY - NOW))
                     # Check if session exists in Supabase
-                    supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=id&mac=eq.$MAC&limit=1"
+                    supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=id&session_uuid=eq.$SID&limit=1"
                     if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
                         # Update existing
-                        SID_BODY="{\"remaining_seconds\": $REM_SEC, \"session_uuid\": \"$SID\", \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
-                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$MAC" "$SID_BODY"
+                        SID_BODY="{\"mac\": \"$MAC\", \"remaining_seconds\": $REM_SEC, \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?session_uuid=eq.$SID" "$SID_BODY"
                     else
                         # Insert new
                         SID_BODY="{\"mac\": \"$MAC\", \"remaining_seconds\": $REM_SEC, \"session_uuid\": \"$SID\", \"connected_at\": $NOW, \"is_paused\": false}"
                         supa_insert "$SUPA_URL" "$SUPA_KEY" "sessions" "$SID_BODY"
-                    fi
-                    
-                    # Also sync to wifi_devices for tracking
-                    DEV_BODY="{\"mac_address\": \"$MAC\", \"session_token\": \"$SID\", \"remaining_seconds\": $REM_SEC, \"last_heartbeat\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
-                    supa_request "$SUPA_URL" "$SUPA_KEY" "wifi_devices?select=id&mac_address=eq.$MAC&limit=1"
-                    if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
-                        supa_patch "$SUPA_URL" "$SUPA_KEY" "wifi_devices?mac_address=eq.$MAC" "$DEV_BODY"
-                    else
-                        supa_insert "$SUPA_URL" "$SUPA_KEY" "wifi_devices" "$DEV_BODY"
                     fi
                 fi
                 
@@ -1056,30 +1080,38 @@ handle_api() {
                 $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
                 logger -t pisowifi "User $MAC connected successfully. Time added: $ADDED_MINUTES mins. New Expiry: $NEW_EXPIRY"
                 
-                json_response "{\"status\": \"connected\", \"expiry\": $NEW_EXPIRY, \"redirect_url\": \"https://www.google.com\"}"
+                json_response "{\"status\": \"connected\", \"expiry\": $NEW_EXPIRY, \"sid\": \"$SID\", \"redirect_url\": \"https://www.google.com\"}"
             else
                 json_response "{\"error\": \"No coins\"}"
             fi
             ;;
             
         "action=pause"*)
-            # Get current expiry
-            EXPIRY=$(get_user_session "$MAC")
+            TARGET_MAC="$MAC"
+            if [ -n "$SID" ]; then
+                TM=$(sqlite3 $DB_FILE "SELECT mac FROM users WHERE session_token='$SID' LIMIT 1" 2>/dev/null)
+                [ -n "$TM" ] && TARGET_MAC="$TM"
+            fi
+            EXPIRY=$(get_user_session "$TARGET_MAC")
             NOW=$(date +%s)
             
             if [ -n "$EXPIRY" ] && [ "$EXPIRY" -gt "$NOW" ]; then
                 REMAINING=$((EXPIRY - NOW))
                 # Save remaining time, clear session end
-                query_db "UPDATE users SET paused_time=$REMAINING, session_end=0 WHERE mac='$MAC'"
+                query_db "UPDATE users SET paused_time=$REMAINING, session_end=0 WHERE mac='$TARGET_MAC'"
                 
                 # Sync to Supabase
                 if [ -n "$SUPA_URL" ]; then
                     SID_BODY="{\"remaining_seconds\": $REMAINING, \"is_paused\": true, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
-                    supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$MAC" "$SID_BODY"
+                    if [ -n "$SID" ]; then
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?session_uuid=eq.$SID" "$SID_BODY"
+                    else
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
+                    fi
                 fi
                 
                 # Cut internet
-                $FIREWALL_SCRIPT deny "$MAC"
+                $FIREWALL_SCRIPT deny "$TARGET_MAC"
                 json_response "{\"status\": \"paused\", \"remaining\": $REMAINING}"
             else
                 json_response "{\"error\": \"No active session to pause\"}"
@@ -1087,24 +1119,32 @@ handle_api() {
             ;;
 
         "action=resume"*)
-            # Get paused time
-            PAUSED=$(query_db "SELECT paused_time FROM users WHERE mac='$MAC'")
+            TARGET_MAC="$MAC"
+            if [ -n "$SID" ]; then
+                TM=$(sqlite3 $DB_FILE "SELECT mac FROM users WHERE session_token='$SID' LIMIT 1" 2>/dev/null)
+                [ -n "$TM" ] && TARGET_MAC="$TM"
+            fi
+            PAUSED=$(query_db "SELECT paused_time FROM users WHERE mac='$TARGET_MAC'")
             [ -z "$PAUSED" ] && PAUSED=0
             
             if [ "$PAUSED" -gt 0 ]; then
                 NOW=$(date +%s)
                 NEW_END=$((NOW + PAUSED))
                 # Restore session, clear paused time
-                query_db "UPDATE users SET session_end=$NEW_END, paused_time=0 WHERE mac='$MAC'"
+                query_db "UPDATE users SET session_end=$NEW_END, paused_time=0 WHERE mac='$TARGET_MAC'"
                 
                 # Sync to Supabase
                 if [ -n "$SUPA_URL" ]; then
                     SID_BODY="{\"remaining_seconds\": $PAUSED, \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
-                    supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$MAC" "$SID_BODY"
+                    if [ -n "$SID" ]; then
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?session_uuid=eq.$SID" "$SID_BODY"
+                    else
+                        supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
+                    fi
                 fi
                 
                 # Restore internet
-                $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
+                $FIREWALL_SCRIPT allow "$TARGET_MAC" "$REMOTE_ADDR"
                 json_response "{\"status\": \"resumed\", \"expiry\": $NEW_END}"
             else
                 json_response "{\"error\": \"No paused session found\"}"
@@ -1112,14 +1152,23 @@ handle_api() {
             ;;
 
         "action=logout"*)
-            $FIREWALL_SCRIPT deny "$MAC"
+            TARGET_MAC="$MAC"
+            if [ -n "$SID" ]; then
+                TM=$(sqlite3 $DB_FILE "SELECT mac FROM users WHERE session_token='$SID' LIMIT 1" 2>/dev/null)
+                [ -n "$TM" ] && TARGET_MAC="$TM"
+            fi
+            $FIREWALL_SCRIPT deny "$TARGET_MAC"
             # Remove user session from database
-            query_db "UPDATE users SET session_end=0, paused_time=0 WHERE mac='$MAC'"
+            query_db "UPDATE users SET session_end=0, paused_time=0 WHERE mac='$TARGET_MAC'"
             
             # Sync to Supabase
             if [ -n "$SUPA_URL" ]; then
                 SID_BODY="{\"remaining_seconds\": 0, \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
-                supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$MAC" "$SID_BODY"
+                if [ -n "$SID" ]; then
+                    supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?session_uuid=eq.$SID" "$SID_BODY"
+                else
+                    supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
+                fi
             fi
             
             json_response "{\"status\": \"success\"}"
@@ -1191,7 +1240,7 @@ else
 <html>
 <head>
 <meta charset="UTF-8">
-<title>PisoWifi Portal</title>
+<title>NEXI-FI PISOWIFI - V1</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body { font-family: sans-serif; text-align: center; padding: 20px; background: #f4f4f4; background-image: url('/bg.jpg'); background-size: cover; background-position: center; min-height: 100vh; }
@@ -1208,7 +1257,7 @@ button:active { transform: scale(0.98); }
 <body>
 
 <div class="container">
-    <h1>NEXI-FI PISOWIFI</h1>
+    <h1>NEXI-FI PISOWIFI <span style="font-size:14px; color:#64748b;">V1</span></h1>
     <div id="loading">Loading...</div>
     
     <!-- Permanent Device Info -->
@@ -1280,24 +1329,33 @@ var interval;
 var timerInterval;
 var timeLeft = 0;
 
-// Persistent Session ID (1 year)
 function getSessionId() {
     var sid = localStorage.getItem('pisowifi_sid');
     var expiry = localStorage.getItem('pisowifi_sid_expiry');
-    var now = new Date().getTime();
-    
-    if (!sid || !expiry || now > parseInt(expiry)) {
-        // Generate new SID
-        sid = 'SID-' + Math.random().toString(36).substr(2, 9) + '-' + now;
-        var oneYear = 365 * 24 * 60 * 60 * 1000;
-        localStorage.setItem('pisowifi_sid', sid);
-        localStorage.setItem('pisowifi_sid_expiry', (now + oneYear).toString());
+    var now = Date.now();
+    if (!sid || !expiry) return "";
+    if (now > parseInt(expiry)) {
+        localStorage.removeItem('pisowifi_sid');
+        localStorage.removeItem('pisowifi_sid_expiry');
+        return "";
     }
     return sid;
 }
 
+function generateSessionId() {
+    return 'SID-' + Math.random().toString(36).substr(2, 9) + '-' + Date.now();
+}
+
+function saveSessionId(sid) {
+    var now = Date.now();
+    var oneYear = 365 * 24 * 60 * 60 * 1000;
+    localStorage.setItem('pisowifi_sid', sid);
+    localStorage.setItem('pisowifi_sid_expiry', (now + oneYear).toString());
+}
+
 function getSidParam() {
-    return "&sid=" + encodeURIComponent(getSessionId());
+    var sid = getSessionId();
+    return sid ? ("&sid=" + encodeURIComponent(sid)) : "";
 }
 
 function openRates() {
@@ -1523,12 +1581,17 @@ function connect() {
     // Stop Insert Coin Audio immediately
     stopAudio();
     playAudio('connect');
-    
-    fetch(apiUrl + "?action=connect" + getSidParam())
+
+    var existingSid = getSessionId();
+    var candidateSid = existingSid || generateSessionId();
+    var sidParam = "&sid=" + encodeURIComponent(candidateSid);
+
+    fetch(apiUrl + "?action=connect" + sidParam)
     .then(r => r.json())
     .then(data => {
         closeModal();
         if (data.status === "connected") {
+            if (!existingSid) saveSessionId(data.sid || candidateSid);
             checkStatus();
             if (data.redirect_url) {
                 setTimeout(() => {
@@ -2685,7 +2748,7 @@ echo "Content-type: text/html; charset=utf-8"
 echo ""
 
 # HTML Start
-echo "<!DOCTYPE html><html><head><title>NEXI-FI Admin Dashboard</title><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
+echo "<!DOCTYPE html><html><head><title>NEXI-FI Admin Dashboard - V1</title><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
 echo "<style>"
 echo "  :root { --primary: #2563eb; --secondary: #64748b; --success: #22c55e; --danger: #ef4444; --bg: #f1f5f9; --sidebar-bg: #1e293b; --sidebar-text: #e2e8f0; }"
 echo "  body { font-family: 'Inter', sans-serif; background: var(--bg); color: #1e293b; margin: 0; padding: 0; display: flex; min-height: 100vh; }"
@@ -2717,7 +2780,7 @@ echo "</style></head><body>"
 
 # Render Sidebar
 echo "<div class='sidebar'>"
-echo "  <h2>NEXI-FI ADMIN</h2>"
+echo "  <h2>NEXI-FI ADMIN <span style='font-size:12px; opacity:.85;'>V1</span></h2>"
 echo "  <nav>"
 if [ "$LIC_VALID" = "1" ]; then
     echo "    <a href='?tab=dashboard' class='nav-link $([ "$TAB" = "dashboard" ] && echo "active")'>Dashboard</a>"
@@ -2998,18 +3061,27 @@ echo "<div class='main-content'><div class='container'>"
         }
 
         NOW=$($DATE +%s)
-        LEASE_FILE="/tmp/dhcp.leases"
-        [ -f /var/dhcp.leases ] && LEASE_FILE="/var/dhcp.leases"
+        LEASE_FILES="/tmp/dhcp.leases /tmp/dnsmasq.leases /var/dhcp.leases"
+        LEASE_FILE=""
+        for lf in $LEASE_FILES; do
+            if [ -f "$lf" ] && $GREP -q '.' "$lf" 2>/dev/null; then
+                LEASE_FILE="$lf"
+                break
+            fi
+        done
 
         # Function to get hostname by IP
         get_hostname_by_ip() {
             local ip="$1"
             local hostname=""
             # Try to get from DHCP leases first
-            if [ -f "$LEASE_FILE" ]; then
-                hostname=$($GREP "$ip" "$LEASE_FILE" 2>/dev/null | $HEAD -1 | $AWK '{print $4}' 2>/dev/null)
-                [ "$hostname" = "*" ] && hostname=""
-            fi
+            for lf in $LEASE_FILES; do
+                if [ -f "$lf" ]; then
+                    hostname=$($GREP "$ip" "$lf" 2>/dev/null | $HEAD -1 | $AWK '{print $4}' 2>/dev/null)
+                    [ "$hostname" = "*" ] && hostname=""
+                    [ -n "$hostname" ] && break
+                fi
+            done
             # If not found, try reverse DNS lookup
             if [ -z "$hostname" ]; then
                 hostname=$(nslookup "$ip" 2>/dev/null | $GREP "name =" | $HEAD -1 | $AWK -F'=' '{print $2}' | $SED 's/\.$//' 2>/dev/null)
@@ -3107,7 +3179,7 @@ echo "<div class='main-content'><div class='container'>"
         echo "<p style='color:#64748b; font-size:14px; margin-bottom:8px;'>Devices are automatically saved when they connect to the network. Online devices show green status.</p>"
         echo "<button id='sync-all-btn' class='btn btn-primary' style='background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); border:none; padding:8px 16px; border-radius:6px; color:white; cursor:pointer;'>Sync All Devices</button>"
         echo "</div>"
-        echo "<table><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Status</th><th>Notes</th><th>Actions</th></tr>"
+        echo "<table><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Token</th><th>Status</th><th>Notes</th><th>Actions</th></tr>"
         
         # Display all devices with connection status
         sqlite3 -separator '|' "$DB_FILE" "SELECT mac, ip, hostname, notes FROM devices ORDER BY updated_at DESC;" 2>/dev/null | while IFS='|' read MACADDR IPADDR HOSTNAME NOTES; do
@@ -3117,20 +3189,38 @@ echo "<div class='main-content'><div class='container'>"
             # Check if device is currently connected (has valid lease)
             IS_CONNECTED=0
             CURRENT_IP=""
-            if [ -f "$LEASE_FILE" ]; then
-                LEASE_INFO=$($GREP -i "$MAC_UP" "$LEASE_FILE" 2>/dev/null | $HEAD -1)
-                if [ -n "$LEASE_INFO" ]; then
+            for lf in $LEASE_FILES; do
+                if [ -f "$lf" ]; then
+                    LEASE_INFO=$($GREP -i "$MAC_UP" "$lf" 2>/dev/null | $HEAD -1)
+                    if [ -n "$LEASE_INFO" ]; then
+                        IS_CONNECTED=1
+                        CURRENT_IP=$(echo "$LEASE_INFO" | $AWK '{print $3}' 2>/dev/null)
+                        break
+                    fi
+                fi
+            done
+            if [ "$IS_CONNECTED" = "0" ] && command -v iw >/dev/null 2>&1; then
+                for ifc in $(iw dev 2>/dev/null | $AWK '/Interface/ {print $2}'); do
+                    iw dev "$ifc" station dump 2>/dev/null | $GREP -qi "$MAC_UP" && IS_CONNECTED=1 && break
+                done
+            fi
+            if [ "$IS_CONNECTED" = "0" ] && [ -f /proc/net/arp ]; then
+                ARP_LINE=$($GREP -i "$MAC_UP" /proc/net/arp 2>/dev/null | $HEAD -1)
+                if [ -n "$ARP_LINE" ]; then
                     IS_CONNECTED=1
-                    CURRENT_IP=$(echo "$LEASE_INFO" | $AWK '{print $3}' 2>/dev/null)
+                    ARP_IP=$(echo "$ARP_LINE" | $AWK '{print $1}' 2>/dev/null)
+                    [ -n "$ARP_IP" ] && CURRENT_IP="$ARP_IP"
                 fi
             fi
             
             # Get user session info
-            USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
+            USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time, session_token FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
             END_TS=$(echo "$USER_ROW" | cut -d'|' -f1)
             PAUSED_TS=$(echo "$USER_ROW" | cut -d'|' -f2)
+            TOKEN=$(echo "$USER_ROW" | cut -d'|' -f3)
             [ -z "$END_TS" ] && END_TS=0
             [ -z "$PAUSED_TS" ] && PAUSED_TS=0
+            [ -z "$TOKEN" ] && TOKEN="None"
             
             # Determine status and color
             if [ "$PAUSED_TS" -gt 0 ]; then
@@ -3156,9 +3246,10 @@ echo "<div class='main-content'><div class='container'>"
             [ -z "$EH" ] && EH="(unknown)"
             EIP=$(esc "$DISPLAY_IP")
             EM=$(esc "$MAC_UP")
+            ETOKEN=$(esc "$TOKEN")
             EN=$(esc "$NOTES")
             
-            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td><span style='color:$STATUS_COLOR; font-weight:600;'>$STATUS</span></td><td>$EN</td><td>"
+            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td style='font-size:11px; color:#64748b;'>$ETOKEN</td><td><span style='color:$STATUS_COLOR; font-weight:600;'>$STATUS</span></td><td>$EN</td><td>"
             echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center; margin-bottom:6px;'>"
             echo "    <input type='hidden' name='action' value='update_device'>"
             echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
@@ -3194,10 +3285,16 @@ echo "<div class='main-content'><div class='container'>"
         echo "  "
         echo "  fetch('/cgi-bin/admin', {"
         echo "    method: 'POST',"
+        echo "    credentials: 'same-origin',"
         echo "    headers: {'Content-Type': 'application/x-www-form-urlencoded'},"
         echo "    body: 'action=sync_devices'"
         echo "  })"
-        echo "  .then(response => response.json())"
+        echo "  .then(response => response.text())"
+        echo "  .then(text => {"
+        echo "    var data;"
+        echo "    try { data = JSON.parse(text); } catch(e) { throw new Error(text.slice(0,120)); }"
+        echo "    return data;"
+        echo "  })"
         echo "  .then(data => {"
         echo "    if(data.status === 'success') {"
         echo "      alert('✅ ' + data.message);"
@@ -4644,7 +4741,8 @@ while IFS='|' read -r MAC IP DEV SSTART SEND; do
     [ -z "$MAC" ] && continue
     SYNC_TOTAL=$((SYNC_TOTAL + 1))
 
-    MAC_ESC="$(printf '%s' "$MAC" | sed 's/"/\\"/g')"
+    MAC_UP="$(printf '%s' "$MAC" | tr 'a-z' 'A-Z')"
+    MAC_ESC="$(printf '%s' "$MAC_UP" | sed 's/"/\\"/g')"
     IP_ESC="$(printf '%s' "$IP" | sed 's/"/\\"/g')"
     DEV_ESC="$(printf '%s' "$DEV" | sed 's/"/\\"/g')"
 
@@ -4653,7 +4751,13 @@ while IFS='|' read -r MAC IP DEV SSTART SEND; do
         REM=$((SEND - NOW_EPOCH))
     fi
 
-    BODY="{\"vendor_id\":\"$VENDOR_ID\",\"machine_id\":\"$MACHINE_ID\",\"mac_address\":\"$MAC_ESC\",\"ip_address\":\"$IP_ESC\",\"device_name\":\"$DEV_ESC\",\"remaining_seconds\":$REM,\"last_heartbeat\":\"$NOW_ISO\",\"last_sync_attempt\":\"$NOW_ISO\",\"sync_status\":\"success\",\"is_connected\":true}"
+    TOKEN="$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_token FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null | head -n1)"
+    TOKEN_ESC="$(printf '%s' "$TOKEN" | sed 's/\"/\\\"/g')"
+    BODY="{\"vendor_id\":\"$VENDOR_ID\",\"machine_id\":\"$MACHINE_ID\",\"mac_address\":\"$MAC_ESC\",\"ip_address\":\"$IP_ESC\",\"device_name\":\"$DEV_ESC\",\"remaining_seconds\":$REM"
+    if [ -n "$TOKEN_ESC" ]; then
+        BODY="$BODY,\"session_token\":\"$TOKEN_ESC\""
+    fi
+    BODY="$BODY,\"last_heartbeat\":\"$NOW_ISO\",\"last_sync_attempt\":\"$NOW_ISO\",\"sync_status\":\"success\",\"is_connected\":true}"
 
     T="/tmp/wifi_devices_sync_resp.$$"
     CODE="$(curl -sS -o "$T" -w "%{http_code}" --connect-timeout 8 --max-time 15 \
