@@ -993,15 +993,19 @@ handle_api() {
     }
 
     gen_sid() {
-        if [ -r /proc/sys/kernel/random/uuid ]; then
-            echo "SID-$(cat /proc/sys/kernel/random/uuid | tr -d '\r\n')"
-            return
-        fi
         if [ -r /dev/urandom ] && command -v hexdump >/dev/null 2>&1; then
-            echo "SID-$(hexdump -n 16 -e '16/1 \"%02x\"' /dev/urandom 2>/dev/null)-$(date +%s)"
+            hexdump -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null
             return
         fi
-        echo "SID-$(date +%s)-$$"
+        if [ -r /proc/sys/kernel/random/uuid ]; then
+            cat /proc/sys/kernel/random/uuid | tr -d '\r\n-' | tr 'A-F' 'a-f' | cut -c1-32
+            return
+        fi
+        if command -v md5sum >/dev/null 2>&1; then
+            echo -n "$(date +%s)-$$-${RANDOM:-0}" | md5sum 2>/dev/null | awk '{print $1}' | cut -c1-32
+            return
+        fi
+        echo "$(date +%s)$$${RANDOM:-0}" | tr -cd '0-9' | cut -c1-32
     }
     
     case "$QUERY_STRING" in
@@ -1083,7 +1087,7 @@ handle_api() {
             json_response "{\"authenticated\": \"$AUTH\", \"time_remaining\": $TIME_REMAINING, \"mac\": \"$MAC\", \"ip\": \"$REMOTE_ADDR\"}"
             ;;
             
-        "action=start_coin")
+        "action=start_coin"*)
             # Check if coinslot is available and acquire lock (no timeout)
             [ -z "$SID" ] && SID="$(gen_sid)"
             
@@ -1139,10 +1143,9 @@ handle_api() {
             fi
             ;;
             
-        "action=check_coin")
+        "action=check_coin"*)
             COUNT=$(get_coin_count "$MAC")
             [ -z "$COUNT" ] && COUNT=0
-            logger -t pisowifi "Coin check for $MAC: $COUNT coins"
             MINUTES=$((COUNT * MINUTES_PER_PESO))
             json_response "{\"count\": $COUNT, \"minutes\": $MINUTES}"
             ;;
@@ -1304,7 +1307,7 @@ handle_api() {
             json_response "{\"status\": \"success\"}"
             ;;
             
-        "action=insert_coin")
+        "action=insert_coin"*)
             # Manual coin insertion for testing
             sqlite3 $DB_FILE "INSERT INTO coins (mac, coins) VALUES ('00:00:00:00:00:00', 1)"
             COUNT=$(sqlite3 $DB_FILE "SELECT SUM(coins) FROM coins WHERE mac='00:00:00:00:00:00'")
@@ -1312,7 +1315,7 @@ handle_api() {
             json_response "{\"status\": \"coin_inserted\", \"total\": $COUNT}"
             ;;
             
-        "action=log_internet")
+        "action=log_internet"*)
             # Log client internet status
             STATUS=$(echo "$QUERY_STRING" | grep -o "status=[^&]*" | cut -d= -f2)
             CLIENT_MAC=$(echo "$QUERY_STRING" | grep -o "mac=[^&]*" | cut -d= -f2 | sed 's/%3A/:/g')
@@ -1329,13 +1332,13 @@ handle_api() {
             json_response "{\"status\": \"logged\"}"
             ;;
 
-        "action=rates")
+        "action=rates"*)
             RATES_JSON=$(sqlite3 -separator '|' "$DB_FILE" "SELECT amount, minutes, is_pausable, expiration FROM rates ORDER BY amount ASC;" 2>/dev/null | awk -F'|' 'BEGIN{printf "["} {a=$1+0; m=$2+0; p=($3==""?1:$3)+0; e=($4==""?0:$4)+0; if(NR>1) printf ","; printf "{\"amount\":%d,\"minutes\":%d,\"pausable\":%d,\"expiration\":%d}", a,m,p,e} END{printf "]"}')
             [ -z "$RATES_JSON" ] && RATES_JSON="[]"
             json_response "{\"rates\": $RATES_JSON}"
             ;;
             
-        "action=test_dns")
+        "action=test_dns"*)
             # Test DNS resolution for debugging
             MAC=$(get_client_mac)
             AUTH="false"
@@ -1354,7 +1357,7 @@ handle_api() {
             json_response "{\"authenticated\": \"$AUTH\", \"dns_external\": $DNS_TEST, \"dns_local\": $DNS_LOCAL, \"mac\": \"$MAC\"}"
             ;;
             
-        "action=check_coinslot_lock")
+        "action=check_coinslot_lock"*)
             # Check if coinslot is locked and by whom (no expiration)
             MAC=$(get_client_mac)
 
@@ -1375,7 +1378,7 @@ handle_api() {
             json_response "{\"locked\": true, \"locked_by_me\": false, \"locked_by_mac\": \"$locked_mac\", \"locked_at\": $locked_at, \"mac\": \"$MAC\"}"
             ;;
             
-        "action=acquire_coinslot_lock")
+        "action=acquire_coinslot_lock"*)
             # Try to acquire coinslot lock (no timeout)
             MAC=$(get_client_mac)
             [ -z "$SID" ] && SID="$(gen_sid)"
@@ -1394,7 +1397,7 @@ handle_api() {
             fi
             ;;
             
-        "action=release_coinslot_lock")
+        "action=release_coinslot_lock"*)
             # Release coinslot lock
             MAC=$(get_client_mac)
             release_coinslot_lock "$MAC"
@@ -1870,6 +1873,7 @@ if [ -x "$BB" ]; then
     SED="$BB sed"
     TR="$BB tr"
     CAT="$BB cat"
+    AWK="$BB awk"
     DATE="$BB date"
     LOGGER="$BB logger"
 else
@@ -1879,6 +1883,7 @@ else
     SED="sed"
     TR="tr"
     CAT="cat"
+    AWK="awk"
     DATE="date"
     LOGGER="logger"
 fi
@@ -2971,10 +2976,16 @@ echo "  .btn-primary { background: var(--primary); color: white; }"
 echo "  .btn-danger { background: var(--danger); color: white; }"
 echo "  .chart-container { height: 200px; width: 100%; margin-top: 10px; position: relative; }"
 echo "  canvas { width: 100% !important; height: 100% !important; }"
-echo "  @media (max-width: 768px) { body { flex-direction: column; } .sidebar { width: 100%; padding: 10px; box-sizing: border-box; } .main-content { padding: 15px; } }"
+echo "  .sidebar-toggle { display: none; position: fixed; top: 12px; left: 12px; z-index: 1002; background: var(--sidebar-bg); color: white; border: 0; border-radius: 10px; padding: 10px 12px; font-size: 18px; line-height: 1; }"
+echo "  .sidebar-overlay { display: none; position: fixed; inset: 0; background: rgba(15,23,42,0.45); z-index: 1000; }"
+echo "  body.sidebar-open .sidebar { transform: translateX(0); }"
+echo "  body.sidebar-open .sidebar-overlay { display: block; }"
+echo "  @media (max-width: 768px) { body { display: block; } .sidebar { position: fixed; top: 0; left: 0; height: 100vh; width: 260px; max-width: 85vw; padding: 16px; box-sizing: border-box; transform: translateX(-110%); transition: transform .2s ease; z-index: 1001; overflow-y: auto; } .main-content { padding: 16px; } .sidebar-toggle { display: inline-flex; align-items: center; justify-content: center; } .header { padding-left: 44px; } table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; } th, td { white-space: nowrap; } }"
 echo "</style></head><body>"
 
 # Render Sidebar
+echo "<button class='sidebar-toggle' type='button' onclick='toggleSidebar()' aria-label='Menu'>☰</button>"
+echo "<div id='sidebar-overlay' class='sidebar-overlay' onclick='toggleSidebar(false)'></div>"
 echo "<div class='sidebar'>"
 echo "  <h2>NEXI-FI ADMIN</h2>"
 echo "  <nav>"
@@ -2995,6 +3006,7 @@ echo "  </div>"
 echo "</div>"
 
 echo "<div class='main-content'><div class='container'>"
+echo "<script>function toggleSidebar(force){var open=document.body.classList.contains('sidebar-open');var next=(typeof force==='boolean')?force:!open;if(next){document.body.classList.add('sidebar-open');}else{document.body.classList.remove('sidebar-open');}}window.addEventListener('resize',function(){if(window.innerWidth>768)document.body.classList.remove('sidebar-open');});document.addEventListener('keydown',function(e){if(e.key==='Escape')document.body.classList.remove('sidebar-open');});document.addEventListener('click',function(e){var t=e.target;if(t&&t.classList&&t.classList.contains('nav-link')&&window.innerWidth<=768){document.body.classList.remove('sidebar-open');}});</script>"
 
     if [ "$TAB" = "dashboard" ]; then
         # Dashboard Content

@@ -363,6 +363,43 @@ let lockCleanupInterval;
 
 const $ = (id) => document.getElementById(id);
 
+function genHex32() {
+    if (window.crypto && window.crypto.getRandomValues) {
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    let out = '';
+    for (let i = 0; i < 32; i++) out += Math.floor(Math.random() * 16).toString(16);
+    return out;
+}
+
+function getOrCreateSid() {
+    const key = 'pisowifi_sid_v1';
+    const now = Date.now();
+    try {
+        const raw = localStorage.getItem(key);
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed.sid === 'string' && typeof parsed.exp === 'number' && parsed.exp > now && /^[0-9a-f]{32}$/.test(parsed.sid)) {
+                return parsed.sid;
+            }
+        }
+    } catch (_) {}
+    const sid = genHex32();
+    const exp = now + 365 * 24 * 60 * 60 * 1000;
+    try {
+        localStorage.setItem(key, JSON.stringify({ sid, exp }));
+    } catch (_) {}
+    return sid;
+}
+
+const SID = getOrCreateSid();
+
+function api(params) {
+    return apiUrl + "?" + params + "&sid=" + encodeURIComponent(SID);
+}
+
 function openRates() { $("rates-modal").classList.add("active"); loadRates(); }
 function closeRates() { $("rates-modal").classList.remove("active"); }
 
@@ -402,7 +439,7 @@ function convertMinutesToReadable(min) {
 }
 
 function loadRates() {
-    fetch(apiUrl+"?action=rates")
+    fetch(api("action=rates"))
     .then(r=>r.json())
     .then(d => {
         const el = $("rates-body");
@@ -462,7 +499,7 @@ function checkInternet() {
 }
 
 function checkStatus() {
-    fetch(apiUrl+"?action=status").then(r=>r.json()).then(data => {
+    fetch(api("action=status")).then(r=>r.json()).then(data => {
         // Update all MAC/IP display points
         if(data.mac) {
             $("login-mac").innerText = data.mac;
@@ -503,7 +540,7 @@ function checkStatus() {
 function pauseTime() {
     console.log("[LOCK_DEBUG] pauseTime() called - releasing lock");
     closeConfirm();
-    fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d => {
+    fetch(api("action=pause")).then(r=>r.json()).then(d => {
         if(d.status === "paused") {
             console.log("[LOCK_DEBUG] Session paused, lock should be released");
             checkStatus();
@@ -517,7 +554,7 @@ function pauseTime() {
 }
 
 function resumeTime() {
-    fetch(apiUrl+"?action=resume").then(r=>r.json()).then(d => {
+    fetch(api("action=resume")).then(r=>r.json()).then(d => {
         if(d.status === "resumed") checkStatus();
     });
 }
@@ -539,7 +576,7 @@ function startCoin() {
     });
     
     // Try to acquire lock and start coin session in one atomic operation
-    fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(data => {
+    fetch(api("action=start_coin")).then(r=>r.json()).then(data => {
         const responseTimestamp = new Date().toISOString();
         console.log(`[LOCK_DEBUG] [${responseTimestamp}] [${deviceId}] start_coin response:`, data);
         
@@ -552,7 +589,7 @@ function startCoin() {
             $("connect-btn").style.display = "none";
             if(coinInterval) clearInterval(coinInterval);
             coinInterval = setInterval(() => {
-                fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d => {
+                fetch(api("action=check_coin")).then(r=>r.json()).then(d => {
                     $("coin-count").innerText = d.count;
                     $("coin-time").innerText = d.minutes;
                     if(d.count > 0) $("connect-btn").style.display = "flex";
@@ -628,7 +665,7 @@ function startCoin() {
 
 function connect() {
     playAudio("connect");
-    fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d => {
+    fetch(api("action=connect")).then(r=>r.json()).then(d => {
         closeModal();
         if(d.status === "connected") {
             checkStatus();
@@ -647,7 +684,7 @@ function startLockStatusChecker() {
     if(lockCheckInterval) clearInterval(lockCheckInterval);
     
     lockCheckInterval = setInterval(() => {
-        fetch(apiUrl+"?action=check_coinslot_lock").then(r=>r.json()).then(lockData => {
+        fetch(api("action=check_coinslot_lock")).then(r=>r.json()).then(lockData => {
             const insertCoinBtns = getInsertCoinButtons();
             if(insertCoinBtns.length === 0) return;
             
@@ -689,7 +726,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 function logout() {
     closeConfirm();
-    fetch(apiUrl+"?action=logout").then(r=>r.json()).then(d => {
+    fetch(api("action=logout")).then(r=>r.json()).then(d => {
         checkStatus();
     }).catch(err => {
         console.error("Logout failed:", err);
@@ -706,7 +743,7 @@ function closeModal() {
     if(coinInterval) clearInterval(coinInterval);
     
     // Release coinslot lock when closing modal
-    fetch(apiUrl+"?action=release_coinslot_lock").then(r=>r.json()).then(data => {
+    fetch(api("action=release_coinslot_lock")).then(r=>r.json()).then(data => {
         const releaseTimestamp = new Date().toISOString();
         console.log(`[LOCK_DEBUG] [${releaseTimestamp}] [${deviceId}] Coinslot lock released:`, data);
     }).catch(err => {
@@ -727,7 +764,7 @@ checkStatus();
 // Cleanup on page unload
 window.addEventListener('beforeunload', function() {
     // Try to release any active lock
-    fetch(apiUrl+"?action=release_coinslot_lock", {keepalive: true}).catch(() => {});
+    fetch(api("action=release_coinslot_lock"), {keepalive: true}).catch(() => {});
 });
 </script>
 </body>
