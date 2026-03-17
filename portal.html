@@ -589,7 +589,11 @@ function startCoin() {
             
         } else if(data.error) {
             console.log(`[LOCK_DEBUG] [${responseTimestamp}] [${deviceId}] Error starting coin session: ${data.error}`);
-            alert(data.error + " (Device: " + data.locked_by_mac + ")");
+            if(data.locked_by_mac) {
+                alert(data.error + " (Device: " + data.locked_by_mac + ")");
+            } else {
+                alert(data.error);
+            }
             
             insertCoinBtns.forEach(btn => {
                 btn.disabled = false;

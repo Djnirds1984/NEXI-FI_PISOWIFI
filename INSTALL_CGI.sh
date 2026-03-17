@@ -791,6 +791,8 @@ if [ ! -f "$DB_FILE" ]; then
     sqlite3 $DB_FILE "CREATE TABLE IF NOT EXISTS coinslot_locks (id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT UNIQUE NOT NULL, locked_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), session_token TEXT, created_at INTEGER DEFAULT (strftime('%s', 'now')));"
     sqlite3 $DB_FILE "CREATE INDEX IF NOT EXISTS idx_coinslot_locks_mac ON coinslot_locks(mac);"
 fi
+sqlite3 $DB_FILE "CREATE TABLE IF NOT EXISTS coinslot_locks (id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT UNIQUE NOT NULL, locked_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), session_token TEXT, created_at INTEGER DEFAULT (strftime('%s', 'now')));" 2>/dev/null || true
+sqlite3 $DB_FILE "CREATE INDEX IF NOT EXISTS idx_coinslot_locks_mac ON coinslot_locks(mac);" 2>/dev/null || true
 chmod 666 $DB_FILE
 
 # Database Helper Functions
@@ -831,6 +833,15 @@ get_coinslot_lock() {
 get_active_coinslot_lock() {
     # Get any existing lock (no expiration check)
     local result=$(query_db "SELECT mac, locked_at, session_token FROM coinslot_locks ORDER BY locked_at DESC LIMIT 1")
+    if [ -n "$result" ]; then
+        local locked_mac=$(echo "$result" | cut -d'|' -f1)
+        if ! echo "$locked_mac" | grep -Eq '^([0-9A-F]{2}:){5}[0-9A-F]{2}$'; then
+            logger -t pisowifi "[LOCK_DEBUG] Invalid lock row detected (mac=$locked_mac). Removing."
+            query_db "DELETE FROM coinslot_locks WHERE mac='$locked_mac'"
+            echo ""
+            return
+        fi
+    fi
     echo "$result"
 }
 
@@ -839,18 +850,21 @@ acquire_coinslot_lock() {
     local session_token="$2"
     local now=$(date +%s)
 
-    local owner_mac
-    owner_mac=$(sqlite3 "$DB_FILE" -cmd ".timeout 2000" "BEGIN IMMEDIATE;
+    local sqlite_out rc owner_mac
+    sqlite_out=$(sqlite3 "$DB_FILE" -batch -noheader -cmd ".timeout 2000" "BEGIN IMMEDIATE;
 DELETE FROM coinslot_locks WHERE rowid NOT IN (SELECT rowid FROM coinslot_locks ORDER BY locked_at DESC LIMIT 1);
 INSERT INTO coinslot_locks (mac, locked_at, session_token)
 SELECT '$mac', $now, '$session_token'
 WHERE NOT EXISTS (SELECT 1 FROM coinslot_locks);
 UPDATE coinslot_locks SET locked_at=$now, session_token='$session_token' WHERE mac='$mac';
 SELECT mac FROM coinslot_locks ORDER BY locked_at DESC LIMIT 1;
-COMMIT;" 2>/dev/null | tail -n 1 | tr -d '\r')
+COMMIT;" 2>&1)
+    rc=$?
+    owner_mac=$(printf "%s" "$sqlite_out" | tail -n 1 | tr -d '\r')
 
-    if [ $? -ne 0 ] || [ -z "$owner_mac" ]; then
-        logger -t pisowifi "[LOCK_DEBUG] Failed to acquire lock - sqlite transaction error"
+    if [ $rc -ne 0 ] || [ -z "$owner_mac" ]; then
+        logger -t pisowifi "[LOCK_DEBUG] Failed to acquire lock - sqlite transaction error (rc=$rc)"
+        logger -t pisowifi "[LOCK_DEBUG] sqlite output: $(printf "%s" "$sqlite_out" | tr '\n' ' ' | cut -c1-300)"
         return 1
     fi
 
