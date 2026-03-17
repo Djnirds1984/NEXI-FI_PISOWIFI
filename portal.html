@@ -359,6 +359,7 @@ let coinInterval;
 let timerInterval;
 let timeLeft = 0;
 let pendingAction = null;
+let lockCleanupInterval;
 
 const $ = (id) => document.getElementById(id);
 
@@ -500,9 +501,18 @@ function checkStatus() {
 }
 
 function pauseTime() {
+    console.log("[LOCK_DEBUG] pauseTime() called - releasing lock");
     closeConfirm();
     fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d => {
-        if(d.status === "paused") checkStatus();
+        if(d.status === "paused") {
+            console.log("[LOCK_DEBUG] Session paused, lock should be released");
+            checkStatus();
+        } else {
+            alert(d.error || "Failed to pause session");
+        }
+    }).catch(err => {
+        console.error("[LOCK_DEBUG] Pause failed:", err);
+        alert("Failed to pause session. Please try again.");
     });
 }
 
@@ -512,20 +522,103 @@ function resumeTime() {
     });
 }
 
+function getInsertCoinButtons() {
+    return Array.from(document.querySelectorAll('button[onclick*="startCoin"]'));
+}
+
 function startCoin() {
-    fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(() => {
-        $("coin-modal").classList.add("active");
-        $("coin-count").innerText = "0";
-        $("coin-time").innerText = "0";
-        $("connect-btn").style.display = "none";
-        if(coinInterval) clearInterval(coinInterval);
-        coinInterval = setInterval(() => {
-            fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d => {
-                $("coin-count").innerText = d.count;
-                $("coin-time").innerText = d.minutes;
-                if(d.count > 0) $("connect-btn").style.display = "flex";
+    const timestamp = new Date().toISOString();
+    const deviceId = 'DEV_' + Math.random().toString(36).substr(2, 9);
+    console.log(`[LOCK_DEBUG] [${timestamp}] [${deviceId}] startCoin() called`);
+    
+    const insertCoinBtns = getInsertCoinButtons();
+    insertCoinBtns.forEach(btn => {
+        btn.disabled = true;
+        btn.style.opacity = '0.6';
+        btn.style.cursor = 'not-allowed';
+    });
+    
+    // Try to acquire lock and start coin session in one atomic operation
+    fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(data => {
+        const responseTimestamp = new Date().toISOString();
+        console.log(`[LOCK_DEBUG] [${responseTimestamp}] [${deviceId}] start_coin response:`, data);
+        
+        if(data.status === "started" && data.lock_acquired) {
+            console.log(`[LOCK_DEBUG] [${responseTimestamp}] [${deviceId}] Lock acquired successfully for MAC: ${data.mac || 'unknown'}, showing modal`);
+            // Successfully acquired lock - show modal
+            $("coin-modal").classList.add("active");
+            $("coin-count").innerText = "0";
+            $("coin-time").innerText = "0";
+            $("connect-btn").style.display = "none";
+            if(coinInterval) clearInterval(coinInterval);
+            coinInterval = setInterval(() => {
+                fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d => {
+                    $("coin-count").innerText = d.count;
+                    $("coin-time").innerText = d.minutes;
+                    if(d.count > 0) $("connect-btn").style.display = "flex";
+                });
+            }, 1000);
+            
+            insertCoinBtns.forEach(btn => {
+                btn.disabled = false;
+                btn.style.opacity = '1';
+                btn.style.cursor = 'pointer';
+                btn.title = '';
             });
-        }, 1000);
+            
+        } else if(data.button_disabled === true || (data.error && (data.error.includes("currently in use") || data.error.includes("in use") || data.error.includes("locked by another device")))) {
+            console.log(`[LOCK_DEBUG] [${responseTimestamp}] [${deviceId}] Coinslot locked by another device: ${data.locked_by_mac || 'unknown'}`);
+            insertCoinBtns.forEach(btn => {
+                btn.disabled = true;
+                btn.style.opacity = '0.5';
+                btn.style.cursor = 'not-allowed';
+                btn.title = `Coinslot in use by ${data.locked_by_mac || 'another device'}`;
+            });
+            
+            const errorMsg = `COINSLOT IN USE\n\nAnother device (${data.locked_by_mac || 'unknown'}) is currently using the coinslot.\n\nPlease wait for them to finish before trying again.`;
+            alert(errorMsg);
+            
+            setTimeout(() => {
+                insertCoinBtns.forEach(btn => {
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                    btn.style.cursor = 'pointer';
+                    btn.title = '';
+                });
+            }, 5000);
+            
+        } else if(data.error) {
+            console.log(`[LOCK_DEBUG] [${responseTimestamp}] [${deviceId}] Error starting coin session: ${data.error}`);
+            alert(data.error + " (Device: " + data.locked_by_mac + ")");
+            
+            insertCoinBtns.forEach(btn => {
+                btn.disabled = false;
+                btn.style.opacity = '1';
+                btn.style.cursor = 'pointer';
+                btn.title = '';
+            });
+            
+        } else {
+            console.log(`[LOCK_DEBUG] [${responseTimestamp}] [${deviceId}] Failed to start coin session - unknown error`);
+            alert("Failed to start coin session. Please try again.");
+            
+            insertCoinBtns.forEach(btn => {
+                btn.disabled = false;
+                btn.style.opacity = '1';
+                btn.style.cursor = 'pointer';
+                btn.title = '';
+            });
+        }
+    }).catch(err => {
+        console.error(`[LOCK_DEBUG] [${new Date().toISOString()}] [${deviceId}] Failed to start coin session:`, err);
+        alert("Failed to start coin session. Please refresh the page.");
+        
+        insertCoinBtns.forEach(btn => {
+            btn.disabled = false;
+            btn.style.opacity = '1';
+            btn.style.cursor = 'pointer';
+            btn.title = '';
+        });
     });
 }
 
@@ -533,18 +626,89 @@ function connect() {
     playAudio("connect");
     fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d => {
         closeModal();
-        if(d.status === "connected") checkStatus();
+        if(d.status === "connected") {
+            checkStatus();
+        }
+    }).catch(err => {
+        console.error("Connection failed:", err);
+        alert("Connection failed. Please try again.");
     });
 }
 
+// Periodic lock status checker to freeze/unfreeze button automatically
+let lockCheckInterval = null;
+let currentLockHolder = null;
+
+function startLockStatusChecker() {
+    if(lockCheckInterval) clearInterval(lockCheckInterval);
+    
+    lockCheckInterval = setInterval(() => {
+        fetch(apiUrl+"?action=check_coinslot_lock").then(r=>r.json()).then(lockData => {
+            const insertCoinBtns = getInsertCoinButtons();
+            if(insertCoinBtns.length === 0) return;
+            
+            if(lockData.locked && !lockData.locked_by_me) {
+                if(currentLockHolder !== lockData.locked_by_mac) {
+                    console.log(`[LOCK_DEBUG] Button frozen - coinslot locked by ${lockData.locked_by_mac}`);
+                    currentLockHolder = lockData.locked_by_mac;
+                }
+                
+                insertCoinBtns.forEach(btn => {
+                    btn.disabled = true;
+                    btn.style.opacity = '0.5';
+                    btn.style.cursor = 'not-allowed';
+                    btn.title = `Coinslot in use by ${lockData.locked_by_mac || 'another device'}`;
+                });
+                
+            } else if(!lockData.locked) {
+                if(currentLockHolder !== null) {
+                    console.log('[LOCK_DEBUG] Button unfrozen - coinslot available');
+                    currentLockHolder = null;
+                }
+                
+                insertCoinBtns.forEach(btn => {
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                    btn.style.cursor = 'pointer';
+                    btn.title = '';
+                });
+            }
+        }).catch(err => {
+            console.error('[LOCK_DEBUG] Failed to check lock status:', err);
+        });
+    }, 2000);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    setTimeout(startLockStatusChecker, 1000);
+});
+
 function logout() {
     closeConfirm();
-    fetch(apiUrl+"?action=logout").then(() => checkStatus());
+    fetch(apiUrl+"?action=logout").then(r=>r.json()).then(d => {
+        checkStatus();
+    }).catch(err => {
+        console.error("Logout failed:", err);
+        checkStatus();
+    });
 }
 
 function closeModal() {
+    const timestamp = new Date().toISOString();
+    const deviceId = 'DEV_' + Math.random().toString(36).substr(2, 9);
+    console.log(`[LOCK_DEBUG] [${timestamp}] [${deviceId}] closeModal() called - releasing lock`);
+    
     $("coin-modal").classList.remove("active");
     if(coinInterval) clearInterval(coinInterval);
+    
+    // Release coinslot lock when closing modal
+    fetch(apiUrl+"?action=release_coinslot_lock").then(r=>r.json()).then(data => {
+        const releaseTimestamp = new Date().toISOString();
+        console.log(`[LOCK_DEBUG] [${releaseTimestamp}] [${deviceId}] Coinslot lock released:`, data);
+    }).catch(err => {
+        const errorTimestamp = new Date().toISOString();
+        console.error(`[LOCK_DEBUG] [${errorTimestamp}] [${deviceId}] Failed to release lock:`, err);
+    });
 }
 
 window.onclick = function(event) {
@@ -555,6 +719,12 @@ window.onclick = function(event) {
 }
 
 checkStatus();
+
+// Cleanup on page unload
+window.addEventListener('beforeunload', function() {
+    // Try to release any active lock
+    fetch(apiUrl+"?action=release_coinslot_lock", {keepalive: true}).catch(() => {});
+});
 </script>
 </body>
 </html>

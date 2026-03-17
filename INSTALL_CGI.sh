@@ -788,12 +788,14 @@ if [ ! -f "$DB_FILE" ]; then
     # Create minimal database schema
     sqlite3 $DB_FILE "CREATE TABLE IF NOT EXISTS users (mac TEXT PRIMARY KEY, ip TEXT, session_token TEXT, session_end INTEGER, coins_inserted INTEGER DEFAULT 0);"
     sqlite3 $DB_FILE "CREATE TABLE IF NOT EXISTS coins (id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT, coins INTEGER, timestamp INTEGER DEFAULT (strftime('%s', 'now')));"
+    sqlite3 $DB_FILE "CREATE TABLE IF NOT EXISTS coinslot_locks (id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT UNIQUE NOT NULL, locked_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), session_token TEXT, created_at INTEGER DEFAULT (strftime('%s', 'now')));"
+    sqlite3 $DB_FILE "CREATE INDEX IF NOT EXISTS idx_coinslot_locks_mac ON coinslot_locks(mac);"
 fi
 chmod 666 $DB_FILE
 
 # Database Helper Functions
 query_db() {
-    sqlite3 $DB_FILE "$1" 2>/dev/null || echo ""
+    sqlite3 "$DB_FILE" -cmd ".timeout 2000" "$1" 2>/dev/null || echo ""
 }
 
 get_user_session() {
@@ -817,6 +819,66 @@ insert_coin_record() {
     local mac="$1"
     local coins="$2"
     query_db "INSERT INTO coins (mac, coins) VALUES ('$mac', $coins)"
+}
+
+# Coinslot Lock Functions (No Timeout)
+get_coinslot_lock() {
+    local mac="$1"
+    local result=$(query_db "SELECT mac, locked_at, session_token FROM coinslot_locks WHERE mac='$mac' LIMIT 1")
+    echo "$result"
+}
+
+get_active_coinslot_lock() {
+    # Get any existing lock (no expiration check)
+    local result=$(query_db "SELECT mac, locked_at, session_token FROM coinslot_locks ORDER BY locked_at DESC LIMIT 1")
+    echo "$result"
+}
+
+acquire_coinslot_lock() {
+    local mac="$1"
+    local session_token="$2"
+    local now=$(date +%s)
+
+    local owner_mac
+    owner_mac=$(sqlite3 "$DB_FILE" -cmd ".timeout 2000" "BEGIN IMMEDIATE;
+DELETE FROM coinslot_locks WHERE rowid NOT IN (SELECT rowid FROM coinslot_locks ORDER BY locked_at DESC LIMIT 1);
+INSERT INTO coinslot_locks (mac, locked_at, session_token)
+SELECT '$mac', $now, '$session_token'
+WHERE NOT EXISTS (SELECT 1 FROM coinslot_locks);
+UPDATE coinslot_locks SET locked_at=$now, session_token='$session_token' WHERE mac='$mac';
+SELECT mac FROM coinslot_locks ORDER BY locked_at DESC LIMIT 1;
+COMMIT;" 2>/dev/null | tail -n 1 | tr -d '\r')
+
+    if [ $? -ne 0 ] || [ -z "$owner_mac" ]; then
+        logger -t pisowifi "[LOCK_DEBUG] Failed to acquire lock - sqlite transaction error"
+        return 1
+    fi
+
+    if ! echo "$owner_mac" | grep -Eq '^([0-9A-F]{2}:){5}[0-9A-F]{2}$'; then
+        logger -t pisowifi "[LOCK_DEBUG] Failed to acquire lock - invalid lock owner value: $owner_mac"
+        return 1
+    fi
+
+    if [ "$owner_mac" = "$mac" ]; then
+        logger -t pisowifi "[LOCK_DEBUG] Device $mac acquired coinslot lock"
+        return 0
+    fi
+
+    logger -t pisowifi "[LOCK_DEBUG] Device $mac denied - lock owned by $owner_mac"
+    return 1
+}
+
+release_coinslot_lock() {
+    local mac="$1"
+    sqlite3 "$DB_FILE" -cmd ".timeout 2000" "BEGIN IMMEDIATE;
+DELETE FROM coinslot_locks WHERE rowid NOT IN (SELECT rowid FROM coinslot_locks ORDER BY locked_at DESC LIMIT 1);
+DELETE FROM coinslot_locks WHERE mac='$mac';
+COMMIT;" 2>/dev/null || true
+}
+
+cleanup_expired_locks() {
+    # No-op - locks don't expire
+    return 0
 }
 
 # Supabase Helper Functions
@@ -1008,13 +1070,59 @@ handle_api() {
             ;;
             
         "action=start_coin")
-            # Clear coins from database for this user
-            query_db "DELETE FROM coins WHERE mac='$MAC'"
+            # Check if coinslot is available and acquire lock (no timeout)
+            [ -z "$SID" ] && SID="$(gen_sid)"
             
-            # REMOVED AUTO-INIT.
-            # We assume firewall is ready. This prevents disconnecting other users.
+            local microtime=$(date +%s%N)
+            logger -t pisowifi "[LOCK_DEBUG] === START_COIN REQUEST START ==="
+            logger -t pisowifi "[LOCK_DEBUG] Device $MAC attempting to acquire coinslot lock (microtime: $microtime)"
+            logger -t pisowifi "[LOCK_DEBUG] Session Token: $SID"
             
-            json_response "{\"status\": \"started\"}"
+            # Check current lock status first
+            logger -t pisowifi "[LOCK_DEBUG] Checking current lock status..."
+            local current_lock=$(get_active_coinslot_lock)
+            if [ -n "$current_lock" ]; then
+                local locked_mac=$(echo "$current_lock" | cut -d'|' -f1)
+                local locked_at=$(echo "$current_lock" | cut -d'|' -f2)
+                logger -t pisowifi "[LOCK_DEBUG] Found existing lock: MAC=$locked_mac, locked_at=$locked_at"
+                
+                if [ "$locked_mac" != "$MAC" ]; then
+                    logger -t pisowifi "[LOCK_DEBUG] ❌ DEVICE DENIED - Coinslot already locked by $locked_mac"
+                    logger -t pisowifi "[LOCK_DEBUG] === START_COIN REQUEST DENIED ==="
+                    json_response "{\"status\": \"failed\", \"error\": \"Coinslot is currently in use by another device\", \"locked_by_mac\": \"$locked_mac\", \"button_disabled\": true}"
+                    return
+                else
+                    logger -t pisowifi "[LOCK_DEBUG] ✅ Device $MAC already has the lock - proceeding"
+                fi
+            else
+                logger -t pisowifi "[LOCK_DEBUG] ✅ No existing lock found - coinslot is available"
+            fi
+            
+            # Try to acquire lock atomically
+            logger -t pisowifi "[LOCK_DEBUG] Attempting atomic lock acquisition..."
+            if acquire_coinslot_lock "$MAC" "$SID"; then
+                logger -t pisowifi "[LOCK_DEBUG] ✅ SUCCESS - Device $MAC successfully acquired coinslot lock"
+                logger -t pisowifi "[LOCK_DEBUG] Clearing coins from database for this user..."
+                
+                # Clear coins from database for this user
+                query_db "DELETE FROM coins WHERE mac='$MAC'"
+                
+                logger -t pisowifi "[LOCK_DEBUG] === START_COIN REQUEST SUCCESS ==="
+                json_response "{\"status\": \"started\", \"lock_acquired\": true, \"session_token\": \"$SID\", \"mac\": \"$MAC\", \"button_enabled\": true}"
+            else
+                logger -t pisowifi "[LOCK_DEBUG] ❌ FAILED - Device $MAC failed to acquire coinslot lock"
+                # Check who has the lock (should be someone else now)
+                local active_lock=$(get_active_coinslot_lock)
+                if [ -n "$active_lock" ]; then
+                    local locked_mac=$(echo "$active_lock" | cut -d'|' -f1)
+                    logger -t pisowifi "[LOCK_DEBUG] Coinslot now locked by $locked_mac (race condition detected)"
+                    logger -t pisowifi "[LOCK_DEBUG] === START_COIN REQUEST FAILED ==="
+                    json_response "{\"status\": \"failed\", \"error\": \"Coinslot is currently in use by another device\", \"locked_by_mac\": \"$locked_mac\", \"button_disabled\": true}"
+                else
+                    logger -t pisowifi "[LOCK_DEBUG] === START_COIN REQUEST FAILED ==="
+                    json_response "{\"status\": \"failed\", \"error\": \"Failed to acquire coinslot lock\", \"button_disabled\": true}"
+                fi
+            fi
             ;;
             
         "action=check_coin")
@@ -1026,6 +1134,9 @@ handle_api() {
             ;;
             
         "action=connect"*)
+            # Release coinslot lock before connecting
+            release_coinslot_lock "$MAC"
+            
             # Transfer coins from global counter to user
             COUNT=$(transfer_coins_to_user "$MAC")
             [ -z "$COUNT" ] && COUNT=0
@@ -1086,6 +1197,9 @@ handle_api() {
             ;;
             
         "action=pause"*)
+            # Release coinslot lock when pausing
+            release_coinslot_lock "$MAC"
+            
             TARGET_MAC="$MAC"
             if [ -n "$SID" ]; then
                 TM=$(sqlite3 $DB_FILE "SELECT mac FROM users WHERE session_token='$SID' LIMIT 1" 2>/dev/null)
@@ -1151,6 +1265,9 @@ handle_api() {
             ;;
 
         "action=logout"*)
+            # Release coinslot lock when logging out
+            release_coinslot_lock "$MAC"
+            
             TARGET_MAC="$MAC"
             if [ -n "$SID" ]; then
                 TM=$(sqlite3 $DB_FILE "SELECT mac FROM users WHERE session_token='$SID' LIMIT 1" 2>/dev/null)
@@ -1221,6 +1338,53 @@ handle_api() {
             DNS_LOCAL=$(nslookup google.com 10.0.0.1 2>/dev/null | grep -c "Address")
             
             json_response "{\"authenticated\": \"$AUTH\", \"dns_external\": $DNS_TEST, \"dns_local\": $DNS_LOCAL, \"mac\": \"$MAC\"}"
+            ;;
+            
+        "action=check_coinslot_lock")
+            # Check if coinslot is locked and by whom (no expiration)
+            MAC=$(get_client_mac)
+
+            local active_lock=$(get_active_coinslot_lock)
+            if [ -z "$active_lock" ]; then
+                json_response "{\"locked\": false, \"mac\": \"$MAC\"}"
+                return
+            fi
+
+            local locked_mac=$(echo "$active_lock" | cut -d'|' -f1)
+            local locked_at=$(echo "$active_lock" | cut -d'|' -f2)
+
+            if [ "$locked_mac" = "$MAC" ]; then
+                json_response "{\"locked\": true, \"locked_by_me\": true, \"locked_at\": $locked_at, \"mac\": \"$MAC\"}"
+                return
+            fi
+
+            json_response "{\"locked\": true, \"locked_by_me\": false, \"locked_by_mac\": \"$locked_mac\", \"locked_at\": $locked_at, \"mac\": \"$MAC\"}"
+            ;;
+            
+        "action=acquire_coinslot_lock")
+            # Try to acquire coinslot lock (no timeout)
+            MAC=$(get_client_mac)
+            [ -z "$SID" ] && SID="$(gen_sid)"
+            
+            if acquire_coinslot_lock "$MAC" "$SID"; then
+                json_response "{\"success\": true, \"locked\": true, \"mac\": \"$MAC\", \"session_token\": \"$SID\"}"
+            else
+                # Check who has the lock
+                local active_lock=$(get_active_coinslot_lock)
+                if [ -n "$active_lock" ]; then
+                    local locked_mac=$(echo "$active_lock" | cut -d'|' -f1)
+                    json_response "{\"success\": false, \"error\": \"Coinslot is currently in use by another device\", \"locked_by_mac\": \"$locked_mac\"}"
+                else
+                    json_response "{\"success\": false, \"error\": \"Failed to acquire lock\"}"
+                fi
+            fi
+            ;;
+            
+        "action=release_coinslot_lock")
+            # Release coinslot lock
+            MAC=$(get_client_mac)
+            release_coinslot_lock "$MAC"
+            json_response "{\"success\": true, \"released\": true, \"mac\": \"$MAC\"}"
             ;;
     esac
 }
@@ -1550,30 +1714,41 @@ function resumeTime() {
 }
 
 function startCoin() {
+    // Try to acquire lock and start coin session in one atomic operation
     fetch(apiUrl + "?action=start_coin" + getSidParam())
     .then(r => r.json())
     .then(data => {
-        document.getElementById("coin-modal").style.display = "block";
-        document.getElementById("coin-count").innerText = "0";
-        document.getElementById("coin-time").innerText = "0";
-        document.getElementById("connect-btn").style.display = "none";
-        
-        if(interval) clearInterval(interval);
-        interval = setInterval(() => {
-            fetch(apiUrl + "?action=check_coin" + getSidParam())
-            .then(r => r.json())
-            .then(d => {
-                document.getElementById("coin-count").innerText = d.count;
-                document.getElementById("coin-time").innerText = d.minutes;
-                if(d.count > 0) document.getElementById("connect-btn").style.display = "block";
-            })
-            .catch(err => console.error("Coin check failed:", err));
-        }, 1000);
-    })
-    .catch(err => {
-        console.error("Start coin failed:", err);
-        alert("Failed to start coin session. Please refresh the page.");
-    });
+        if(data.status === "started" && data.lock_acquired) {
+            // Successfully acquired lock - show modal
+            document.getElementById("coin-modal").style.display = "block";
+            document.getElementById("coin-count").innerText = "0";
+            document.getElementById("coin-time").innerText = "0";
+            document.getElementById("connect-btn").style.display = "none";
+                
+                if(interval) clearInterval(interval);
+                interval = setInterval(() => {
+                    fetch(apiUrl + "?action=check_coin" + getSidParam())
+                    .then(r => r.json())
+                    .then(d => {
+                        document.getElementById("coin-count").innerText = d.count;
+                        document.getElementById("coin-time").innerText = d.minutes;
+                        if(d.count > 0) document.getElementById("connect-btn").style.display = "block";
+                    })
+                    .catch(err => console.error("Coin check failed:", err));
+                }, 1000);
+            } else if(data.error && data.error.includes("locked by another device")) {
+                // Coinslot is locked by another device
+                alert("Coinslot is currently in use by another device. Please try again later.");
+            } else if(data.error) {
+                alert(data.error + " (Device: " + data.locked_by_mac + ")");
+            } else {
+                alert("Failed to start coin session. Please try again.");
+            }
+        })
+        .catch(err => {
+            console.error("Start coin failed:", err);
+            alert("Failed to start coin session. Please refresh the page.");
+        });
 }
 
 function connect() {
@@ -1621,6 +1796,14 @@ function closeModal() {
     document.getElementById("coin-modal").style.display = "none";
     if(interval) clearInterval(interval);
     stopAudio(); // Stop audio when closing modal
+    
+    // Release coinslot lock when closing modal
+    fetch(apiUrl + "?action=release_coinslot_lock" + getSidParam())
+    .then(r => r.json())
+    .then(data => {
+        console.log("Coinslot lock released:", data);
+    })
+    .catch(err => console.error("Failed to release lock:", err));
 }
 
 function checkCoinCount() {
@@ -3999,20 +4182,32 @@ function resumeTime() {
 }
 
 function startCoin() {
-  fetch(apiUrl + "?action=start_coin").then(r => r.json()).then(() => {
-    document.getElementById("coin-modal").style.display="block";
-    document.getElementById("coin-count").innerText="0";
-    document.getElementById("coin-time").innerText="0";
-    document.getElementById("connect-btn").style.display="none";
-    if(interval) clearInterval(interval);
-    interval = setInterval(() => {
-      fetch(apiUrl + "?action=check_coin").then(r => r.json()).then(d => {
-        document.getElementById("coin-count").innerText = d.count;
-        document.getElementById("coin-time").innerText = d.minutes;
-        if(d.count > 0) document.getElementById("connect-btn").style.display="block";
-      }).catch(() => {});
-    }, 1000);
-  }).catch(() => { alert("Failed to start coin session. Please refresh the page."); });
+  // Try to acquire lock and start coin session in one atomic operation
+  fetch(apiUrl + "?action=start_coin").then(r => r.json()).then(data => {
+    if(data.status === "started" && data.lock_acquired) {
+      // Successfully acquired lock - show modal
+      document.getElementById("coin-modal").style.display="block";
+      document.getElementById("coin-count").innerText="0";
+      document.getElementById("coin-time").innerText="0";
+      document.getElementById("connect-btn").style.display="none";
+        if(interval) clearInterval(interval);
+        interval = setInterval(() => {
+          fetch(apiUrl + "?action=check_coin").then(r => r.json()).then(d => {
+            document.getElementById("coin-count").innerText = d.count;
+            document.getElementById("coin-time").innerText = d.minutes;
+            if(d.count > 0) document.getElementById("connect-btn").style.display="block";
+          }).catch(() => {});
+        }, 1000);
+      } else if(data.error && data.error.includes("locked by another device")) {
+        // Coinslot is locked by another device
+        alert("Coinslot is currently in use by another device. Please try again later.");
+      } else if(data.error) {
+        alert(data.error + " (Device: " + data.locked_by_mac + ")");
+      } else {
+        alert("Failed to start coin session. Please try again.");
+      }
+    })
+    .catch(() => { alert("Failed to start coin session. Please refresh the page."); });
 }
 
 function connect() {
@@ -4037,6 +4232,14 @@ function closeModal() {
   document.getElementById("coin-modal").style.display="none";
   if(interval) clearInterval(interval);
   stopAudio();
+  
+  // Release coinslot lock when closing modal
+  fetch(apiUrl + "?action=release_coinslot_lock")
+  .then(r => r.json())
+  .then(data => {
+    console.log("Coinslot lock released:", data);
+  })
+  .catch(err => console.error("Failed to release lock:", err));
 }
 
 setTimeout(function() {
@@ -4185,10 +4388,14 @@ function checkInternet(){var img=new Image();var now=new Date().getTime();img.sr
 function checkStatus(){fetch(apiUrl+"?action=status").then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(data=>{if(data.mac){var a=document.getElementById("info-mac");if(a)a.innerText=data.mac;}if(data.ip){var b=document.getElementById("info-ip");if(b)b.innerText=data.ip;}var loading=document.getElementById("loading");if(loading)loading.style.display="none";if(data.authenticated==="true"){document.getElementById("login-section").style.display="none";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="block";timeLeft=parseInt(data.time_remaining);document.getElementById("time-remaining").innerText=formatTime(timeLeft);if(data.mac)document.getElementById("client-mac").innerText=data.mac;startTimer();checkInternet();setTimeout(checkStatus,5000);}else if(data.authenticated==="paused"){document.getElementById("login-section").style.display="none";document.getElementById("connected-section").style.display="none";document.getElementById("resume-section").style.display="block";document.getElementById("paused-time").innerText=formatTime(data.time_remaining);if(timerInterval)clearInterval(timerInterval);setTimeout(checkStatus,10000);}else{document.getElementById("login-section").style.display="block";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="none";if(timerInterval)clearInterval(timerInterval);}}).catch(()=>{var loading=document.getElementById("loading");if(loading)loading.style.display="none";document.getElementById("login-section").style.display="block";});}
 function pauseTime(){if(!confirm("Pause Internet? You can resume later."))return;fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d=>{if(d.status==="paused"){alert("Internet Paused. Time saved: "+formatTime(d.remaining));checkStatus();}else{alert("Error: "+(d.error||"Failed to pause"));}}).catch(()=>{});}
 function resumeTime(){fetch(apiUrl+"?action=resume").then(r=>r.json()).then(d=>{if(d.status==="resumed")checkStatus();else alert("Error: "+(d.error||"Failed to resume"));}).catch(()=>{});}
-function startCoin(){fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(()=>{document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
+function startCoin(){// Try to acquire lock and start coin session in one atomic operation
+fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(data=>{if(data.status==="started"&&data.lock_acquired){// Successfully acquired lock - show modal
+document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}else if(data.error&&data.error.includes("locked by another device")){// Coinslot is locked by another device
+alert("Coinslot is currently in use by another device. Please try again later.");}else if(data.error){alert(data.error+" (Device: "+data.locked_by_mac+")");}else{alert("Failed to start coin session. Please try again.");}}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
 function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{closeModal();if(d.status==="connected"){checkStatus();if(d.redirect_url)setTimeout(()=>{window.location.href=d.redirect_url;},2000);}else{alert(d.error||"Connection failed");}}).catch(()=>{alert("Failed to connect. Please try again.");});}
 function logout(){fetch(apiUrl+"?action=logout").then(r=>r.json()).then(()=>checkStatus()).catch(()=>checkStatus());}
-function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);stopAudio();}
+function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);stopAudio();// Release coinslot lock when closing modal
+fetch(apiUrl+"?action=release_coinslot_lock").then(r=>r.json()).then(data=>{console.log("Coinslot lock released:",data);}).catch(err=>console.error("Failed to release lock:",err));}
 setTimeout(function(){fetch(apiUrl+"?action=test_dns").then(r=>r.json()).then(()=>{}).catch(()=>{});},3000);
 checkStatus();
 </script>
@@ -4318,10 +4525,13 @@ function checkInternet(){var img=new Image();var now=new Date().getTime();img.sr
 function checkStatus(){fetch(apiUrl+"?action=status").then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(d=>{if(d.mac){var a=document.getElementById("info-mac");if(a)a.innerText=d.mac;}if(d.ip){var b=document.getElementById("info-ip");if(b)b.innerText=d.ip;}var loading=document.getElementById("loading");if(loading)loading.style.display="none";if(d.authenticated==="true"){document.getElementById("login-section").style.display="none";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="block";timeLeft=parseInt(d.time_remaining);document.getElementById("time-remaining").innerText=formatTime(timeLeft);if(d.mac)document.getElementById("client-mac").innerText=d.mac;startTimer();checkInternet();setTimeout(checkStatus,5000);}else if(d.authenticated==="paused"){document.getElementById("login-section").style.display="none";document.getElementById("connected-section").style.display="none";document.getElementById("resume-section").style.display="block";document.getElementById("paused-time").innerText=formatTime(d.time_remaining);if(timerInterval)clearInterval(timerInterval);setTimeout(checkStatus,10000);}else{document.getElementById("login-section").style.display="block";document.getElementById("resume-section").style.display="none";document.getElementById("connected-section").style.display="none";if(timerInterval)clearInterval(timerInterval);}}).catch(()=>{var loading=document.getElementById("loading");if(loading)loading.style.display="none";document.getElementById("login-section").style.display="block";});}
 function pauseTime(){if(!confirm("Pause Internet? You can resume later."))return;fetch(apiUrl+"?action=pause").then(r=>r.json()).then(d=>{if(d.status==="paused"){alert("Internet Paused. Time saved: "+formatTime(d.remaining));checkStatus();}else{alert("Error: "+(d.error||"Failed to pause"));}}).catch(()=>{});}
 function resumeTime(){fetch(apiUrl+"?action=resume").then(r=>r.json()).then(d=>{if(d.status==="resumed")checkStatus();else alert("Error: "+(d.error||"Failed to resume"));}).catch(()=>{});}
-function startCoin(){fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(()=>{document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}
+function startCoin(){// First check if coinslot is available
+fetch(apiUrl+"?action=check_coinslot_lock").then(r=>r.json()).then(lockData=>{if(lockData.locked&&!lockData.locked_by_me){alert("Coinslot is currently in use by another device. Please try again later.");return;}// Try to acquire lock and start coin session
+fetch(apiUrl+"?action=start_coin").then(r=>r.json()).then(data=>{if(data.status==="started"&&data.lock_acquired){document.getElementById("coin-modal").style.display="block";document.getElementById("coin-count").innerText="0";document.getElementById("coin-time").innerText="0";document.getElementById("connect-btn").style.display="none";if(interval)clearInterval(interval);interval=setInterval(()=>{fetch(apiUrl+"?action=check_coin").then(r=>r.json()).then(d=>{document.getElementById("coin-count").innerText=d.count;document.getElementById("coin-time").innerText=d.minutes;if(d.count>0)document.getElementById("connect-btn").style.display="block";}).catch(()=>{});},1000);}else if(data.error){alert(data.error+" (Device: "+data.locked_by_mac+")");}else{alert("Failed to start coin session. Please try again.");}}).catch(()=>{alert("Failed to start coin session. Please refresh the page.");});}).catch(()=>{alert("Failed to check coinslot lock. Please try again.");});}
 function connect(){stopAudio();playAudio("connect");fetch(apiUrl+"?action=connect").then(r=>r.json()).then(d=>{closeModal();if(d.status==="connected"){checkStatus();if(d.redirect_url)setTimeout(()=>{window.location.href=d.redirect_url;},2000);}else{alert(d.error||"Connection failed");}}).catch(()=>{alert("Failed to connect. Please try again.");});}
 function logout(){fetch(apiUrl+"?action=logout").then(r=>r.json()).then(()=>checkStatus()).catch(()=>checkStatus());}
-function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);stopAudio();}
+function closeModal(){document.getElementById("coin-modal").style.display="none";if(interval)clearInterval(interval);stopAudio();// Release coinslot lock when closing modal
+fetch(apiUrl+"?action=release_coinslot_lock").then(r=>r.json()).then(data=>{console.log("Coinslot lock released:",data);}).catch(err=>console.error("Failed to release lock:",err));}
 setTimeout(function(){fetch(apiUrl+"?action=test_dns").then(r=>r.json()).then(()=>{}).catch(()=>{});},3000);
 checkStatus();
 </script>
