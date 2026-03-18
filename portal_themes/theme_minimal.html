@@ -107,7 +107,7 @@ button:active{transform:scale(0.99)}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl="/pisowifi";var interval;var timerInterval;var timeLeft=0;
+var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;
 function openRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="block";loadRates();}
 function closeRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="none";}
 function loadRates(){fetch(apiUrl+"?action=rates").then(r=>r.json()).then(function(d){var el=document.getElementById("rates-body");if(!el)return;if(!d||!d.rates||!d.rates.length){el.innerHTML="<div>No rates set.</div>";return;}var html="<div style='display:grid; gap:8px; margin-top:10px;'>";d.rates.forEach(function(x){html+="<div style='display:flex; justify-content:space-between; padding:10px; border-radius:12px; border:1px solid #e2e8f0; background:#f8fafc;'><div style='font-weight:800;'>₱"+x.amount+"</div><div>"+x.minutes+" min</div></div>";});html+="</div>";el.innerHTML=html;}).catch(function(){var el=document.getElementById("rates-body");if(el)el.innerHTML="<div>Failed to load rates.</div>";});}

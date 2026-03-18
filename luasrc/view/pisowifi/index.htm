@@ -32,6 +32,10 @@
                 Time: <span id="coin-time">0</span> Minutes
             </div>
             
+            <div style="font-size: 13px; color: #666;">
+                Coinslot Lock Timeout: <span id="coin-lock-remaining">--</span>
+            </div>
+            
             <button id="connect-btn" class="pisowifi-btn" style="display:none;">Done & Start Internet</button>
             <br>
             <button id="cancel-btn" style="margin-top: 10px; background:none; border:none; color:red; cursor:pointer;">Cancel</button>
@@ -39,6 +43,9 @@
     </div>
 
     <div id="status-message"></div>
+
+    <audio id="audio-insert" src="/insert.mp3"></audio>
+    <audio id="audio-connect" src="/connected.mp3"></audio>
 
     <hr>
     
@@ -49,6 +56,79 @@
 (function() {
     var apiUrl = "<%=luci.dispatcher.build_url('pisowifi', 'api')%>";
     var coinInterval = null;
+    var audioCtx = null;
+    var lockExpiry = 0;
+    var lockTicker = null;
+
+    function stopAudio() {
+        try {
+            var sounds = document.querySelectorAll('audio');
+            sounds.forEach(function(sound) { sound.pause(); sound.currentTime = 0; });
+        } catch(e) {}
+    }
+
+    function updateLockCountdown() {
+        var el = document.getElementById('coin-lock-remaining');
+        if (!el) return;
+        if (!lockExpiry || lockExpiry <= 0) { el.innerText = "--"; return; }
+        var now = Math.floor(Date.now() / 1000);
+        var rem = lockExpiry - now;
+        if (rem < 0) rem = 0;
+        el.innerText = rem + "s";
+        if (rem === 0) {
+            try { clearInterval(lockTicker); lockTicker = null; } catch(e) {}
+            if (coinInterval) { clearInterval(coinInterval); coinInterval = null; }
+            if (document.getElementById('coin-modal')) document.getElementById('coin-modal').style.display = 'none';
+            lockExpiry = 0;
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', apiUrl + '/cancel_coin', true);
+            xhr.send();
+        }
+    }
+
+    function playAudio(type) {
+        try {
+            stopAudio();
+            var audio = document.getElementById("audio-" + type);
+            var fallback = function() {
+                try {
+                    var AC = window.AudioContext || window.webkitAudioContext;
+                    if (!AC) return;
+                    if (!audioCtx) audioCtx = new AC();
+                    if (audioCtx.state === "suspended") audioCtx.resume().catch(function(){});
+                    var now = audioCtx.currentTime;
+                    var freq = (type === "connect") ? 660 : 880;
+                    var dur = (type === "connect") ? 0.22 : 0.28;
+                    var o = audioCtx.createOscillator();
+                    var g = audioCtx.createGain();
+                    o.type = "sine";
+                    o.frequency.setValueAtTime(freq, now);
+                    g.gain.setValueAtTime(0, now);
+                    if (type === "connect") {
+                        g.gain.linearRampToValueAtTime(0.25, now + 0.02);
+                        g.gain.linearRampToValueAtTime(0, now + dur);
+                    } else {
+                        g.gain.linearRampToValueAtTime(0.25, now + 0.01);
+                        g.gain.linearRampToValueAtTime(0, now + 0.08);
+                        g.gain.setValueAtTime(0, now + 0.12);
+                        g.gain.linearRampToValueAtTime(0.25, now + 0.13);
+                        g.gain.linearRampToValueAtTime(0, now + 0.21);
+                    }
+                    o.connect(g);
+                    g.connect(audioCtx.destination);
+                    o.start(now);
+                    o.stop(now + dur);
+                } catch(e) {}
+            };
+            if (audio) {
+                audio.currentTime = 0;
+                var p = audio.play();
+                if (p && p.catch) p.catch(fallback);
+            } else {
+                fallback();
+            }
+        } catch(e) {}
+    }
     
     function formatTime(seconds) {
         if (seconds <= 0) return "Expired";
@@ -114,11 +194,22 @@
 
     // Coin Logic
     document.getElementById('insert-coin-btn').addEventListener('click', function() {
+        playAudio('insert');
         // Start coin session
         var xhr = new XMLHttpRequest();
         xhr.open('POST', apiUrl + '/start_coin', true);
         xhr.onload = function() {
             if (xhr.status === 200) {
+                var data = {};
+                try { data = JSON.parse(xhr.responseText || "{}"); } catch(e) {}
+                if (data.status === "busy") {
+                    alert(data.message || "SOMEONE IS PAYING, WAIT FOR YOUR TURN");
+                    return;
+                }
+                if (typeof data.lock_expiry === "number") lockExpiry = data.lock_expiry;
+                updateLockCountdown();
+                if (lockTicker) clearInterval(lockTicker);
+                lockTicker = setInterval(updateLockCountdown, 250);
                 document.getElementById('coin-modal').style.display = 'block';
                 document.getElementById('coin-count').innerText = "0";
                 document.getElementById('coin-time').innerText = "0";
@@ -127,6 +218,10 @@
                 // Start polling
                 if (coinInterval) clearInterval(coinInterval);
                 coinInterval = setInterval(checkCoins, 1000);
+            } else {
+                var data = {};
+                try { data = JSON.parse(xhr.responseText || "{}"); } catch(e) {}
+                alert(data.error || "Failed to start coin session");
             }
         };
         xhr.send();
@@ -137,7 +232,17 @@
         xhr.open('GET', apiUrl + '/check_coin', true);
         xhr.onload = function() {
             if (xhr.status === 200) {
-                var data = JSON.parse(xhr.responseText);
+                var data = {};
+                try { data = JSON.parse(xhr.responseText || "{}"); } catch(e) {}
+                if (data.status === "busy") {
+                    alert(data.message || "SOMEONE IS PAYING, WAIT FOR YOUR TURN");
+                    document.getElementById('coin-modal').style.display = 'none';
+                    if (coinInterval) clearInterval(coinInterval);
+                    if (lockTicker) clearInterval(lockTicker);
+                    return;
+                }
+                if (typeof data.lock_expiry === "number") lockExpiry = data.lock_expiry;
+                updateLockCountdown();
                 document.getElementById('coin-count').innerText = data.count;
                 document.getElementById('coin-time').innerText = data.minutes;
                 
@@ -150,15 +255,32 @@
     }
 
     document.getElementById('connect-btn').addEventListener('click', function() {
+        playAudio('connect');
         var xhr = new XMLHttpRequest();
         xhr.open('POST', apiUrl + '/connect', true);
         xhr.onload = function() {
             if (xhr.status === 200) {
-                document.getElementById('coin-modal').style.display = 'none';
-                clearInterval(coinInterval);
-                checkStatus();
+                var data = {};
+                try { data = JSON.parse(xhr.responseText || "{}"); } catch(e) {}
+                if (data.status === "busy") {
+                    alert(data.message || "SOMEONE IS PAYING, WAIT FOR YOUR TURN");
+                    return;
+                }
+                if (data.status === "connected") {
+                    stopAudio();
+                    document.getElementById('coin-modal').style.display = 'none';
+                    clearInterval(coinInterval);
+                    if (lockTicker) clearInterval(lockTicker);
+                    lockExpiry = 0;
+                    updateLockCountdown();
+                    checkStatus();
+                    return;
+                }
+                alert(data.error || 'Connection failed');
             } else {
-                alert('Connection failed');
+                var data = {};
+                try { data = JSON.parse(xhr.responseText || "{}"); } catch(e) {}
+                alert(data.error || 'Connection failed');
             }
         };
         xhr.send();
@@ -167,6 +289,12 @@
     document.getElementById('cancel-btn').addEventListener('click', function() {
         document.getElementById('coin-modal').style.display = 'none';
         clearInterval(coinInterval);
+        if (lockTicker) clearInterval(lockTicker);
+        lockExpiry = 0;
+        updateLockCountdown();
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', apiUrl + '/cancel_coin', true);
+        xhr.send();
     });
 
     document.getElementById('logout-btn').addEventListener('click', function() {

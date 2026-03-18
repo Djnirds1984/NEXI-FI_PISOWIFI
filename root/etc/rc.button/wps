@@ -2,15 +2,28 @@
 
 [ "$ACTION" = "pressed" ] || exit 0
 
-DB_FILE="/tmp/pisowifi.db"
+DB_FILE="/etc/pisowifi/pisowifi.db"
+[ -d /etc/pisowifi ] || mkdir -p /etc/pisowifi
+chmod 777 /etc/pisowifi 2>/dev/null || true
 
-# Insert coin into database for any user (global coin counter)
-# This is compatible with the CGI version (INSTALL_CGI.sh)
-sqlite3 $DB_FILE "INSERT INTO coins (mac, coins) VALUES ('00:00:00:00:00:00', 1)"
-COUNT=$(sqlite3 $DB_FILE "SELECT SUM(coins) FROM coins WHERE mac='00:00:00:00:00:00'")
+LOCK_FILE="/tmp/coin_lock"
+LOCK_TIMEOUT="$(uci get pisowifi.settings.coin_lock_timeout 2>/dev/null)"
+[ -z "$LOCK_TIMEOUT" ] && LOCK_TIMEOUT=20
+NOW="$(date +%s)"
 
-# Log for debugging
-logger -t pisowifi "Coin inserted via WPS button. Total: $COUNT"
+LINE="$(cat "$LOCK_FILE" 2>/dev/null | tr -d '\r\n')"
+LOCKED_MAC="$(echo "$LINE" | awk '{print $1}')"
+LOCK_EXP="$(echo "$LINE" | awk '{print $2}')"
+[ -z "$LOCK_EXP" ] && LOCK_EXP=0
+if [ -z "$LOCKED_MAC" ] || [ "$LOCK_EXP" -le "$NOW" ] 2>/dev/null; then
+	rm -f "$LOCK_FILE" 2>/dev/null
+	exit 0
+fi
+echo "$LOCKED_MAC $((NOW + LOCK_TIMEOUT))" > "$LOCK_FILE" 2>/dev/null
 
-# Ensure permissions are correct just in case they were reset
+sqlite3 $DB_FILE "INSERT INTO coins (mac, coins) VALUES ('$LOCKED_MAC', 1)" 2>/dev/null
+COUNT=$(sqlite3 $DB_FILE "SELECT COALESCE(SUM(coins),0) FROM coins WHERE mac='$LOCKED_MAC'" 2>/dev/null)
+
+logger -t pisowifi "Coin inserted for $LOCKED_MAC via ${BUTTON:-wps} button. Total: $COUNT"
+
 chmod 666 $DB_FILE

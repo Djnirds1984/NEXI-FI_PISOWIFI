@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NEXI-FI PISOWIFI - Light Edition</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@700&display=swap" rel="stylesheet">
+<style>
+:root { 
+  --bg: #f8fafc; 
+  --card: rgba(255, 255, 255, 0.75); /* Increased transparency */
+  --border: rgba(255, 255, 255, 0.2);
+  --text: #0f172a; 
+  --muted: #475569; 
+  --accent: #2563eb;
+  --accent-glow: rgba(37, 99, 235, 0.2);
+  --success: #059669;
+  --success-glow: rgba(5, 150, 105, 0.15);
+  --warn: #d97706;
+  --danger: #dc2626;
+  --surface: rgba(241, 245, 249, 0.5);
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; outline: none; margin: 0; padding: 0; }
+
+body {
+  margin: 0; 
+  min-height: 100vh; 
+  display: flex; 
+  align-items: center; 
+  justify-content: center; 
+  padding: 20px; 
+  background-color: #000;
+  /* Reduced linear-gradient opacity to make wallpaper pop */
+  background-image: 
+   linear-gradient(rgba(0, 0, 0, 0.3), rgba(0, 0, 0, 0.3)),
+    url('https://media.easy-peasy.ai/03161798-d57c-48ca-b8bf-1ca22575c0ef/8fa696cc-af6c-4e2a-82fc-6133407c6652_medium.webp');
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  color: var(--text); 
+  font-family: 'Plus Jakarta Sans', sans-serif;
+}
+
+.shell { width: 100%; max-width: 400px; position: relative; z-index: 10; animation: slideUp 0.6s ease-out; }
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.logo-container { margin-bottom: 24px; text-align: center; }
+.logo-text { 
+  font-size: 32px; 
+  letter-spacing: 2px; 
+  background: linear-gradient(135deg, #0f172a 0%, #2563eb 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  font-weight: 800;
+  display: block;
+  text-shadow: 0 4px 10px rgba(0,0,0,0.1);
+}
+.logo-sub { 
+  display: block; 
+  font-size: 10px; 
+  color: var(--accent); 
+  text-transform: uppercase; 
+  letter-spacing: 4px;
+  font-weight: 700;
+  margin-top: 2px;
+}
+
+.card { 
+  background: var(--card); 
+  border: 1px solid var(--border); 
+  border-radius: 28px; 
+  padding: 32px 24px; 
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.15); 
+  backdrop-filter: blur(16px); 
+  -webkit-backdrop-filter: blur(16px);
+  width: 100%;
+}
+
+.h1 { margin-bottom: 8px; font-size: 24px; font-weight: 800; letter-spacing: -0.02em; text-align: center; color: #1e293b; }
+.sub { margin-bottom: 24px; color: var(--muted); font-size: 14px; line-height: 1.5; text-align: center; font-weight: 600;}
+
+.info-grid { 
+  display: grid; 
+  grid-template-columns: 1fr 1fr;
+  gap: 12px; 
+  margin-bottom: 24px; 
+}
+
+.info-chip { 
+  background: var(--surface);
+  border: 1px solid rgba(255,255,255,0.3);
+  border-radius: 14px; 
+  padding: 12px; 
+  text-align: center;
+}
+
+.info-chip label { display: block; font-size: 9px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; font-weight: 800; letter-spacing: 0.05em;}
+.info-chip span { font-size: 12px; font-family: 'JetBrains Mono', monospace; color: #0f172a; font-weight: 700; }
+
+button { 
+  width: 100%; 
+  padding: 16px; 
+  border-radius: 14px; 
+  border: none; 
+  font-weight: 700; 
+  cursor: pointer; 
+  transition: all 0.2s ease;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+button:active { transform: scale(0.96); }
+
+.btn-primary { 
+  background: var(--accent); 
+  color: white; 
+  box-shadow: 0 8px 15px -3px var(--accent-glow);
+}
+
+.btn-success { 
+  background: var(--success); 
+  color: white; 
+  box-shadow: 0 8px 15px -3px var(--success-glow);
+}
+
+.btn-ghost { background: rgba(15, 23, 42, 0.05); color: #1e293b; backdrop-filter: blur(5px); }
+.btn-warn-ghost { background: rgba(217, 119, 6, 0.1); color: var(--warn); }
+.btn-danger-ghost { background: rgba(220, 38, 38, 0.1); color: var(--danger); }
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(5, 150, 105, 0.15);
+  color: var(--success);
+  padding: 8px 16px;
+  border-radius: 100px;
+  font-size: 11px;
+  font-weight: 800;
+  margin-bottom: 20px;
+}
+
+.dot { width: 6px; height: 6px; background: currentColor; border-radius: 50%; position: relative; }
+.dot::after {
+    content: '';
+    position: absolute;
+    inset: -3px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.3;
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse { 0% { transform: scale(1); opacity: 0.3; } 100% { transform: scale(2.5); opacity: 0; } }
+
+.timer-display { 
+  font-size: 48px; 
+  font-family: 'JetBrains Mono', monospace; 
+  font-weight: 800; 
+  margin: 15px 0;
+  color: #0f172a;
+  text-align: center;
+  letter-spacing: -1px;
+}
+
+.modal { 
+  display: none; 
+  position: fixed; 
+  z-index: 1000; 
+  inset: 0;
+  background: rgba(15, 23, 42, 0.4); 
+  backdrop-filter: blur(8px); 
+  padding: 20px; 
+  align-items: center;
+  justify-content: center;
+}
+
+.modal.active { display: flex; }
+
+.modal-content { 
+  background: rgba(255, 255, 255, 0.9); 
+  padding: 24px; 
+  width: 100%; 
+  max-width: 340px; 
+  border-radius: 20px; 
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(10px);
+  animation: pop 0.3s cubic-bezier(0.17, 0.89, 0.32, 1.1);
+}
+
+@keyframes pop { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+.rate-item { 
+  display: flex; 
+  justify-content: space-between; 
+  padding: 12px 16px; 
+  border-radius: 12px; 
+  background: rgba(248, 250, 252, 0.5); 
+  border: 1px solid rgba(0,0,0,0.05);
+  margin-bottom: 8px;
+}
+
+.rate-item .price { color: var(--accent); font-weight: 800; }
+.rate-item .time { color: #64748b; font-weight: 600; font-size: 13px; }
+
+#loading { text-align: center; padding: 40px 0; }
+.spinner { 
+  width: 32px; height: 32px; 
+  border: 3px solid #e2e8f0; 
+  border-top-color: var(--accent); 
+  border-radius: 50%; 
+  margin: 0 auto 16px; 
+  animation: spin 0.8s linear infinite; 
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.action-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; }
+
+.connection-stats {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  margin-bottom: 16px;
+  font-size: 9px;
+  color: var(--muted);
+  font-weight: 800;
+  text-transform: uppercase;
+}
+</style>
+</head>
+<body>
+
+<div class="shell">
+  <div class="logo-container">
+    <span class="logo-text">NEXI-FI</span>
+    <span class="logo-sub">Hyper-Speed Network</span>
+  </div>
+
+  <div class="card">
+    <div id="loading">
+      <div class="spinner"></div>
+      <p class="sub">Authenticating Session...</p>
+    </div>
+
+    <!-- LOGIN -->
+    <div id="login-section" style="display:none;">
+      <div class="h1">Portal Access</div>
+      <p class="sub">Insert a coin to start your high-speed session.</p>
+      
+      <div class="info-grid">
+        <div class="info-chip"><label>MAC Address</label><span id="login-mac">...</span></div>
+        <div class="info-chip"><label>Local IP</label><span id="login-ip">...</span></div>
+      </div>
+
+      <button onclick="playAudio('insert'); startCoin()" class="btn-success">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+        INSERT COIN
+      </button>
+      <button onclick="openRates()" class="btn-ghost">View Pricing / Rates</button>
+    </div>
+
+    <!-- PAUSED -->
+    <div id="resume-section" style="display:none;">
+      <div class="h1">Session Paused</div>
+      <p class="sub">Your credits are safely stored.</p>
+      
+      <div class="info-chip" style="margin-bottom: 20px; padding: 24px; background: rgba(217, 119, 6, 0.05);">
+        <label>Stored Time</label>
+        <span id="paused-time" style="color: var(--warn); font-size: 32px; font-weight: 800;">00:00:00</span>
+      </div>
+
+      <button onclick="resumeTime()" class="btn-primary">RESUME SESSION</button>
+      <button onclick="openRates()" class="btn-ghost">View Pricing</button>
+    </div>
+
+    <!-- ACTIVE -->
+    <div id="connected-section" style="display:none; text-align: center;">
+      <div class="status-badge">
+        <div class="dot"></div>
+        ACTIVE CONNECTION
+      </div>
+      
+      <div class="connection-stats">
+        <div>IP: <span id="status-ip">...</span></div>
+        <div>MAC: <span id="status-mac">...</span></div>
+      </div>
+      
+      <div class="timer-display" id="time-remaining">00:00:00</div>
+      <p id="internet-status" class="sub" style="margin-bottom: 20px; font-weight: 700; text-transform: uppercase; font-size: 10px;">Link Status: Verifying...</p>
+
+      <button onclick="playAudio('insert'); startCoin()" class="btn-success">ADD TIME</button>
+      
+      <div class="action-row">
+        <button onclick="confirmAction('pause')" class="btn-warn-ghost">PAUSE</button>
+        <button onclick="confirmAction('logout')" class="btn-danger-ghost">LOGOUT</button>
+      </div>
+      <button onclick="openRates()" class="btn-ghost" style="margin-top: 12px;">View Rates</button>
+    </div>
+  </div>
+</div>
+
+<!-- COIN MODAL -->
+<div id="coin-modal" class="modal">
+  <div class="modal-content">
+    <div class="h1">Coin Slot Active</div>
+    <p class="sub">Drop your coins now.</p>
+    <div class="info-grid" style="margin-bottom: 20px;">
+      <div class="info-chip"><label>Amount</label><span id="coin-count" style="font-size: 24px; font-weight: 800;">0</span> PHP</div>
+      <div class="info-chip"><label>Total Time</label><span id="coin-time-display" style="font-size: 18px; font-weight: 800;">0 MIN</span></div>
+    </div>
+    <button id="connect-btn" onclick="connect()" class="btn-primary" style="display:none;">ACTIVATE INTERNET</button>
+    <button onclick="closeModal()" class="btn-ghost" style="margin-top: 8px; font-size: 12px;">Cancel</button>
+  </div>
+</div>
+
+<!-- RATES MODAL -->
+<div id="rates-modal" class="modal">
+  <div class="modal-content">
+    <div class="h1">WiFi Rates</div>
+    <p class="sub">Our current pricing plan</p>
+    <div id="rates-body" class="rate-list"></div>
+    <button onclick="closeRates()" class="btn-primary" style="margin-top: 16px;">CLOSE</button>
+  </div>
+</div>
+
+<!-- CONFIRMATION -->
+<div id="confirm-modal" class="modal">
+  <div class="modal-content" style="text-align: center;">
+    <div class="h1" id="confirm-title">Confirm?</div>
+    <p class="sub" id="confirm-msg">Please confirm your choice.</p>
+    <div class="action-row" style="margin-top: 16px;">
+        <button onclick="closeConfirm()" class="btn-ghost">NO</button>
+        <button id="confirm-exec" class="btn-primary">YES</button>
+    </div>
+  </div>
+</div>
+
+<audio id="audio-insert" src="/insert.mp3"></audio>
+<audio id="audio-connect" src="/connected.mp3"></audio>
+
+<script>
+const apiUrl = "/cgi-bin/pisowifi";
+let coinInterval, timerInterval, timeLeft = 0, pendingAction = null;
+const $ = (id) => document.getElementById(id);
+
+function genHex32() {
+    const bytes = new Uint8Array(16);
+    (window.crypto || window.msCrypto).getRandomValues(bytes);
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function getOrCreateSid() {
+    const key = 'pisowifi_sid_v1';
+    const now = Date.now();
+    try {
+        const raw = localStorage.getItem(key);
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && parsed.sid && parsed.exp > now) return parsed.sid;
+        }
+    } catch (_) {}
+    const sid = genHex32();
+    localStorage.setItem(key, JSON.stringify({ sid, exp: now + 31536000000 }));
+    return sid;
+}
+
+const SID = getOrCreateSid();
+const api = (p) => `${apiUrl}?${p}&sid=${encodeURIComponent(SID)}`;
+
+// Utility function to convert minutes to readable hours/mins
+function formatReadableTime(minutes) {
+    if (minutes < 60) return minutes + " MIN";
+    const hrs = Math.floor(minutes / 60);
+    const mins = minutes % 60;
+    return hrs + " HR" + (hrs > 1 ? "S" : "") + (mins > 0 ? " " + mins + " MIN" : "");
+}
+
+function openRates() { $("rates-modal").classList.add("active"); loadRates(); }
+function closeRates() { $("rates-modal").classList.remove("active"); }
+
+function confirmAction(type) {
+    pendingAction = type;
+    $("confirm-modal").classList.add("active");
+    if(type === 'pause') {
+        $("confirm-title").innerText = "Pause Session?";
+        $("confirm-msg").innerText = "Credits will be saved for your next login.";
+        $("confirm-exec").onclick = pauseTime;
+    } else {
+        $("confirm-title").innerText = "Logout Device?";
+        $("confirm-msg").innerText = "This will end your session immediately.";
+        $("confirm-exec").onclick = logout;
+    }
+}
+
+function closeConfirm() { $("confirm-modal").classList.remove("active"); }
+
+function loadRates() {
+    fetch(api("action=rates")).then(r=>r.json()).then(d => {
+        const el = $("rates-body");
+        if(d.rates) el.innerHTML = d.rates.map(x => `
+            <div class="rate-item">
+                <span class="price">₱${x.amount}</span>
+                <span class="time">${formatReadableTime(parseInt(x.minutes))}</span>
+            </div>
+        `).join('');
+    });
+}
+
+function stopAudio() {
+    ['audio-insert', 'audio-connect'].forEach(id => {
+        const a = $(id);
+        if(a) { a.pause(); a.currentTime = 0; }
+    });
+}
+
+function playAudio(t) {
+    stopAudio();
+    try { const a = $("audio-"+t); if(a) a.play().catch(()=>{}); } catch(e){}
+}
+
+function formatTime(s) {
+    if(s <= 0) return "00:00:00";
+    const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+    return [h,m,sec].map(v => v < 10 ? "0" + v : v).join(":");
+}
+
+function startTimer() {
+    if(timerInterval) clearInterval(timerInterval);
+    timerInterval = setInterval(() => {
+        if(timeLeft > 0) {
+            timeLeft--;
+            $("time-remaining").innerText = formatTime(timeLeft);
+        } else {
+            clearInterval(timerInterval);
+            checkStatus();
+        }
+    }, 1000);
+}
+
+function checkInternet() {
+    const img = new Image();
+    img.src = "https://www.google.com/favicon.ico?t=" + Date.now();
+    img.onload = () => { $("internet-status").innerText = "Status: Online"; $("internet-status").style.color = "var(--success)"; };
+    img.onerror = () => { $("internet-status").innerText = "Status: Local Only"; $("internet-status").style.color = "var(--warn)"; };
+}
+
+function checkStatus() {
+    fetch(api("action=status")).then(r=>r.json()).then(data => {
+        if(data.mac) { $("login-mac").innerText = data.mac; $("status-mac").innerText = data.mac; }
+        if(data.ip) { $("login-ip").innerText = data.ip; $("status-ip").innerText = data.ip; }
+        $("loading").style.display = "none";
+        ["login-section", "resume-section", "connected-section"].forEach(v => $(v).style.display = "none");
+        
+        if(data.authenticated === "true") {
+            $("connected-section").style.display = "block";
+            timeLeft = parseInt(data.time_remaining);
+            $("time-remaining").innerText = formatTime(timeLeft);
+            startTimer();
+            checkInternet();
+            setTimeout(checkStatus, 15000);
+        } else if(data.authenticated === "paused") {
+            $("resume-section").style.display = "block";
+            $("paused-time").innerText = formatTime(data.time_remaining);
+            setTimeout(checkStatus, 15000);
+        } else {
+            $("login-section").style.display = "block";
+        }
+    }).catch(() => { $("loading").style.display = "none"; $("login-section").style.display = "block"; });
+}
+
+function pauseTime() { closeConfirm(); fetch(api("action=pause")).then(() => checkStatus()); }
+function resumeTime() { fetch(api("action=resume")).then(() => checkStatus()); }
+
+function startCoin() {
+    fetch(api("action=start_coin")).then(r=>r.json()).then(data => {
+        if(data.status === "started") {
+            $("coin-modal").classList.add("active");
+            if(coinInterval) clearInterval(coinInterval);
+            coinInterval = setInterval(() => {
+                fetch(api("action=check_coin")).then(r=>r.json()).then(d => {
+                    $("coin-count").innerText = d.count;
+                    $("coin-time-display").innerText = formatReadableTime(parseInt(d.minutes));
+                    if(d.count > 0) $("connect-btn").style.display = "flex";
+                });
+            }, 1000);
+        }
+    });
+}
+
+function connect() {
+    stopAudio();
+    playAudio("connect");
+    fetch(api("action=connect")).then(() => { closeModal(); checkStatus(); });
+}
+
+function logout() { closeConfirm(); fetch(api("action=logout")).then(() => checkStatus()); }
+
+function closeModal() {
+    stopAudio();
+    $("coin-modal").classList.remove("active");
+    if(coinInterval) clearInterval(coinInterval);
+    fetch(api("action=release_coinslot_lock")).catch(() => {});
+}
+
+checkStatus();
+</script>
+</body>
+</html>

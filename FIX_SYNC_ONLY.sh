@@ -9,8 +9,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
 # Configuration
-CGI_FILE="/www/admin"
-[ -f "$CGI_FILE" ] || CGI_FILE="/www/cgi-bin/admin"
+CGI_FILE="/www/cgi-bin/admin"
+[ -f "$CGI_FILE" ] || CGI_FILE="/www/admin"
 BACKUP_FILE="${CGI_FILE}.backup.syncfix.$(date +%s)"
 SYNC_SCRIPT="/usr/bin/wifi_devices_sync_auto.sh"
 

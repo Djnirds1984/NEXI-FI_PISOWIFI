@@ -704,7 +704,8 @@ echo "Stopping web server temporarily..."
 /etc/init.d/uhttpd stop 2>/dev/null
 sleep 2
 
-cat << 'EOF' > /www/pisowifi
+mkdir -p /www/cgi-bin 2>/dev/null || true
+cat << 'EOF' > /www/cgi-bin/pisowifi
 #!/bin/sh
 
 # Simple captive portal detection - only check for specific known detection URLs
@@ -1574,7 +1575,7 @@ button:active { transform: scale(0.98); }
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl = "/pisowifi";
+var apiUrl = "/cgi-bin/pisowifi";
 var interval;
 var timerInterval;
 var timeLeft = 0;
@@ -1927,13 +1928,22 @@ checkStatus();
 HTML
 fi
 EOF
-chmod +x /www/pisowifi
-mkdir -p /www/cgi-bin 2>/dev/null || true
-ln -sf /www/pisowifi /www/cgi-bin/pisowifi 2>/dev/null || cp -f /www/pisowifi /www/cgi-bin/pisowifi 2>/dev/null || true
+chmod +x /www/cgi-bin/pisowifi
+cat << 'HTML' > /www/pisowifi
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="refresh" content="0; URL=/cgi-bin/pisowifi" />
+</head>
+<body>
+<a href="/cgi-bin/pisowifi">Continue</a>
+</body>
+</html>
+HTML
 
 # 3.5 Create Admin Panel CGI
 echo "Creating Admin Panel..."
-cat << 'EOF' > /www/admin
+cat << 'EOF' > /www/cgi-bin/admin
 #!/bin/sh
 
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
@@ -2029,6 +2039,29 @@ check_auth() {
     return 0
 }
 
+if echo "$QUERY_STRING" | $GREP -q "action=get_traffic"; then
+    if ! check_auth; then
+        echo "Status: 401 Unauthorized"
+        echo "Content-type: application/json"
+        echo ""
+        echo "{\"rx\":0,\"tx\":0,\"error\":\"unauthorized\"}"
+        exit 0
+    fi
+    WAN_IF=$($UCI -q get network.wan.device 2>/dev/null)
+    [ -z "$WAN_IF" ] && WAN_IF=$($UCI -q get network.wan.ifname 2>/dev/null)
+    WAN_IF=$(printf "%s" "$WAN_IF" | $AWK '{print $1}' | $SED 's/@//g')
+    [ -z "$WAN_IF" ] && WAN_IF="eth0"
+    STATS_LINE=$($AWK -v i="$WAN_IF" '$1==i":" {print $2 "|" $10}' /proc/net/dev 2>/dev/null)
+    RX=$(printf "%s" "$STATS_LINE" | $CUT -d'|' -f1)
+    TX=$(printf "%s" "$STATS_LINE" | $CUT -d'|' -f2)
+    case "$RX" in ''|*[!0-9]*) RX=0 ;; esac
+    case "$TX" in ''|*[!0-9]*) TX=0 ;; esac
+    echo "Content-type: application/json"
+    echo ""
+    echo "{\"rx\":$RX,\"tx\":$TX,\"iface\":\"$WAN_IF\"}"
+    exit 0
+fi
+
 # --- POST REQUEST HANDLER ---
 if [ "$REQUEST_METHOD" = "POST" ]; then
     # Use temporary file instead of variable to handle large uploads
@@ -2064,6 +2097,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
 
     sql_escape() {
         printf "%s" "$1" | $SED "s/'/''/g"
+    }
+
+    normalize_portal_file() {
+        FILE="$1"
+        [ -f "$FILE" ] || return 0
+        $SED -i "s|\"/pisowifi\"|\"/cgi-bin/pisowifi\"|g; s|'/pisowifi'|'/cgi-bin/pisowifi'|g" "$FILE" 2>/dev/null || true
     }
 
     cleanup_old_supa_tmp() {
@@ -2264,12 +2303,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         if [ "$PASS" = "$ADMIN_PASS" ]; then
             echo "Set-Cookie: session=logged_in_secret_token; Path=/; Max-Age=3600"
             echo "Status: 302 Found"
-            echo "Location: /admin?tab=dashboard"
+            echo "Location: /cgi-bin/admin?tab=dashboard"
             echo ""
             exit 0
         else
             echo "Status: 302 Found"
-            echo "Location: /admin?error=invalid"
+            echo "Location: /cgi-bin/admin?error=invalid"
             echo ""
             exit 0
         fi
@@ -2278,7 +2317,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     if [ "$ACTION" = "logout" ]; then
         echo "Set-Cookie: session=; Path=/; Max-Age=0"
         echo "Status: 302 Found"
-        echo "Location: /admin"
+        echo "Location: /cgi-bin/admin"
         echo ""
         exit 0
     fi
@@ -2308,7 +2347,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
 
              if [ -z "$SUPA_URL" ] || [ -z "$SUPA_KEY" ]; then
                  echo "Status: 302 Found"
-                 echo "Location: /admin?tab=settings&msg=license_missing_supabase"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_missing_supabase"
                  echo ""
                  exit 0
              fi
@@ -2366,7 +2405,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                          else
                              if [ "$BOUND_HW" != "$HARDWARE_ID" ]; then
                                  echo "Status: 302 Found"
-                                 echo "Location: /admin?tab=settings&msg=license_hw_mismatch"
+                                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_hw_mismatch"
                                  echo ""
                                  exit 0
                              fi
@@ -2429,12 +2468,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  fi
                  
                  echo "Status: 302 Found"
-                 echo "Location: /admin?tab=settings&msg=license_ok"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_ok"
                  echo ""
                  exit 0
              else
                  echo "Status: 302 Found"
-                 echo "Location: /admin?tab=settings&msg=license_not_found"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_not_found"
                  echo ""
                  exit 0
              fi
@@ -2454,7 +2493,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              sqlite3 "$DB_FILE" "DELETE FROM license;" 2>/dev/null
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=settings&msg=license_cleared"
+             echo "Location: /cgi-bin/admin?tab=settings&msg=license_cleared"
              echo ""
              exit 0
 
@@ -2465,7 +2504,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              "$UCI" commit pisowifi
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=settings&msg=centralized_cleared"
+             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_cleared"
              echo ""
              exit 0
 
@@ -2552,7 +2591,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                              "$UCI" commit pisowifi
                              
                              echo "Status: 302 Found"
-                             echo "Location: /admin?tab=settings&msg=centralized_ok"
+                             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_ok"
                              echo ""
                              exit 0
                          else
@@ -2560,7 +2599,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                              echo "<!-- DEBUG: Key found but not active or invalid response -->" >&2
                              echo "<!-- DEBUG: C_ACTIVE=$C_ACTIVE -->" >&2
                              echo "Status: 302 Found"
-                             echo "Location: /admin?tab=settings&msg=centralized_failed"
+                             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_failed"
                              echo ""
                              exit 0
                          fi
@@ -2624,7 +2663,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                                  "$UCI" commit pisowifi
                                  
                                  echo "Status: 302 Found"
-                                 echo "Location: /admin?tab=settings&msg=centralized_ok"
+                                 echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_ok"
                                  echo ""
                                  exit 0
                              fi
@@ -2635,7 +2674,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                          echo "<!-- DEBUG: Final failure - key not found or connection error -->" >&2
                          
                          echo "Status: 302 Found"
-                         echo "Location: /admin?tab=settings&msg=centralized_failed"
+                         echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_failed"
                          echo ""
                          exit 0
                      fi
@@ -2643,13 +2682,13 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                      echo "<!-- DEBUG: Regex FAILED for key: $C_KEY -->" >&2
                      echo "<!-- DEBUG: Expected format: CENTRAL-XXXXXXXX-XXXXXXXX -->" >&2
                      echo "Status: 302 Found"
-                     echo "Location: /admin?tab=settings&msg=centralized_format_error"
+                     echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_format_error"
                      echo ""
                      exit 0
                  fi
              else
                  echo "Status: 302 Found"
-                 echo "Location: /admin?tab=settings&msg=centralized_invalid_format"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_invalid_format"
                  echo ""
                  exit 0
              fi
@@ -2668,7 +2707,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=devices&msg=device_saved"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=device_saved"
              echo ""
              exit 0
 
@@ -2689,7 +2728,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=devices&msg=device_saved"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=device_saved"
              echo ""
              exit 0
 
@@ -2699,7 +2738,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              sqlite3 "$DB_FILE" "DELETE FROM devices WHERE mac='$MAC_SQL';" 2>/dev/null
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=devices&msg=device_deleted"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=device_deleted"
              echo ""
              exit 0
 
@@ -2735,7 +2774,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              fi
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=devices&msg=time_added"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=time_added"
              echo ""
              exit 0
 
@@ -2748,7 +2787,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              esac
              if [ "$DED_MIN" -le 0 ]; then
                  echo "Status: 302 Found"
-                 echo "Location: /admin?tab=devices&msg=time_deducted"
+                 echo "Location: /cgi-bin/admin?tab=devices&msg=time_deducted"
                  echo ""
                  exit 0
              fi
@@ -2783,7 +2822,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              fi
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=devices&msg=time_deducted"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=time_deducted"
              echo ""
              exit 0
 
@@ -2813,7 +2852,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              fi
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=devices&msg=sync_triggered"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=sync_triggered"
              echo ""
              exit 0
 
@@ -2922,7 +2961,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              /sbin/wifi reload
              
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=hotspot&msg=wifi_saved"
+             echo "Location: /cgi-bin/admin?tab=hotspot&msg=wifi_saved"
              echo ""
              exit 0
              
@@ -2931,7 +2970,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              [ -x "$RB" ] || RB="$(command -v reboot 2>/dev/null || echo reboot)"
              ( sleep 2; $RB ) >/dev/null 2>&1 &
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=settings&msg=rebooting"
+             echo "Location: /cgi-bin/admin?tab=settings&msg=rebooting"
              echo ""
              exit 0
 
@@ -2981,7 +3020,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=schedule&msg=sched_saved"
+             echo "Location: /cgi-bin/admin?tab=schedule&msg=sched_saved"
              echo ""
              exit 0
 
@@ -3031,7 +3070,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=schedule&msg=sched_saved"
+             echo "Location: /cgi-bin/admin?tab=schedule&msg=sched_saved"
              echo ""
              exit 0
 
@@ -3044,7 +3083,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              fi
              
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=settings&msg=saved"
+             echo "Location: /cgi-bin/admin?tab=settings&msg=saved"
              echo ""
              exit 0
              
@@ -3055,7 +3094,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              # Also update in DB for consistency
              sqlite3 $DB_FILE "UPDATE rates SET minutes=$RATE WHERE amount=1"
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=rates&msg=rate_saved"
+             echo "Location: /cgi-bin/admin?tab=rates&msg=rate_saved"
              echo ""
              exit 0
              
@@ -3084,7 +3123,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              
              sqlite3 $DB_FILE "INSERT OR REPLACE INTO rates (amount, minutes, is_pausable, expiration) VALUES ($AMOUNT, $MINUTES, $MODE, $EXPIRATION)"
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=rates&msg=rate_saved"
+             echo "Location: /cgi-bin/admin?tab=rates&msg=rate_saved"
              echo ""
              exit 0
              
@@ -3092,7 +3131,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              ID=$(get_post_var "rate_id")
              sqlite3 $DB_FILE "DELETE FROM rates WHERE id=$ID"
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=rates&msg=rate_deleted"
+             echo "Location: /cgi-bin/admin?tab=rates&msg=rate_deleted"
              echo ""
              exit 0
              
@@ -3133,7 +3172,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              /usr/bin/pisowifi_nftables.sh reload_qos >/dev/null 2>&1 &
              
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=qos&msg=qos_saved"
+             echo "Location: /cgi-bin/admin?tab=qos&msg=qos_saved"
              echo ""
              exit 0
              
@@ -3141,9 +3180,10 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              HTML_CONTENT=$(get_post_var "html_content")
              # Write to file
              echo "$HTML_CONTENT" > /www/portal.html
+             normalize_portal_file "/www/portal.html"
              
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=portal&msg=portal_saved"
+             echo "Location: /cgi-bin/admin?tab=portal&msg=portal_saved"
              echo ""
              exit 0
 
@@ -3154,10 +3194,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              [ -z "$SLUG" ] && SLUG=$($DATE +%s)
              HTML_CONTENT=$(get_post_var "html_content")
              mkdir -p /www/portal_themes
-             echo "$HTML_CONTENT" > "/www/portal_themes/custom_${SLUG}.html"
+             THEME_PATH="/www/portal_themes/custom_${SLUG}.html"
+             echo "$HTML_CONTENT" > "$THEME_PATH"
+             normalize_portal_file "$THEME_PATH"
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=portal&msg=theme_saved"
+             echo "Location: /cgi-bin/admin?tab=portal&msg=theme_saved"
              echo ""
              exit 0
 
@@ -3168,7 +3210,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              rm -f "/www/portal_themes/${THEME_ID}.html" 2>/dev/null || true
 
              echo "Status: 302 Found"
-             echo "Location: /admin?tab=portal&msg=theme_deleted"
+             echo "Location: /cgi-bin/admin?tab=portal&msg=theme_deleted"
              echo ""
              exit 0
              
@@ -3188,7 +3230,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  $GREP -a -o "filedata=[^&]*" "$POST_FILE" | $CUT -d= -f2- | $SED 's/%2B/+/g; s/%2F/\//g; s/%3D/=/g' | base64 -d > "/www/$FILENAME"
                  
                  echo "Status: 302 Found"
-                echo "Location: /admin?tab=portal&msg=upload_success"
+                echo "Location: /cgi-bin/admin?tab=portal&msg=upload_success"
                 echo ""
             else
                 echo "Status: 400 Bad Request"
@@ -3246,7 +3288,7 @@ fi
 
 if [ "$LIC_VALID" != "1" ] && [ "$TAB" != "settings" ]; then
     echo "Status: 302 Found"
-    echo "Location: /admin?tab=settings&msg=license_required"
+    echo "Location: /cgi-bin/admin?tab=settings&msg=license_required"
     echo ""
     exit 0
 fi
@@ -3364,7 +3406,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "  let rxData = [], txData = [], labels = [];"
         echo "  let lastRx = 0, lastTx = 0;"
         echo "  function updateChart() {"
-        echo "    fetch('/admin?action=get_traffic').then(r => r.json()).then(data => {"
+        echo "    fetch('/cgi-bin/admin?action=get_traffic').then(r => r.json()).then(data => {"
         echo "      const now = new Date().toLocaleTimeString();"
         echo "      if(lastRx > 0) {"
         echo "        const rxSpeed = (data.rx - lastRx) / 1024; // KB/s"
@@ -3840,7 +3882,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "  btn.disabled = true;"
         echo "  "
         echo "  function post(body){"
-        echo "    return fetch('/admin', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: body}).then(function(r){return r.text();});"
+        echo "    return fetch('/cgi-bin/admin', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: body}).then(function(r){return r.text();});"
         echo "  }"
         echo "  function parseJson(txt){"
         echo "    try { return JSON.parse(txt); } catch(e){ return {status:'error', message: txt}; }"
@@ -4148,7 +4190,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "  btn.disabled = true;"
         echo "  "
         echo "  // Use Raw Binary Upload to avoid RAM limits"
-        echo "  fetch('/admin?action=upload_raw&filename=' + filename, {"
+        echo "  fetch('/cgi-bin/admin?action=upload_raw&filename=' + filename, {"
         echo "    method: 'POST',"
         echo "    body: file"
         echo "  })"
@@ -4427,9 +4469,18 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
 
 echo "</body></html>"
 EOF
-chmod +x /www/admin
-mkdir -p /www/cgi-bin 2>/dev/null || true
-ln -sf /www/admin /www/cgi-bin/admin 2>/dev/null || cp -f /www/admin /www/cgi-bin/admin 2>/dev/null || true
+chmod +x /www/cgi-bin/admin
+cat << 'HTML' > /www/admin
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="refresh" content="0; URL=/cgi-bin/admin" />
+</head>
+<body>
+<a href="/cgi-bin/admin">Continue</a>
+</body>
+</html>
+HTML
 
 mkdir -p /www/portal_themes
 
@@ -4546,7 +4597,7 @@ button:active{transform: scale(0.99);}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl = "/pisowifi";
+var apiUrl = "/cgi-bin/pisowifi";
 var interval;
 var timerInterval;
 var timeLeft = 0;
@@ -4886,7 +4937,7 @@ button:active{transform:scale(0.99)}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl = "/pisowifi";
+var apiUrl = "/cgi-bin/pisowifi";
 var interval;
 var timerInterval;
 var timeLeft = 0;
@@ -5028,7 +5079,7 @@ button:active{transform:scale(0.99)}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl="/pisowifi";var interval;var timerInterval;var timeLeft=0;
+var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;
 function openRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="block";loadRates();}
 function closeRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="none";}
 function loadRates(){fetch(apiUrl+"?action=rates").then(r=>r.json()).then(function(d){var el=document.getElementById("rates-body");if(!el)return;if(!d||!d.rates||!d.rates.length){el.innerHTML="<div>No rates set.</div>";return;}var html="<div style='display:grid; gap:8px; margin-top:10px;'>";d.rates.forEach(function(x){html+="<div style='display:flex; justify-content:space-between; padding:10px; border-radius:12px; border:1px solid #e2e8f0; background:#f8fafc;'><div style='font-weight:800;'>₱"+x.amount+"</div><div>"+x.minutes+" min</div></div>";});html+="</div>";el.innerHTML=html;}).catch(function(){var el=document.getElementById("rates-body");if(el)el.innerHTML="<div>Failed to load rates.</div>";});}
@@ -5166,7 +5217,7 @@ button:active{transform:scale(0.99)}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl="/pisowifi";var interval;var timerInterval;var timeLeft=0;
+var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;
 function openRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="block";loadRates();}
 function closeRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="none";}
 function loadRates(){fetch(apiUrl+"?action=rates").then(r=>r.json()).then(function(d){var el=document.getElementById("rates-body");if(!el)return;if(!d||!d.rates||!d.rates.length){el.innerHTML="<div>No rates set.</div>";return;}var html="<div style='display:grid; gap:8px; margin-top:10px;'>";d.rates.forEach(function(x){html+="<div style='display:flex; justify-content:space-between; padding:10px; border-radius:14px; background: rgba(15,23,42,0.04); border:1px solid rgba(15,23,42,0.08);'><div style='font-weight:900;'>₱"+x.amount+"</div><div>"+x.minutes+" min</div></div>";});html+="</div>";el.innerHTML=html;}).catch(function(){var el=document.getElementById("rates-body");if(el)el.innerHTML="<div>Failed to load rates.</div>";});}
@@ -5198,8 +5249,8 @@ echo "Setting up redirect..."
 
 # Configure uhttpd to handle 404 errors by serving the CGI script
 # This is crucial for captive portal detection (e.g. /generate_204)
-uci set uhttpd.main.error_page='/pisowifi'
-uci set uhttpd.main.cgi_prefix='/'
+uci set uhttpd.main.error_page='/cgi-bin/pisowifi'
+uci set uhttpd.main.cgi_prefix='/cgi-bin'
 uci commit uhttpd
 
 cat << 'EOF' > /www/index.html
