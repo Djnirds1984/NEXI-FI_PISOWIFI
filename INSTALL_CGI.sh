@@ -493,7 +493,8 @@ start_daemon() {
 
                 sqlite3 -separator '|' "$DB_FILE" "SELECT mac, ip FROM users WHERE session_end > $NOW AND paused_time = 0" 2>/dev/null | while IFS='|' read m ip; do
                     [ -z "$m" ] && continue
-                    if ! nft list chain inet pisowifi pisowifi_filter 2>/dev/null | grep -q "MAC:$m"; then
+                    if ! nft list chain inet pisowifi pisowifi_filter 2>/dev/null | grep -q "MAC:$m" \
+                       || ! nft list chain inet pisowifi pisowifi_nat 2>/dev/null | grep -q "MAC:$m"; then
                         $FIREWALL_SCRIPT allow "$m" "$ip" >/dev/null 2>&1
                     fi
                 done
@@ -518,6 +519,23 @@ case "$1" in
 esac
 EOF
 chmod +x /usr/bin/pisowifi_sessiond.sh
+
+cat << 'EOF' > /usr/bin/pisowifi_maintenance.sh
+#!/bin/sh
+
+DB_FILE="/etc/pisowifi/pisowifi.db"
+
+case "$1" in
+    reboot)
+        /sbin/reboot
+        ;;
+    cleanup_devices)
+        NOW=$(date +%s)
+        sqlite3 "$DB_FILE" "DELETE FROM devices WHERE mac NOT IN (SELECT mac FROM users WHERE (session_end > $NOW) OR (paused_time > 0));" 2>/dev/null || true
+        ;;
+esac
+EOF
+chmod +x /usr/bin/pisowifi_maintenance.sh
 
 # 2. Ensure Button Script is Present
 # Always overwrite to ensure we use the SQLite version compatible with this CGI script
@@ -686,7 +704,7 @@ echo "Stopping web server temporarily..."
 /etc/init.d/uhttpd stop 2>/dev/null
 sleep 2
 
-cat << 'EOF' > /www/cgi-bin/pisowifi
+cat << 'EOF' > /www/pisowifi
 #!/bin/sh
 
 # Simple captive portal detection - only check for specific known detection URLs
@@ -932,6 +950,43 @@ supa_insert() {
     rm -f "$tmp"
 }
 
+supa_key_effective() {
+    if [ -n "$SUPA_SERVICE_KEY" ]; then
+        echo "$SUPA_SERVICE_KEY"
+        return
+    fi
+    echo "$SUPA_KEY"
+}
+
+sync_wifi_devices_remaining() {
+    local mac="$1"
+    local remaining="$2"
+    local force="$3"
+
+    [ -z "$mac" ] && return
+    [ -z "$SUPA_URL" ] && return
+    local key
+    key=$(supa_key_effective)
+    [ -z "$key" ] && return
+
+    local now
+    now=$(date +%s)
+    local keyfile="/tmp/pisowifi_wifi_rem_$(echo "$mac" | tr -d ':' | tr 'A-Z' 'a-z')"
+    if [ "$force" != "1" ] && [ -f "$keyfile" ]; then
+        local last_ts last_rem
+        last_ts=$(cut -d'|' -f1 "$keyfile" 2>/dev/null)
+        last_rem=$(cut -d'|' -f2 "$keyfile" 2>/dev/null)
+        if [ -n "$last_ts" ] && [ $((now - last_ts)) -lt 60 ] 2>/dev/null && [ "$last_rem" = "$remaining" ]; then
+            return
+        fi
+    fi
+    echo "$now|$remaining" > "$keyfile" 2>/dev/null || true
+
+    local body
+    body=$(printf '{"remaining_seconds":%s}' "${remaining:-0}")
+    supa_patch "$SUPA_URL" "$key" "wifi_devices?mac_address=eq.$mac" "$body"
+}
+
 get_coin_count() {
     local mac="$1"
     # Get coins from global counter (mac 00:00:00:00:00:00)
@@ -1057,9 +1112,15 @@ handle_api() {
                 if [ "$PAUSED_TIME" -gt 0 ] 2>/dev/null; then
                     AUTH="paused"
                     TIME_REMAINING=$PAUSED_TIME
+                    $FIREWALL_SCRIPT deny "$MAC" >/dev/null 2>&1 || true
+                    sync_wifi_devices_remaining "$MAC" "$TIME_REMAINING" "0"
                 elif [ "$EXPIRY" -gt "$NOW" ] 2>/dev/null; then
                     AUTH="true"
                     TIME_REMAINING=$((EXPIRY - NOW))
+                    if ! nft list chain inet pisowifi pisowifi_filter 2>/dev/null | grep -qi "$MAC"; then
+                        $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR" >/dev/null 2>&1 || true
+                    fi
+                    sync_wifi_devices_remaining "$MAC" "$TIME_REMAINING" "0"
                 else
                     if [ -n "$SUPA_URL" ] && [ -n "$SID" ]; then
                         supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=remaining_seconds,connected_at,is_paused&session_uuid=eq.$SID&limit=1"
@@ -1079,6 +1140,7 @@ handle_api() {
                                 sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time, session_token) VALUES ('$MAC', '$REMOTE_ADDR', $NEW_EXPIRY, 0, '$SID');" 2>/dev/null \
                                 || sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time) VALUES ('$MAC', '$REMOTE_ADDR', $NEW_EXPIRY, 0);" 2>/dev/null || true
                                 $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
+                                sync_wifi_devices_remaining "$MAC" "$REM_SEC" "1"
                             fi
                         fi
                     fi
@@ -1202,6 +1264,8 @@ handle_api() {
                         supa_insert "$SUPA_URL" "$SUPA_KEY" "sessions" "$SID_BODY"
                     fi
                 fi
+
+                sync_wifi_devices_remaining "$MAC" "$((NEW_EXPIRY - NOW))" "1"
                 
                 # Allow Access
                 $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
@@ -1239,6 +1303,8 @@ handle_api() {
                         supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
                     fi
                 fi
+
+                sync_wifi_devices_remaining "$TARGET_MAC" "$REMAINING" "1"
                 
                 # Cut internet
                 $FIREWALL_SCRIPT deny "$TARGET_MAC"
@@ -1272,6 +1338,8 @@ handle_api() {
                         supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
                     fi
                 fi
+
+                sync_wifi_devices_remaining "$TARGET_MAC" "$PAUSED" "1"
                 
                 # Restore internet
                 $FIREWALL_SCRIPT allow "$TARGET_MAC" "$REMOTE_ADDR"
@@ -1303,6 +1371,8 @@ handle_api() {
                     supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
                 fi
             fi
+
+            sync_wifi_devices_remaining "$TARGET_MAC" "0" "1"
             
             json_response "{\"status\": \"success\"}"
             ;;
@@ -1504,7 +1574,7 @@ button:active { transform: scale(0.98); }
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl = "/cgi-bin/pisowifi";
+var apiUrl = "/pisowifi";
 var interval;
 var timerInterval;
 var timeLeft = 0;
@@ -1849,16 +1919,21 @@ setTimeout(testDNS, 3000);
 checkStatus();
 </script>
 
+<div style="text-align:center;padding:16px 10px;color:#64748b;font-size:12px;">
+  <a href="https://www.facebook.com/ajcabz84" target="_blank" rel="noopener noreferrer" style="color:#0ea5e9;text-decoration:none;font-weight:600;">Facebook</a>
+</div>
 </body>
 </html>
 HTML
 fi
 EOF
-chmod +x /www/cgi-bin/pisowifi
+chmod +x /www/pisowifi
+mkdir -p /www/cgi-bin 2>/dev/null || true
+ln -sf /www/pisowifi /www/cgi-bin/pisowifi 2>/dev/null || cp -f /www/pisowifi /www/cgi-bin/pisowifi 2>/dev/null || true
 
 # 3.5 Create Admin Panel CGI
 echo "Creating Admin Panel..."
-cat << 'EOF' > /www/cgi-bin/admin
+cat << 'EOF' > /www/admin
 #!/bin/sh
 
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
@@ -1991,7 +2066,13 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         printf "%s" "$1" | $SED "s/'/''/g"
     }
 
+    cleanup_old_supa_tmp() {
+        command -v find >/dev/null 2>&1 || return 0
+        find /tmp -maxdepth 1 -type f \( -name 'pisowifi_supa_*' -o -name 'pisowifi_supa_err_*' \) -mmin +60 -delete 2>/dev/null || true
+    }
+
     supa_request() {
+        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         PATH="$3"
@@ -2023,6 +2104,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     }
 
     supa_patch() {
+        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         PATH="$3"
@@ -2055,6 +2137,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     }
 
     supa_rpc() {
+        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         FN="$3"
@@ -2087,6 +2170,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     }
 
     supa_insert() {
+        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         PATH="$3"
@@ -2180,12 +2264,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         if [ "$PASS" = "$ADMIN_PASS" ]; then
             echo "Set-Cookie: session=logged_in_secret_token; Path=/; Max-Age=3600"
             echo "Status: 302 Found"
-            echo "Location: /cgi-bin/admin?tab=dashboard"
+            echo "Location: /admin?tab=dashboard"
             echo ""
             exit 0
         else
             echo "Status: 302 Found"
-            echo "Location: /cgi-bin/admin?error=invalid"
+            echo "Location: /admin?error=invalid"
             echo ""
             exit 0
         fi
@@ -2194,7 +2278,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     if [ "$ACTION" = "logout" ]; then
         echo "Set-Cookie: session=; Path=/; Max-Age=0"
         echo "Status: 302 Found"
-        echo "Location: /cgi-bin/admin"
+        echo "Location: /admin"
         echo ""
         exit 0
     fi
@@ -2224,7 +2308,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
 
              if [ -z "$SUPA_URL" ] || [ -z "$SUPA_KEY" ]; then
                  echo "Status: 302 Found"
-                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_missing_supabase"
+                 echo "Location: /admin?tab=settings&msg=license_missing_supabase"
                  echo ""
                  exit 0
              fi
@@ -2282,7 +2366,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                          else
                              if [ "$BOUND_HW" != "$HARDWARE_ID" ]; then
                                  echo "Status: 302 Found"
-                                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_hw_mismatch"
+                                 echo "Location: /admin?tab=settings&msg=license_hw_mismatch"
                                  echo ""
                                  exit 0
                              fi
@@ -2345,12 +2429,12 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  fi
                  
                  echo "Status: 302 Found"
-                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_ok"
+                 echo "Location: /admin?tab=settings&msg=license_ok"
                  echo ""
                  exit 0
              else
                  echo "Status: 302 Found"
-                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_not_found"
+                 echo "Location: /admin?tab=settings&msg=license_not_found"
                  echo ""
                  exit 0
              fi
@@ -2370,7 +2454,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              sqlite3 "$DB_FILE" "DELETE FROM license;" 2>/dev/null
 
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=settings&msg=license_cleared"
+             echo "Location: /admin?tab=settings&msg=license_cleared"
              echo ""
              exit 0
 
@@ -2381,7 +2465,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              "$UCI" commit pisowifi
 
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_cleared"
+             echo "Location: /admin?tab=settings&msg=centralized_cleared"
              echo ""
              exit 0
 
@@ -2468,7 +2552,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                              "$UCI" commit pisowifi
                              
                              echo "Status: 302 Found"
-                             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_ok"
+                             echo "Location: /admin?tab=settings&msg=centralized_ok"
                              echo ""
                              exit 0
                          else
@@ -2476,7 +2560,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                              echo "<!-- DEBUG: Key found but not active or invalid response -->" >&2
                              echo "<!-- DEBUG: C_ACTIVE=$C_ACTIVE -->" >&2
                              echo "Status: 302 Found"
-                             echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_failed"
+                             echo "Location: /admin?tab=settings&msg=centralized_failed"
                              echo ""
                              exit 0
                          fi
@@ -2540,7 +2624,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                                  "$UCI" commit pisowifi
                                  
                                  echo "Status: 302 Found"
-                                 echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_ok"
+                                 echo "Location: /admin?tab=settings&msg=centralized_ok"
                                  echo ""
                                  exit 0
                              fi
@@ -2551,7 +2635,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                          echo "<!-- DEBUG: Final failure - key not found or connection error -->" >&2
                          
                          echo "Status: 302 Found"
-                         echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_failed"
+                         echo "Location: /admin?tab=settings&msg=centralized_failed"
                          echo ""
                          exit 0
                      fi
@@ -2559,13 +2643,13 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                      echo "<!-- DEBUG: Regex FAILED for key: $C_KEY -->" >&2
                      echo "<!-- DEBUG: Expected format: CENTRAL-XXXXXXXX-XXXXXXXX -->" >&2
                      echo "Status: 302 Found"
-                     echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_format_error"
+                     echo "Location: /admin?tab=settings&msg=centralized_format_error"
                      echo ""
                      exit 0
                  fi
              else
                  echo "Status: 302 Found"
-                 echo "Location: /cgi-bin/admin?tab=settings&msg=centralized_invalid_format"
+                 echo "Location: /admin?tab=settings&msg=centralized_invalid_format"
                  echo ""
                  exit 0
              fi
@@ -2584,7 +2668,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
 
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=devices&msg=device_saved"
+             echo "Location: /admin?tab=devices&msg=device_saved"
              echo ""
              exit 0
 
@@ -2595,6 +2679,9 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              NOTES=$(get_post_var "notes")
 
              MAC_SQL=$(sql_escape "$MAC")
+             if [ -z "$IP_ADDR" ]; then
+                 IP_ADDR=$(sqlite3 "$DB_FILE" "SELECT ip FROM devices WHERE mac='$MAC_SQL' LIMIT 1;" 2>/dev/null)
+             fi
              IP_SQL=$(sql_escape "$IP_ADDR")
              HOST_SQL=$(sql_escape "$HOSTNAME")
              NOTES_SQL=$(sql_escape "$NOTES")
@@ -2602,7 +2689,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
 
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=devices&msg=device_saved"
+             echo "Location: /admin?tab=devices&msg=device_saved"
              echo ""
              exit 0
 
@@ -2612,7 +2699,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              sqlite3 "$DB_FILE" "DELETE FROM devices WHERE mac='$MAC_SQL';" 2>/dev/null
 
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=devices&msg=device_deleted"
+             echo "Location: /admin?tab=devices&msg=device_deleted"
              echo ""
              exit 0
 
@@ -2648,7 +2735,85 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              fi
 
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=devices&msg=time_added"
+             echo "Location: /admin?tab=devices&msg=time_added"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "device_deduct_time" ]; then
+             MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
+             IP_ADDR=$(get_post_var "ip")
+             DED_MIN=$(get_post_var "deduct_minutes")
+             case "$DED_MIN" in
+                 ''|*[!0-9]*) DED_MIN=0 ;;
+             esac
+             if [ "$DED_MIN" -le 0 ]; then
+                 echo "Status: 302 Found"
+                 echo "Location: /admin?tab=devices&msg=time_deducted"
+                 echo ""
+                 exit 0
+             fi
+
+             NOW_TS=$($DATE +%s)
+             DED_SEC=$((DED_MIN * 60))
+             MAC_SQL=$(sql_escape "$MAC")
+             USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$MAC_SQL' LIMIT 1;" 2>/dev/null)
+             CUR_END=$(echo "$USER_ROW" | $CUT -d'|' -f1)
+             CUR_PAUSED=$(echo "$USER_ROW" | $CUT -d'|' -f2)
+             [ -z "$CUR_END" ] && CUR_END=0
+             [ -z "$CUR_PAUSED" ] && CUR_PAUSED=0
+
+             if [ "$CUR_PAUSED" -gt 0 ] 2>/dev/null; then
+                 NEW_PAUSED=$((CUR_PAUSED - DED_SEC))
+                 if [ "$NEW_PAUSED" -le 0 ] 2>/dev/null; then
+                     sqlite3 "$DB_FILE" "UPDATE users SET session_end=0, paused_time=0 WHERE mac='$MAC_SQL';" 2>/dev/null || true
+                     /usr/bin/pisowifi_nftables.sh deny "$MAC" >/dev/null 2>&1 &
+                 else
+                     sqlite3 "$DB_FILE" "UPDATE users SET paused_time=$NEW_PAUSED WHERE mac='$MAC_SQL';" 2>/dev/null || true
+                     /usr/bin/pisowifi_nftables.sh deny "$MAC" >/dev/null 2>&1 &
+                 fi
+             elif [ "$CUR_END" -gt "$NOW_TS" ] 2>/dev/null; then
+                 NEW_END=$((CUR_END - DED_SEC))
+                 if [ "$NEW_END" -le "$NOW_TS" ] 2>/dev/null; then
+                     sqlite3 "$DB_FILE" "UPDATE users SET session_end=0, paused_time=0 WHERE mac='$MAC_SQL';" 2>/dev/null || true
+                     /usr/bin/pisowifi_nftables.sh deny "$MAC" >/dev/null 2>&1 &
+                 else
+                     sqlite3 "$DB_FILE" "UPDATE users SET session_end=$NEW_END WHERE mac='$MAC_SQL';" 2>/dev/null || true
+                     [ -n "$IP_ADDR" ] && /usr/bin/pisowifi_nftables.sh allow "$MAC" "$IP_ADDR" >/dev/null 2>&1 &
+                 fi
+             fi
+
+             echo "Status: 302 Found"
+             echo "Location: /admin?tab=devices&msg=time_deducted"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "device_sync_time" ]; then
+             MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
+             NOW_TS=$($DATE +%s)
+             MAC_SQL=$(sql_escape "$MAC")
+             USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$MAC_SQL' LIMIT 1;" 2>/dev/null)
+             CUR_END=$(echo "$USER_ROW" | $CUT -d'|' -f1)
+             CUR_PAUSED=$(echo "$USER_ROW" | $CUT -d'|' -f2)
+             [ -z "$CUR_END" ] && CUR_END=0
+             [ -z "$CUR_PAUSED" ] && CUR_PAUSED=0
+             REM_SEC=0
+             if [ "$CUR_PAUSED" -gt 0 ] 2>/dev/null; then
+                 REM_SEC="$CUR_PAUSED"
+             elif [ "$CUR_END" -gt "$NOW_TS" ] 2>/dev/null; then
+                 REM_SEC=$((CUR_END - NOW_TS))
+             fi
+
+             SUPA_URL_TIME=$("$UCI" get pisowifi.supabase.url 2>/dev/null)
+             SUPA_KEY_TIME=$("$UCI" get pisowifi.supabase.key 2>/dev/null)
+             SUPA_SVC_TIME=$("$UCI" get pisowifi.license.supabase_service_key 2>/dev/null)
+             [ -n "$SUPA_SVC_TIME" ] && SUPA_KEY_TIME="$SUPA_SVC_TIME"
+             if [ -n "$SUPA_URL_TIME" ] && [ -n "$SUPA_KEY_TIME" ]; then
+                 BODY="{\"remaining_seconds\": $REM_SEC, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                 ( supa_patch "$SUPA_URL_TIME" "$SUPA_KEY_TIME" "wifi_devices?mac_address=eq.$MAC" "$BODY" ) >/dev/null 2>&1 &
+             fi
+
+             echo "Status: 302 Found"
+             echo "Location: /admin?tab=devices&msg=sync_triggered"
              echo ""
              exit 0
 
@@ -2668,30 +2833,64 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  echo '{"status":"error","message":"No active centralized key found. Please activate a centralized key first."}'
                  exit 0
              fi
-             
-             # Run sync script
-             if [ -f "/usr/bin/wifi_devices_sync_auto.sh" ]; then
-                 SYNC_RESULT=$(sh /usr/bin/wifi_devices_sync_auto.sh 2>&1)
-                 SYNC_STATUS=$?
-                 
-                 echo "Content-type: application/json"
-                 echo ""
-                 if [ $SYNC_STATUS -eq 0 ]; then
-                     SYNC_SAFE=$(printf '%s' "$SYNC_RESULT" | $TR '\r\n' ' ' | $SED 's/\\/\\\\/g; s/"/\\"/g')
-                     if [ -n "$SYNC_SAFE" ]; then
-                         echo "{\"status\":\"success\",\"message\":\"Device sync completed: $SYNC_SAFE\"}"
-                     else
-                         echo '{"status":"success","message":"Device sync completed successfully."}'
-                     fi
-                 else
-                     SYNC_SAFE=$(printf '%s' "$SYNC_RESULT" | $TR '\r\n' ' ' | $SED 's/\\/\\\\/g; s/"/\\"/g')
-                     echo "{\"status\":\"error\",\"message\":\"Sync failed: $SYNC_SAFE\"}"
-                 fi
-             else
-                 echo "Content-type: application/json"
-                 echo ""
-                 echo '{"status":"error","message":"Sync script not found. Please reinstall device sync functionality."}'
+
+             SYNC_PIDFILE="/tmp/pisowifi_sync_devices.pid"
+             SYNC_OUT="/tmp/pisowifi_sync_devices.out"
+             SYNC_EXIT="/tmp/pisowifi_sync_devices.exit"
+             SYNC_STARTED="/tmp/pisowifi_sync_devices.started"
+
+             echo "Content-type: application/json"
+             echo ""
+
+             if [ -f "$SYNC_PIDFILE" ] && kill -0 "$(cat "$SYNC_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+                 echo '{"status":"running","message":"Sync already running"}'
+                 exit 0
              fi
+
+             if [ ! -x "/usr/bin/wifi_devices_sync_auto.sh" ]; then
+                 echo '{"status":"error","message":"Sync script not found. Please reinstall device sync functionality."}'
+                 exit 0
+             fi
+
+             rm -f "$SYNC_EXIT" "$SYNC_OUT"
+             echo "$($DATE +%s)" > "$SYNC_STARTED" 2>/dev/null || true
+
+             (
+                 /usr/bin/wifi_devices_sync_auto.sh upload >"$SYNC_OUT" 2>&1
+                 echo $? > "$SYNC_EXIT"
+                 tail -c 4000 "$SYNC_OUT" > "${SYNC_OUT}.tmp" 2>/dev/null && mv "${SYNC_OUT}.tmp" "$SYNC_OUT"
+                 rm -f "$SYNC_PIDFILE"
+             ) >/dev/null 2>&1 &
+             echo $! > "$SYNC_PIDFILE" 2>/dev/null || true
+
+             echo '{"status":"started","message":"Sync started"}'
+             exit 0
+
+        elif [ "$ACTION" = "sync_status" ]; then
+             SYNC_PIDFILE="/tmp/pisowifi_sync_devices.pid"
+             SYNC_OUT="/tmp/pisowifi_sync_devices.out"
+             SYNC_EXIT="/tmp/pisowifi_sync_devices.exit"
+
+             echo "Content-type: application/json"
+             echo ""
+
+             if [ -f "$SYNC_PIDFILE" ] && kill -0 "$(cat "$SYNC_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+                 MSG="$(tail -n 5 "$SYNC_OUT" 2>/dev/null | $TR '\r\n' ' ' | $SED 's/\\/\\\\/g; s/"/\\"/g')"
+                 echo "{\"status\":\"running\",\"message\":\"$MSG\"}"
+                 exit 0
+             fi
+
+             if [ -f "$SYNC_EXIT" ]; then
+                 CODE="$(cat "$SYNC_EXIT" 2>/dev/null)"
+                 MSG="$(tail -n 20 "$SYNC_OUT" 2>/dev/null | $TR '\r\n' ' ' | $SED 's/\\/\\\\/g; s/"/\\"/g')"
+                 case "$CODE" in
+                     0) echo "{\"status\":\"success\",\"message\":\"$MSG\"}" ;;
+                     *) echo "{\"status\":\"error\",\"message\":\"$MSG\"}" ;;
+                 esac
+                 exit 0
+             fi
+
+             echo '{"status":"idle","message":"No sync running"}'
              exit 0
 
         elif [ "$ACTION" = "update_wifi" ]; then
@@ -2723,10 +2922,119 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              /sbin/wifi reload
              
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=hotspot&msg=wifi_saved"
+             echo "Location: /admin?tab=hotspot&msg=wifi_saved"
              echo ""
              exit 0
              
+        elif [ "$ACTION" = "router_reboot" ]; then
+             RB="/sbin/reboot"
+             [ -x "$RB" ] || RB="$(command -v reboot 2>/dev/null || echo reboot)"
+             ( sleep 2; $RB ) >/dev/null 2>&1 &
+             echo "Status: 302 Found"
+             echo "Location: /admin?tab=settings&msg=rebooting"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "sched_save_reboot" ]; then
+             EN="$(get_post_var "enabled")"
+             FREQ="$(get_post_var "freq")"
+             TM="$(get_post_var "time")"
+             DOW="$(get_post_var "dow")"
+             [ -z "$EN" ] && EN="0"
+             [ -z "$FREQ" ] && FREQ="daily"
+             [ -z "$TM" ] && TM="03:00"
+             [ -z "$DOW" ] && DOW="0"
+
+             HH=$(printf "%s" "$TM" | $CUT -d: -f1)
+             MM=$(printf "%s" "$TM" | $CUT -d: -f2)
+             case "$HH" in ''|*[!0-9]*) HH="" ;; esac
+             case "$MM" in ''|*[!0-9]*) MM="" ;; esac
+             [ -z "$HH" ] && HH="3"
+             [ -z "$MM" ] && MM="0"
+             case "$DOW" in ''|*[!0-9]*) DOW="0" ;; esac
+
+             $UCI -q set pisowifi.schedule=schedule 2>/dev/null || true
+             $UCI -q set pisowifi.schedule.reboot_enabled="$EN" 2>/dev/null || true
+             $UCI -q set pisowifi.schedule.reboot_freq="$FREQ" 2>/dev/null || true
+             $UCI -q set pisowifi.schedule.reboot_time="$TM" 2>/dev/null || true
+             $UCI -q set pisowifi.schedule.reboot_dow="$DOW" 2>/dev/null || true
+             $UCI -q commit pisowifi 2>/dev/null || true
+
+             CRON_FILE="/etc/crontabs/root"
+             [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
+             TMP_CRON="/tmp/pisowifi_cron_root_$$"
+             if [ -f "$CRON_FILE" ]; then
+                 $CAT "$CRON_FILE" 2>/dev/null | $GREP -v "pisowifi_sched_reboot" > "$TMP_CRON" 2>/dev/null
+             else
+                 $CAT /dev/null > "$TMP_CRON" 2>/dev/null
+             fi
+
+             if [ "$EN" = "1" ]; then
+                 CRON_EXPR="$MM $HH * * *"
+                 if [ "$FREQ" = "weekly" ]; then
+                     CRON_EXPR="$MM $HH * * $DOW"
+                 fi
+                 echo "$CRON_EXPR sh /usr/bin/pisowifi_maintenance.sh reboot >/dev/null 2>&1 # pisowifi_sched_reboot" >> "$TMP_CRON"
+             fi
+             mv "$TMP_CRON" "$CRON_FILE" 2>/dev/null || true
+             chmod 600 "$CRON_FILE" 2>/dev/null || true
+             [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
+
+             echo "Status: 302 Found"
+             echo "Location: /admin?tab=schedule&msg=sched_saved"
+             echo ""
+             exit 0
+
+        elif [ "$ACTION" = "sched_save_cleanup" ]; then
+             EN="$(get_post_var "enabled")"
+             FREQ="$(get_post_var "freq")"
+             TM="$(get_post_var "time")"
+             DOW="$(get_post_var "dow")"
+             [ -z "$EN" ] && EN="0"
+             [ -z "$FREQ" ] && FREQ="daily"
+             [ -z "$TM" ] && TM="04:00"
+             [ -z "$DOW" ] && DOW="0"
+
+             HH=$(printf "%s" "$TM" | $CUT -d: -f1)
+             MM=$(printf "%s" "$TM" | $CUT -d: -f2)
+             case "$HH" in ''|*[!0-9]*) HH="" ;; esac
+             case "$MM" in ''|*[!0-9]*) MM="" ;; esac
+             [ -z "$HH" ] && HH="4"
+             [ -z "$MM" ] && MM="0"
+             case "$DOW" in ''|*[!0-9]*) DOW="0" ;; esac
+
+             $UCI -q set pisowifi.schedule=schedule 2>/dev/null || true
+             $UCI -q set pisowifi.schedule.cleanup_enabled="$EN" 2>/dev/null || true
+             $UCI -q set pisowifi.schedule.cleanup_freq="$FREQ" 2>/dev/null || true
+             $UCI -q set pisowifi.schedule.cleanup_time="$TM" 2>/dev/null || true
+             $UCI -q set pisowifi.schedule.cleanup_dow="$DOW" 2>/dev/null || true
+             $UCI -q commit pisowifi 2>/dev/null || true
+
+             CRON_FILE="/etc/crontabs/root"
+             [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
+             TMP_CRON="/tmp/pisowifi_cron_root_$$"
+             if [ -f "$CRON_FILE" ]; then
+                 $CAT "$CRON_FILE" 2>/dev/null | $GREP -v "pisowifi_sched_cleanup" > "$TMP_CRON" 2>/dev/null
+             else
+                 $CAT /dev/null > "$TMP_CRON" 2>/dev/null
+             fi
+
+             if [ "$EN" = "1" ]; then
+                 CRON_EXPR="$MM $HH * * *"
+                 if [ "$FREQ" = "weekly" ]; then
+                     CRON_EXPR="$MM $HH * * $DOW"
+                 fi
+                 echo "$CRON_EXPR sh /usr/bin/pisowifi_maintenance.sh cleanup_devices >/dev/null 2>&1 # pisowifi_sched_cleanup" >> "$TMP_CRON"
+             fi
+             mv "$TMP_CRON" "$CRON_FILE" 2>/dev/null || true
+             chmod 600 "$CRON_FILE" 2>/dev/null || true
+             [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
+
+             echo "Status: 302 Found"
+             echo "Location: /admin?tab=schedule&msg=sched_saved"
+             echo ""
+             exit 0
+
         elif [ "$ACTION" = "update_settings" ]; then
              NEW_PASS=$(get_post_var "new_pass")
              
@@ -2736,7 +3044,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              fi
              
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=settings&msg=saved"
+             echo "Location: /admin?tab=settings&msg=saved"
              echo ""
              exit 0
              
@@ -2747,7 +3055,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              # Also update in DB for consistency
              sqlite3 $DB_FILE "UPDATE rates SET minutes=$RATE WHERE amount=1"
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=rates&msg=rate_saved"
+             echo "Location: /admin?tab=rates&msg=rate_saved"
              echo ""
              exit 0
              
@@ -2776,7 +3084,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              
              sqlite3 $DB_FILE "INSERT OR REPLACE INTO rates (amount, minutes, is_pausable, expiration) VALUES ($AMOUNT, $MINUTES, $MODE, $EXPIRATION)"
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=rates&msg=rate_saved"
+             echo "Location: /admin?tab=rates&msg=rate_saved"
              echo ""
              exit 0
              
@@ -2784,7 +3092,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              ID=$(get_post_var "rate_id")
              sqlite3 $DB_FILE "DELETE FROM rates WHERE id=$ID"
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=rates&msg=rate_deleted"
+             echo "Location: /admin?tab=rates&msg=rate_deleted"
              echo ""
              exit 0
              
@@ -2825,7 +3133,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              /usr/bin/pisowifi_nftables.sh reload_qos >/dev/null 2>&1 &
              
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=qos&msg=qos_saved"
+             echo "Location: /admin?tab=qos&msg=qos_saved"
              echo ""
              exit 0
              
@@ -2835,7 +3143,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              echo "$HTML_CONTENT" > /www/portal.html
              
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=portal&msg=portal_saved"
+             echo "Location: /admin?tab=portal&msg=portal_saved"
              echo ""
              exit 0
 
@@ -2849,7 +3157,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              echo "$HTML_CONTENT" > "/www/portal_themes/custom_${SLUG}.html"
 
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=portal&msg=theme_saved"
+             echo "Location: /admin?tab=portal&msg=theme_saved"
              echo ""
              exit 0
 
@@ -2860,7 +3168,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              rm -f "/www/portal_themes/${THEME_ID}.html" 2>/dev/null || true
 
              echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=portal&msg=theme_deleted"
+             echo "Location: /admin?tab=portal&msg=theme_deleted"
              echo ""
              exit 0
              
@@ -2880,7 +3188,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  $GREP -a -o "filedata=[^&]*" "$POST_FILE" | $CUT -d= -f2- | $SED 's/%2B/+/g; s/%2F/\//g; s/%3D/=/g' | base64 -d > "/www/$FILENAME"
                  
                  echo "Status: 302 Found"
-                echo "Location: /cgi-bin/admin?tab=portal&msg=upload_success"
+                echo "Location: /admin?tab=portal&msg=upload_success"
                 echo ""
             else
                 echo "Status: 400 Bad Request"
@@ -2938,7 +3246,7 @@ fi
 
 if [ "$LIC_VALID" != "1" ] && [ "$TAB" != "settings" ]; then
     echo "Status: 302 Found"
-    echo "Location: /cgi-bin/admin?tab=settings&msg=license_required"
+    echo "Location: /admin?tab=settings&msg=license_required"
     echo ""
     exit 0
 fi
@@ -2997,6 +3305,7 @@ if [ "$LIC_VALID" = "1" ]; then
     echo "    <a href='?tab=sales' class='nav-link $([ "$TAB" = "sales" ] && echo "active")'>Sales Report</a>"
     echo "    <a href='?tab=qos' class='nav-link $([ "$TAB" = "qos" ] && echo "active")'>Bandwidth Manager</a>"
     echo "    <a href='?tab=portal' class='nav-link $([ "$TAB" = "portal" ] && echo "active")'>Portal Editor</a>"
+    echo "    <a href='?tab=schedule' class='nav-link $([ "$TAB" = "schedule" ] && echo "active")'>Schedule</a>"
 fi
 echo "    <a href='?tab=settings' class='nav-link $([ "$TAB" = "settings" ] && echo "active")'>Settings</a>"
 echo "  </nav>"
@@ -3055,7 +3364,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "  let rxData = [], txData = [], labels = [];"
         echo "  let lastRx = 0, lastTx = 0;"
         echo "  function updateChart() {"
-        echo "    fetch('/cgi-bin/admin?action=get_traffic').then(r => r.json()).then(data => {"
+        echo "    fetch('/admin?action=get_traffic').then(r => r.json()).then(data => {"
         echo "      const now = new Date().toLocaleTimeString();"
         echo "      if(lastRx > 0) {"
         echo "        const rxSpeed = (data.rx - lastRx) / 1024; // KB/s"
@@ -3248,6 +3557,8 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         if echo "$QUERY_STRING" | grep -q "msg=device_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Device Saved!</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=device_deleted"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Device Deleted!</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=time_added"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Time Added!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=time_deducted"; then echo "<div class='alert' style='background:#dbeafe; color:#1e40af; padding:15px; border-radius:8px; margin-bottom:20px;'>Time Deducted!</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=sync_triggered"; then echo "<div class='alert' style='background:#dbeafe; color:#1e40af; padding:15px; border-radius:8px; margin-bottom:20px;'>Sync Triggered!</div>"; fi
 
         esc() { printf "%s" "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
         fmt_time() {
@@ -3387,7 +3698,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "<p style='color:#64748b; font-size:14px; margin-bottom:8px;'>Devices are automatically saved when they connect to the network. Online devices show green status.</p>"
         echo "<button id='sync-all-btn' class='btn btn-primary' style='background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); border:none; padding:8px 16px; border-radius:6px; color:white; cursor:pointer;'>Sync All Devices</button>"
         echo "</div>"
-        echo "<table><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Status</th><th>Notes</th><th>Actions</th></tr>"
+        echo "<table><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Token</th><th>Status</th><th>Time Remaining</th><th>Notes</th><th>Actions</th></tr>"
         
         # Display all devices with connection status
         sqlite3 -separator '|' "$DB_FILE" "SELECT mac, ip, hostname, notes FROM devices ORDER BY updated_at DESC;" 2>/dev/null | while IFS='|' read MACADDR IPADDR HOSTNAME NOTES; do
@@ -3443,6 +3754,17 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
                 STATUS="Offline"
                 STATUS_COLOR="#6b7280"
             fi
+
+            SESSION_SECS=0
+            if [ "$PAUSED_TS" -gt 0 ] 2>/dev/null; then
+                SESSION_SECS="$PAUSED_TS"
+            elif [ "$END_TS" -gt "$NOW" ] 2>/dev/null; then
+                SESSION_SECS=$((END_TS - NOW))
+            fi
+            SH=$((SESSION_SECS / 3600))
+            SM=$(((SESSION_SECS % 3600) / 60))
+            SS=$((SESSION_SECS % 60))
+            SESSION_TEXT=$(printf "%02d:%02d:%02d" "$SH" "$SM" "$SS")
             
             # Use current IP if device is connected, otherwise use stored IP
             DISPLAY_IP="$CURRENT_IP"
@@ -3452,32 +3774,61 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
             [ -z "$EH" ] && EH="(unknown)"
             EIP=$(esc "$DISPLAY_IP")
             EM=$(esc "$MAC_UP")
+            TOKEN=$(sqlite3 "$DB_FILE" "SELECT session_token FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
+            [ -z "$TOKEN" ] && TOKEN="None"
+            ETOKEN=$(esc "$TOKEN")
             EN=$(esc "$NOTES")
             
-            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td><span style='color:$STATUS_COLOR; font-weight:600;'>$STATUS</span></td><td>$EN</td><td>"
-            echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center; margin-bottom:6px;'>"
-            echo "    <input type='hidden' name='action' value='update_device'>"
-            echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
-            echo "    <input name='ip' value='$EIP' placeholder='IP' style='width:120px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
-            echo "    <input name='hostname' value='$EH' placeholder='Hostname' style='width:160px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
-            echo "    <input name='notes' value='$EN' placeholder='Notes' style='width:160px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
-            echo "    <button class='btn btn-primary' style='padding:8px 10px;'>Update</button>"
-            echo "  </form>"
-            echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center;'>"
-            echo "    <input type='hidden' name='action' value='device_add_time'>"
-            echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
-            echo "    <input type='hidden' name='ip' value='$DISPLAY_IP'>"
-            echo "    <input type='number' name='add_minutes' min='1' placeholder='+min' style='width:90px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
-            echo "    <button class='btn btn-primary' style='padding:8px 10px;'>Add Time</button>"
-            echo "  </form>"
+            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td style='font-size:11px; color:#64748b;'>$ETOKEN</td><td><span style='color:$STATUS_COLOR; font-weight:600;'>$STATUS</span></td><td style='font-weight:600;'>$SESSION_TEXT</td><td>$EN</td><td>"
+            echo "  <button type='button' class='btn btn-primary device-edit-btn' data-mac=\"$MAC_UP\" data-ip=\"$DISPLAY_IP\" data-host=\"$EH\" data-notes=\"$EN\" style='padding:8px 10px;'>Edit</button>"
             echo "  <form method='POST' style='display:inline; margin-left:10px;'>"
-            echo "    <input type='hidden' name='action' value='delete_device'>"
+            echo "    <input type='hidden' name='action' value='device_sync_time'>"
             echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
-            echo "    <button class='btn btn-danger' style='padding:8px 10px;'>Delete</button>"
+            echo "    <button class='btn btn-primary' style='padding:8px 10px; background:#0f172a;'>Sync</button>"
             echo "  </form>"
             echo "</td></tr>"
         done
         echo "</table>"
+        echo "<div id='device-modal' style='display:none; position:fixed; inset:0; background:rgba(15,23,42,0.55); z-index:2000; padding:24px; box-sizing:border-box;'>"
+        echo "  <div style='max-width:520px; margin:8vh auto; background:white; border-radius:12px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,0.25);'>"
+        echo "    <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;'>"
+        echo "      <div style='font-weight:900; font-size:1.05rem;'>Device Actions</div>"
+        echo "      <button type='button' class='btn btn-danger' style='padding:6px 10px;' onclick='closeDeviceModal()'>Close</button>"
+        echo "    </div>"
+        echo "    <div style='font-size:12px; color:#64748b; margin-bottom:12px; font-family:monospace;' id='device-modal-mac'></div>"
+        echo "    <form method='POST' style='margin-bottom:12px;'>"
+        echo "      <input type='hidden' name='action' value='update_device'>"
+        echo "      <input type='hidden' name='mac' id='edit-mac' value=''>"
+        echo "      <input type='hidden' name='ip' id='edit-ip' value=''>"
+        echo "      <div style='display:grid; grid-template-columns: 1fr; gap:10px;'>"
+        echo "        <div><label style='display:block; margin-bottom:6px; font-weight:700;'>Hostname</label><input name='hostname' id='edit-host' placeholder='Hostname' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px; box-sizing:border-box;'></div>"
+        echo "        <div><label style='display:block; margin-bottom:6px; font-weight:700;'>Notes</label><input name='notes' id='edit-notes' placeholder='Notes' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px; box-sizing:border-box;'></div>"
+        echo "      </div>"
+        echo "      <div style='margin-top:10px;'><button class='btn btn-primary' style='width:100%; padding:12px;'>Update Device</button></div>"
+        echo "    </form>"
+        echo "    <div style='display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:12px;'>"
+        echo "      <form method='POST' style='display:flex; gap:8px; align-items:center;'>"
+        echo "        <input type='hidden' name='action' value='device_add_time'>"
+        echo "        <input type='hidden' name='mac' id='add-mac' value=''>"
+        echo "        <input type='hidden' name='ip' id='add-ip' value=''>"
+        echo "        <input type='number' name='add_minutes' min='1' placeholder='+min' style='flex:1; padding:10px; border:1px solid #cbd5e1; border-radius:8px;'>"
+        echo "        <button class='btn btn-primary' style='padding:10px 12px;'>Add</button>"
+        echo "      </form>"
+        echo "      <form method='POST' style='display:flex; gap:8px; align-items:center;'>"
+        echo "        <input type='hidden' name='action' value='device_deduct_time'>"
+        echo "        <input type='hidden' name='mac' id='deduct-mac' value=''>"
+        echo "        <input type='hidden' name='ip' id='deduct-ip' value=''>"
+        echo "        <input type='number' name='deduct_minutes' min='1' placeholder='-min' style='flex:1; padding:10px; border:1px solid #cbd5e1; border-radius:8px;'>"
+        echo "        <button class='btn btn-danger' style='padding:10px 12px;'>Deduct</button>"
+        echo "      </form>"
+        echo "    </div>"
+        echo "    <form method='POST' onsubmit='return confirm(\"Delete this device?\")'>"
+        echo "      <input type='hidden' name='action' value='delete_device'>"
+        echo "      <input type='hidden' name='mac' id='delete-mac' value=''>"
+        echo "      <button class='btn btn-danger' style='width:100%; padding:12px;'>Delete Device</button>"
+        echo "    </form>"
+        echo "  </div>"
+        echo "</div>"
         echo "</div>"
         
         # Add sync functionality JavaScript
@@ -3488,28 +3839,74 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "  btn.textContent = 'Syncing...';"
         echo "  btn.disabled = true;"
         echo "  "
-        echo "  fetch('/cgi-bin/admin', {"
-        echo "    method: 'POST',"
-        echo "    headers: {'Content-Type': 'application/x-www-form-urlencoded'},"
-        echo "    body: 'action=sync_devices'"
-        echo "  })"
-        echo "  .then(response => response.json())"
-        echo "  .then(data => {"
-        echo "    if(data.status === 'success') {"
-        echo "      alert('✅ ' + data.message);"
-        echo "      location.reload();"
-        echo "    } else {"
-        echo "      alert('❌ ' + data.message);"
+        echo "  function post(body){"
+        echo "    return fetch('/admin', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: body}).then(function(r){return r.text();});"
+        echo "  }"
+        echo "  function parseJson(txt){"
+        echo "    try { return JSON.parse(txt); } catch(e){ return {status:'error', message: txt}; }"
+        echo "  }"
+        echo "  function poll(){"
+        echo "    post('action=sync_status').then(function(t){"
+        echo "      var d=parseJson(t);"
+        echo "      if(d.status==='running' || d.status==='started'){"
+        echo "        setTimeout(poll, 1000);"
+        echo "        return;"
+        echo "      }"
+        echo "      if(d.status==='success'){"
+        echo "        alert('✅ ' + (d.message || 'Sync completed'));"
+        echo "        location.reload();"
+        echo "        return;"
+        echo "      }"
+        echo "      alert('❌ ' + (d.message || 'Sync failed'));"
         echo "      btn.textContent = originalText;"
         echo "      btn.disabled = false;"
+        echo "    }).catch(function(e){"
+        echo "      alert('❌ Sync failed: ' + e);"
+        echo "      btn.textContent = originalText;"
+        echo "      btn.disabled = false;"
+        echo "    });"
+        echo "  }"
+        echo "  post('action=sync_devices').then(function(t){"
+        echo "    var d=parseJson(t);"
+        echo "    if(d.status==='error'){"
+        echo "      alert('❌ ' + (d.message || 'Sync failed'));"
+        echo "      btn.textContent = originalText;"
+        echo "      btn.disabled = false;"
+        echo "      return;"
         echo "    }"
-        echo "  })"
-        echo "  .catch(error => {"
+        echo "    poll();"
+        echo "  }).catch(function(error){"
         echo "    alert('❌ Sync failed: ' + error);"
         echo "    btn.textContent = originalText;"
         echo "    btn.disabled = false;"
         echo "  });"
         echo "});"
+        echo "function openDeviceModal(btn){"
+        echo "  var modal=document.getElementById('device-modal');"
+        echo "  if(!modal) return;"
+        echo "  var mac=btn.getAttribute('data-mac')||'';"
+        echo "  var ip=btn.getAttribute('data-ip')||'';"
+        echo "  var host=btn.getAttribute('data-host')||'';"
+        echo "  var notes=btn.getAttribute('data-notes')||'';"
+        echo "  var m=document.getElementById('device-modal-mac'); if(m) m.textContent=mac;"
+        echo "  var em=document.getElementById('edit-mac'); if(em) em.value=mac;"
+        echo "  var eip=document.getElementById('edit-ip'); if(eip) eip.value=ip;"
+        echo "  var eh=document.getElementById('edit-host'); if(eh) eh.value=host;"
+        echo "  var en=document.getElementById('edit-notes'); if(en) en.value=notes;"
+        echo "  var am=document.getElementById('add-mac'); if(am) am.value=mac;"
+        echo "  var aip=document.getElementById('add-ip'); if(aip) aip.value=ip;"
+        echo "  var dm=document.getElementById('deduct-mac'); if(dm) dm.value=mac;"
+        echo "  var dip=document.getElementById('deduct-ip'); if(dip) dip.value=ip;"
+        echo "  var del=document.getElementById('delete-mac'); if(del) del.value=mac;"
+        echo "  modal.style.display='block';"
+        echo "}"
+        echo "function closeDeviceModal(){"
+        echo "  var modal=document.getElementById('device-modal');"
+        echo "  if(modal) modal.style.display='none';"
+        echo "}"
+        echo "document.querySelectorAll('.device-edit-btn').forEach(function(b){ b.addEventListener('click', function(){ openDeviceModal(b); }); });"
+        echo "document.getElementById('device-modal') && document.getElementById('device-modal').addEventListener('click', function(e){ if(e.target===this) closeDeviceModal(); });"
+        echo "document.addEventListener('keydown', function(e){ if(e.key==='Escape') closeDeviceModal(); });"
         echo "</script>"
 
     elif [ "$TAB" = "sales" ]; then
@@ -3751,7 +4148,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "  btn.disabled = true;"
         echo "  "
         echo "  // Use Raw Binary Upload to avoid RAM limits"
-        echo "  fetch('/cgi-bin/admin?action=upload_raw&filename=' + filename, {"
+        echo "  fetch('/admin?action=upload_raw&filename=' + filename, {"
         echo "    method: 'POST',"
         echo "    body: file"
         echo "  })"
@@ -3776,6 +4173,86 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "});"
         echo "</script>"
 
+    elif [ "$TAB" = "schedule" ]; then
+        echo "<div class='header'><h1>Schedule</h1></div>"
+        if echo "$QUERY_STRING" | $GREP -q "msg=sched_saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Schedule Saved!</div>"; fi
+
+        RB_EN=$("$UCI" -q get pisowifi.schedule.reboot_enabled 2>/dev/null || echo 0)
+        RB_FREQ=$("$UCI" -q get pisowifi.schedule.reboot_freq 2>/dev/null || echo "daily")
+        RB_TIME=$("$UCI" -q get pisowifi.schedule.reboot_time 2>/dev/null || echo "03:00")
+        RB_DOW=$("$UCI" -q get pisowifi.schedule.reboot_dow 2>/dev/null || echo 0)
+
+        CL_EN=$("$UCI" -q get pisowifi.schedule.cleanup_enabled 2>/dev/null || echo 0)
+        CL_FREQ=$("$UCI" -q get pisowifi.schedule.cleanup_freq 2>/dev/null || echo "daily")
+        CL_TIME=$("$UCI" -q get pisowifi.schedule.cleanup_time 2>/dev/null || echo "04:00")
+        CL_DOW=$("$UCI" -q get pisowifi.schedule.cleanup_dow 2>/dev/null || echo 0)
+
+        CRON_FILE="/etc/crontabs/root"
+        CRON_LINES=""
+        [ -f "$CRON_FILE" ] && CRON_LINES=$($CAT "$CRON_FILE" 2>/dev/null | $GREP "pisowifi_sched_" | $SED 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+
+        echo "<div class='grid' style='grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));'>"
+
+        echo "  <div class='card'>"
+        echo "    <h3>Scheduled Reboot</h3>"
+        echo "    <div class='sub' style='margin-top:-6px; margin-bottom:10px;'>Auto restart router on schedule.</div>"
+        echo "    <form method='POST'>"
+        echo "      <input type='hidden' name='action' value='sched_save_reboot'>"
+        echo "      <div style='display:flex; align-items:center; gap:10px; margin-bottom:12px;'>"
+        echo "        <input type='hidden' name='enabled' value='0'>"
+        echo "        <label style='display:flex; align-items:center; gap:8px; font-weight:700;'><input type='checkbox' name='enabled' value='1' $([ "$RB_EN" = "1" ] && echo "checked")> Enable</label>"
+        echo "      </div>"
+        echo "      <div style='display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:12px;'>"
+        echo "        <div><label style='display:block; margin-bottom:6px; font-weight:700;'>Frequency</label><select name='freq' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px;'><option value='daily' $([ "$RB_FREQ" = "daily" ] && echo "selected")>Daily</option><option value='weekly' $([ "$RB_FREQ" = "weekly" ] && echo "selected")>Weekly</option></select></div>"
+        echo "        <div><label style='display:block; margin-bottom:6px; font-weight:700;'>Time</label><input type='time' name='time' value='$RB_TIME' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px;'></div>"
+        echo "      </div>"
+        echo "      <div style='margin-bottom:12px;'><label style='display:block; margin-bottom:6px; font-weight:700;'>Day (weekly)</label><select name='dow' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px;'>"
+        echo "        <option value='0' $([ "$RB_DOW" = "0" ] && echo "selected")>Sunday</option>"
+        echo "        <option value='1' $([ "$RB_DOW" = "1" ] && echo "selected")>Monday</option>"
+        echo "        <option value='2' $([ "$RB_DOW" = "2" ] && echo "selected")>Tuesday</option>"
+        echo "        <option value='3' $([ "$RB_DOW" = "3" ] && echo "selected")>Wednesday</option>"
+        echo "        <option value='4' $([ "$RB_DOW" = "4" ] && echo "selected")>Thursday</option>"
+        echo "        <option value='5' $([ "$RB_DOW" = "5" ] && echo "selected")>Friday</option>"
+        echo "        <option value='6' $([ "$RB_DOW" = "6" ] && echo "selected")>Saturday</option>"
+        echo "      </select></div>"
+        echo "      <button class='btn btn-primary' style='width:100%; padding:12px;'>Save Reboot Schedule</button>"
+        echo "    </form>"
+        echo "  </div>"
+
+        echo "  <div class='card'>"
+        echo "    <h3>Scheduled Cleanup</h3>"
+        echo "    <div class='sub' style='margin-top:-6px; margin-bottom:10px;'>Delete devices with no active session time.</div>"
+        echo "    <form method='POST'>"
+        echo "      <input type='hidden' name='action' value='sched_save_cleanup'>"
+        echo "      <div style='display:flex; align-items:center; gap:10px; margin-bottom:12px;'>"
+        echo "        <input type='hidden' name='enabled' value='0'>"
+        echo "        <label style='display:flex; align-items:center; gap:8px; font-weight:700;'><input type='checkbox' name='enabled' value='1' $([ "$CL_EN" = "1" ] && echo "checked")> Enable</label>"
+        echo "      </div>"
+        echo "      <div style='display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:12px;'>"
+        echo "        <div><label style='display:block; margin-bottom:6px; font-weight:700;'>Frequency</label><select name='freq' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px;'><option value='daily' $([ "$CL_FREQ" = "daily" ] && echo "selected")>Daily</option><option value='weekly' $([ "$CL_FREQ" = "weekly" ] && echo "selected")>Weekly</option></select></div>"
+        echo "        <div><label style='display:block; margin-bottom:6px; font-weight:700;'>Time</label><input type='time' name='time' value='$CL_TIME' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px;'></div>"
+        echo "      </div>"
+        echo "      <div style='margin-bottom:12px;'><label style='display:block; margin-bottom:6px; font-weight:700;'>Day (weekly)</label><select name='dow' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px;'>"
+        echo "        <option value='0' $([ "$CL_DOW" = "0" ] && echo "selected")>Sunday</option>"
+        echo "        <option value='1' $([ "$CL_DOW" = "1" ] && echo "selected")>Monday</option>"
+        echo "        <option value='2' $([ "$CL_DOW" = "2" ] && echo "selected")>Tuesday</option>"
+        echo "        <option value='3' $([ "$CL_DOW" = "3" ] && echo "selected")>Wednesday</option>"
+        echo "        <option value='4' $([ "$CL_DOW" = "4" ] && echo "selected")>Thursday</option>"
+        echo "        <option value='5' $([ "$CL_DOW" = "5" ] && echo "selected")>Friday</option>"
+        echo "        <option value='6' $([ "$CL_DOW" = "6" ] && echo "selected")>Saturday</option>"
+        echo "      </select></div>"
+        echo "      <button class='btn btn-primary' style='width:100%; padding:12px;'>Save Cleanup Schedule</button>"
+        echo "    </form>"
+        echo "  </div>"
+
+        echo "</div>"
+
+        echo "<div class='card'>"
+        echo "  <h3>Current Cron Entries</h3>"
+        echo "  <div class='sub' style='margin-top:-6px; margin-bottom:10px;'>Lines tagged with pisowifi_sched_</div>"
+        echo "  <pre style='white-space:pre-wrap; background:#0b1220; color:#e2e8f0; padding:12px; border-radius:10px; font-size:12px; overflow:auto; min-height:48px;'>$CRON_LINES</pre>"
+        echo "</div>"
+
     elif [ "$TAB" = "settings" ]; then
         echo "<div class='header'><h1>Settings</h1></div>"
         
@@ -3784,6 +4261,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         fi
 
         if echo "$QUERY_STRING" | $GREP -q "msg=saved"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Settings Saved Successfully!</div>"; fi
+        if echo "$QUERY_STRING" | $GREP -q "msg=rebooting"; then echo "<div class='alert' style='background:#dbeafe; color:#1e40af; padding:15px; border-radius:8px; margin-bottom:20px;'>Rebooting router... Please wait and reconnect.</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_env_loaded"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>Supabase Credentials Loaded!</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_env_missing"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Missing /etc/pisowifi/supabase.env</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_ok"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>License Activated!</div>"; fi
@@ -3814,6 +4292,15 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "        <input type='password' name='new_pass' placeholder='Leave blank to keep current' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;'>"
         echo "      </div>"
         echo "      <button class='btn btn-primary' style='width:100%; padding: 12px;'>Save Settings</button>"
+        echo "    </form>"
+        echo "  </div>"
+
+        echo "  <div class='card'>"
+        echo "    <h3>Router Reboot</h3>"
+        echo "    <div class='sub' style='margin-top:-6px; margin-bottom:10px;'>Restart the router. All devices will disconnect temporarily.</div>"
+        echo "    <form method='POST' onsubmit='return confirm(\"Reboot router now?\")'>"
+        echo "      <input type='hidden' name='action' value='router_reboot'>"
+        echo "      <button class='btn btn-danger' style='width:100%; padding:12px;'>Reboot Router</button>"
         echo "    </form>"
         echo "  </div>"
 
@@ -3940,7 +4427,9 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
 
 echo "</body></html>"
 EOF
-chmod +x /www/cgi-bin/admin
+chmod +x /www/admin
+mkdir -p /www/cgi-bin 2>/dev/null || true
+ln -sf /www/admin /www/cgi-bin/admin 2>/dev/null || cp -f /www/admin /www/cgi-bin/admin 2>/dev/null || true
 
 mkdir -p /www/portal_themes
 
@@ -4057,7 +4546,7 @@ button:active{transform: scale(0.99);}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl = "/cgi-bin/pisowifi";
+var apiUrl = "/pisowifi";
 var interval;
 var timerInterval;
 var timeLeft = 0;
@@ -4397,7 +4886,7 @@ button:active{transform:scale(0.99)}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl = "/cgi-bin/pisowifi";
+var apiUrl = "/pisowifi";
 var interval;
 var timerInterval;
 var timeLeft = 0;
@@ -4539,7 +5028,7 @@ button:active{transform:scale(0.99)}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;
+var apiUrl="/pisowifi";var interval;var timerInterval;var timeLeft=0;
 function openRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="block";loadRates();}
 function closeRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="none";}
 function loadRates(){fetch(apiUrl+"?action=rates").then(r=>r.json()).then(function(d){var el=document.getElementById("rates-body");if(!el)return;if(!d||!d.rates||!d.rates.length){el.innerHTML="<div>No rates set.</div>";return;}var html="<div style='display:grid; gap:8px; margin-top:10px;'>";d.rates.forEach(function(x){html+="<div style='display:flex; justify-content:space-between; padding:10px; border-radius:12px; border:1px solid #e2e8f0; background:#f8fafc;'><div style='font-weight:800;'>₱"+x.amount+"</div><div>"+x.minutes+" min</div></div>";});html+="</div>";el.innerHTML=html;}).catch(function(){var el=document.getElementById("rates-body");if(el)el.innerHTML="<div>Failed to load rates.</div>";});}
@@ -4677,7 +5166,7 @@ button:active{transform:scale(0.99)}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;
+var apiUrl="/pisowifi";var interval;var timerInterval;var timeLeft=0;
 function openRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="block";loadRates();}
 function closeRates(){var m=document.getElementById("rates-modal");if(m)m.style.display="none";}
 function loadRates(){fetch(apiUrl+"?action=rates").then(r=>r.json()).then(function(d){var el=document.getElementById("rates-body");if(!el)return;if(!d||!d.rates||!d.rates.length){el.innerHTML="<div>No rates set.</div>";return;}var html="<div style='display:grid; gap:8px; margin-top:10px;'>";d.rates.forEach(function(x){html+="<div style='display:flex; justify-content:space-between; padding:10px; border-radius:14px; background: rgba(15,23,42,0.04); border:1px solid rgba(15,23,42,0.08);'><div style='font-weight:900;'>₱"+x.amount+"</div><div>"+x.minutes+" min</div></div>";});html+="</div>";el.innerHTML=html;}).catch(function(){var el=document.getElementById("rates-body");if(el)el.innerHTML="<div>Failed to load rates.</div>";});}
@@ -4709,17 +5198,18 @@ echo "Setting up redirect..."
 
 # Configure uhttpd to handle 404 errors by serving the CGI script
 # This is crucial for captive portal detection (e.g. /generate_204)
-uci set uhttpd.main.error_page='/cgi-bin/pisowifi'
+uci set uhttpd.main.error_page='/pisowifi'
+uci set uhttpd.main.cgi_prefix='/'
 uci commit uhttpd
 
 cat << 'EOF' > /www/index.html
 <!DOCTYPE html>
 <html>
 <head>
-<meta http-equiv="refresh" content="0; URL=/cgi-bin/pisowifi" />
+<meta http-equiv="refresh" content="0; URL=/pisowifi" />
 </head>
 <body>
-<a href="/cgi-bin/pisowifi">Click here if not redirected...</a>
+<a href="/pisowifi">Click here if not redirected...</a>
 </body>
 </html>
 EOF
@@ -4729,7 +5219,8 @@ echo "Restarting web server..."
 /etc/init.d/uhttpd restart 2>/dev/null || /etc/init.d/uhttpd start 2>/dev/null
 
 echo "=== CGI INSTALLATION COMPLETE ==="
-echo "Access at http://10.0.0.1/cgi-bin/pisowifi"
+echo "Access Portal: http://10.0.0.1/pisowifi"
+echo "Access Admin: http://10.0.0.1/admin"
 
 # 5. SETUP NETWORK & WIFI (SSID: NEXI-FI PISOWIFI)
 echo "Configuring Network and WiFi..."

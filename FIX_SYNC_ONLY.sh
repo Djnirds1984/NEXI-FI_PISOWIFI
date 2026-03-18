@@ -9,8 +9,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
 # Configuration
-CGI_FILE="/www/cgi-bin/admin"
-BACKUP_FILE="/www/cgi-bin/admin.backup.syncfix.$(date +%s)"
+CGI_FILE="/www/admin"
+[ -f "$CGI_FILE" ] || CGI_FILE="/www/cgi-bin/admin"
+BACKUP_FILE="${CGI_FILE}.backup.syncfix.$(date +%s)"
 SYNC_SCRIPT="/usr/bin/wifi_devices_sync_auto.sh"
 
 # Check if CGI file exists

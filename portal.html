@@ -354,7 +354,7 @@ button:active { transform: scale(0.97); }
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-const apiUrl = "/cgi-bin/pisowifi";
+const apiUrl = "/pisowifi";
 let coinInterval;
 let timerInterval;
 let timeLeft = 0;
@@ -767,5 +767,8 @@ window.addEventListener('beforeunload', function() {
     fetch(api("action=release_coinslot_lock"), {keepalive: true}).catch(() => {});
 });
 </script>
+<div style="text-align:center;padding:16px 10px;color:#64748b;font-size:12px;">
+  <a href="https://www.facebook.com/ajcabz84" target="_blank" rel="noopener noreferrer" style="color:#0ea5e9;text-decoration:none;font-weight:600;">Facebook</a>
+</div>
 </body>
 </html>

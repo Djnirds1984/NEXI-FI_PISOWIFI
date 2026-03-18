@@ -111,6 +111,11 @@ query_db() {
     sqlite3 "$DB_FILE" -cmd ".timeout 2000" "$1" 2>/dev/null || echo ""
 }
 
+firewall_has_allow_rule() {
+    local mac="$1"
+    nft list chain inet pisowifi pisowifi_filter 2>/dev/null | grep -qi "$mac"
+}
+
 get_user_session() {
     local mac="$1"
     local result=$(query_db "SELECT session_end FROM users WHERE mac='$mac' AND session_end > $(date +%s) LIMIT 1")
@@ -277,6 +282,43 @@ supa_insert() {
     rm -f "$tmp"
 }
 
+supa_key_effective() {
+    if [ -n "$SUPA_SERVICE_KEY" ]; then
+        echo "$SUPA_SERVICE_KEY"
+        return
+    fi
+    echo "$SUPA_KEY"
+}
+
+sync_wifi_devices_remaining() {
+    local mac="$1"
+    local remaining="$2"
+    local force="$3"
+
+    [ -z "$mac" ] && return
+    [ -z "$SUPA_URL" ] && return
+    local key
+    key=$(supa_key_effective)
+    [ -z "$key" ] && return
+
+    local now
+    now=$(date +%s)
+    local keyfile="/tmp/pisowifi_wifi_rem_$(echo "$mac" | tr -d ':' | tr 'A-Z' 'a-z')"
+    if [ "$force" != "1" ] && [ -f "$keyfile" ]; then
+        local last_ts last_rem
+        last_ts=$(cut -d'|' -f1 "$keyfile" 2>/dev/null)
+        last_rem=$(cut -d'|' -f2 "$keyfile" 2>/dev/null)
+        if [ -n "$last_ts" ] && [ $((now - last_ts)) -lt 60 ] 2>/dev/null && [ "$last_rem" = "$remaining" ]; then
+            return
+        fi
+    fi
+    echo "$now|$remaining" > "$keyfile" 2>/dev/null || true
+
+    local body
+    body=$(printf '{"remaining_seconds":%s}' "${remaining:-0}")
+    supa_patch "$SUPA_URL" "$key" "wifi_devices?mac_address=eq.$mac" "$body"
+}
+
 get_coin_count() {
     local mac="$1"
     # Get coins from global counter (mac 00:00:00:00:00:00)
@@ -402,9 +444,15 @@ handle_api() {
                 if [ "$PAUSED_TIME" -gt 0 ] 2>/dev/null; then
                     AUTH="paused"
                     TIME_REMAINING=$PAUSED_TIME
+                    $FIREWALL_SCRIPT deny "$MAC" >/dev/null 2>&1 || true
+                    sync_wifi_devices_remaining "$MAC" "$TIME_REMAINING" "0"
                 elif [ "$EXPIRY" -gt "$NOW" ] 2>/dev/null; then
                     AUTH="true"
                     TIME_REMAINING=$((EXPIRY - NOW))
+                    if ! firewall_has_allow_rule "$MAC"; then
+                        $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR" >/dev/null 2>&1 || true
+                    fi
+                    sync_wifi_devices_remaining "$MAC" "$TIME_REMAINING" "0"
                 else
                     if [ -n "$SUPA_URL" ] && [ -n "$SID" ]; then
                         supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=remaining_seconds,connected_at,is_paused&session_uuid=eq.$SID&limit=1"
@@ -424,6 +472,7 @@ handle_api() {
                                 sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time, session_token) VALUES ('$MAC', '$REMOTE_ADDR', $NEW_EXPIRY, 0, '$SID');" 2>/dev/null \
                                 || sqlite3 $DB_FILE "INSERT OR REPLACE INTO users (mac, ip, session_end, paused_time) VALUES ('$MAC', '$REMOTE_ADDR', $NEW_EXPIRY, 0);" 2>/dev/null || true
                                 $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
+                                sync_wifi_devices_remaining "$MAC" "$REM_SEC" "1"
                             fi
                         fi
                     fi
@@ -548,6 +597,8 @@ handle_api() {
                         supa_insert "$SUPA_URL" "$SUPA_KEY" "sessions" "$SID_BODY"
                     fi
                 fi
+
+                sync_wifi_devices_remaining "$MAC" "$((NEW_EXPIRY - NOW))" "1"
                 
                 # Allow Access
                 $FIREWALL_SCRIPT allow "$MAC" "$REMOTE_ADDR"
@@ -586,6 +637,8 @@ handle_api() {
                         supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
                     fi
                 fi
+
+                sync_wifi_devices_remaining "$TARGET_MAC" "$REMAINING" "1"
                 
                 # Cut internet
                 $FIREWALL_SCRIPT deny "$TARGET_MAC"
@@ -619,6 +672,8 @@ handle_api() {
                         supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
                     fi
                 fi
+
+                sync_wifi_devices_remaining "$TARGET_MAC" "$PAUSED" "1"
                 
                 # Restore internet
                 $FIREWALL_SCRIPT allow "$TARGET_MAC" "$REMOTE_ADDR"
@@ -651,6 +706,8 @@ handle_api() {
                     supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?mac=eq.$TARGET_MAC" "$SID_BODY"
                 fi
             fi
+
+            sync_wifi_devices_remaining "$TARGET_MAC" "0" "1"
             
             json_response "{\"status\": \"success\"}"
             ;;
@@ -852,7 +909,7 @@ button:active { transform: scale(0.98); }
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl = "/cgi-bin/pisowifi";
+var apiUrl = "/pisowifi";
 var interval;
 var timerInterval;
 var timeLeft = 0;

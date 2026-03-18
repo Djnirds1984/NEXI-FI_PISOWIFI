@@ -99,7 +99,7 @@ button:active{transform:scale(0.99)}
 <audio id="audio-connect" src="/connected.mp3"></audio>
 
 <script>
-var apiUrl="/cgi-bin/pisowifi";var interval;var timerInterval;var timeLeft=0;
+var apiUrl="/pisowifi";var interval;var timerInterval;var timeLeft=0;
 function playAudio(t){try{var a=document.getElementById("audio-"+t);if(a){a.currentTime=0;a.play().catch(()=>{});}}catch(e){}}
 function stopAudio(){try{document.querySelectorAll("audio").forEach(function(s){s.pause();s.currentTime=0;});}catch(e){}}
 function formatTime(s){if(s<=0)return"Expired";var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60,t="";if(d>0)t+=d+"d ";if(h>0)t+=h+"h ";if(m>0)t+=m+"m ";t+=sec+"s";return t.trim();}
