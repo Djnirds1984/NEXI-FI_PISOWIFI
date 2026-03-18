@@ -12,7 +12,6 @@ if [ -x "$BB" ]; then
     SED="$BB sed"
     TR="$BB tr"
     CAT="$BB cat"
-    AWK="$BB awk"
     DATE="$BB date"
     LOGGER="$BB logger"
 else
@@ -22,7 +21,6 @@ else
     SED="sed"
     TR="tr"
     CAT="cat"
-    AWK="awk"
     DATE="date"
     LOGGER="logger"
 fi
@@ -130,13 +128,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         printf "%s" "$1" | $SED "s/'/''/g"
     }
 
-    cleanup_old_supa_tmp() {
-        command -v find >/dev/null 2>&1 || return 0
-        find /tmp -maxdepth 1 -type f \( -name 'pisowifi_supa_*' -o -name 'pisowifi_supa_err_*' \) -mmin +60 -delete 2>/dev/null || true
-    }
-
     supa_request() {
-        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         PATH="$3"
@@ -168,7 +160,6 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     }
 
     supa_patch() {
-        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         PATH="$3"
@@ -201,7 +192,6 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     }
 
     supa_rpc() {
-        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         FN="$3"
@@ -234,7 +224,6 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     }
 
     supa_insert() {
-        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         PATH="$3"
@@ -801,30 +790,16 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              exit 0
 
         elif [ "$ACTION" = "sync_devices" ]; then
-             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
-             CENTRALIZED_KEY="$($UCI_BIN -q get pisowifi.license.centralized_key 2>/dev/null)"
-             CENTRAL_STATUS="$($UCI_BIN -q get pisowifi.license.centralized_status 2>/dev/null)"
-             CENTRAL_STATUS_LC="$(echo "$CENTRAL_STATUS" | tr 'A-Z' 'a-z')"
+             CENTRALIZED_KEY=$($UCI -q get pisowifi.license.centralized_key 2>/dev/null)
+             CENTRAL_STATUS=$($UCI -q get pisowifi.license.centralized_status 2>/dev/null)
+             CENTRAL_STATUS_LC=$(echo "$CENTRAL_STATUS" | $TR 'A-Z' 'a-z')
              if [ -n "$CENTRAL_STATUS_LC" ] && [ "$CENTRAL_STATUS_LC" != "active" ]; then
                  echo "Content-type: application/json"
                  echo ""
                  echo '{"status":"error","message":"Centralized key is not active. Please activate it first."}'
                  exit 0
              fi
-             if [ -z "$CENTRALIZED_KEY" ] || [ "$CENTRALIZED_KEY" = "none" ]; then
-                 if [ -f "/etc/pisowifi/license.json" ]; then
-                     CENTRALIZED_KEY="$(sed -n 's/.*\"license_key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' /etc/pisowifi/license.json | head -n1)"
-                 fi
-             fi
-             if [ -z "$CENTRALIZED_KEY" ] || [ "$CENTRALIZED_KEY" = "none" ]; then
-                 if [ -n "$DB_FILE" ] && [ -f "$DB_FILE" ]; then
-                     CENTRALIZED_KEY="$(sqlite3 "$DB_FILE" "SELECT value FROM settings WHERE key='centralized_key' LIMIT 1;" 2>/dev/null)"
-                     if [ -z "$CENTRALIZED_KEY" ] || [ "$CENTRALIZED_KEY" = "none" ]; then
-                         CENTRALIZED_KEY="$(sqlite3 "$DB_FILE" "SELECT centralized_key FROM settings LIMIT 1;" 2>/dev/null)"
-                     fi
-                 fi
-             fi
-             if ! echo "$CENTRALIZED_KEY" | grep -Eq '^CENTRAL-[a-fA-F0-9]+-[a-fA-F0-9]+$'; then
+             if ! echo "$CENTRALIZED_KEY" | $GREP -Eq '^CENTRAL-[a-fA-F0-9]+-[a-fA-F0-9]+$'; then
                  echo "Content-type: application/json"
                  echo ""
                  echo '{"status":"error","message":"No active centralized key found. Please activate a centralized key first."}'
@@ -839,14 +814,14 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  echo "Content-type: application/json"
                  echo ""
                  if [ $SYNC_STATUS -eq 0 ]; then
-                     SYNC_SAFE="$(printf '%s' "$SYNC_RESULT" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+                     SYNC_SAFE=$(printf '%s' "$SYNC_RESULT" | $TR '\r\n' ' ' | $SED 's/\\/\\\\/g; s/"/\\"/g')
                      if [ -n "$SYNC_SAFE" ]; then
                          echo "{\"status\":\"success\",\"message\":\"Device sync completed: $SYNC_SAFE\"}"
                      else
                          echo '{"status":"success","message":"Device sync completed successfully."}'
                      fi
                  else
-                     SYNC_SAFE="$(printf '%s' "$SYNC_RESULT" | tr '\r\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+                     SYNC_SAFE=$(printf '%s' "$SYNC_RESULT" | $TR '\r\n' ' ' | $SED 's/\\/\\\\/g; s/"/\\"/g')
                      echo "{\"status\":\"error\",\"message\":\"Sync failed: $SYNC_SAFE\"}"
                  fi
              else
@@ -856,222 +831,6 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              fi
              exit 0
 
-        elif [ "$ACTION" = "sync_get_interval" ]; then
-             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
-             MIN="$($UCI_BIN -q get pisowifi.license.auto_sync_minutes 2>/dev/null)"
-             [ -z "$MIN" ] && MIN="30"
-             case "$MIN" in
-                 ''|*[!0-9]*) MIN="30" ;;
-             esac
-             echo "Content-type: application/json"
-             echo ""
-             echo "{\"status\":\"success\",\"minutes\":$MIN}"
-             exit 0
-
-        elif [ "$ACTION" = "sync_set_interval" ]; then
-             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
-             MIN="$(get_post_var "minutes")"
-             case "$MIN" in
-                 ''|*[!0-9]*) MIN="" ;;
-             esac
-             if [ -z "$MIN" ]; then
-                 echo "Content-type: application/json"
-                 echo ""
-                 echo '{"status":"error","message":"Invalid minutes value"}'
-                 exit 0
-             fi
-
-             CRON_EXPR=""
-             if [ "$MIN" = "0" ]; then
-                 CRON_EXPR=""
-             else
-                 case "$MIN" in
-                     15) CRON_EXPR="*/15 * * * *" ;;
-                     30) CRON_EXPR="*/30 * * * *" ;;
-                     60) CRON_EXPR="0 * * * *" ;;
-                     120) CRON_EXPR="0 */2 * * *" ;;
-                     360) CRON_EXPR="0 */6 * * *" ;;
-                     720) CRON_EXPR="0 */12 * * *" ;;
-                     1440) CRON_EXPR="0 0 * * *" ;;
-                     *) CRON_EXPR="" ;;
-                 esac
-             fi
-
-             if [ "$MIN" != "0" ] && [ -z "$CRON_EXPR" ]; then
-                 echo "Content-type: application/json"
-                 echo ""
-                 echo '{"status":"error","message":"Unsupported interval. Use 0, 15, 30, 60, 120, 360, 720, or 1440."}'
-                 exit 0
-             fi
-
-             $UCI_BIN set pisowifi.license.auto_sync_minutes="$MIN" 2>/dev/null || true
-             $UCI_BIN commit pisowifi 2>/dev/null || true
-
-             CRON_FILE="/etc/crontabs/root"
-             [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
-             TMP_CRON="/tmp/pisowifi_cron_root_$$"
-             if [ -f "$CRON_FILE" ]; then
-                 $CAT "$CRON_FILE" | $GREP -v "pisowifi_auto_sync" > "$TMP_CRON" 2>/dev/null
-             else
-                 $CAT /dev/null > "$TMP_CRON" 2>/dev/null
-             fi
-
-             if [ "$MIN" != "0" ]; then
-                 echo "$CRON_EXPR sh /usr/bin/wifi_devices_sync_auto.sh >/tmp/pisowifi_auto_sync.log 2>&1 # pisowifi_auto_sync" >> "$TMP_CRON"
-             fi
-
-             mv "$TMP_CRON" "$CRON_FILE" 2>/dev/null || true
-             chmod 600 "$CRON_FILE" 2>/dev/null || true
-             [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
-
-             echo "Content-type: application/json"
-             echo ""
-             echo "{\"status\":\"success\",\"minutes\":$MIN}"
-             exit 0
-        elif [ "$ACTION" = "sync_get_interval" ]; then
-             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
-             MIN="$($UCI_BIN -q get pisowifi.license.auto_sync_minutes 2>/dev/null)"
-             [ -z "$MIN" ] && MIN="30"
-             case "$MIN" in
-                 ''|*[!0-9]*) MIN="30" ;;
-             esac
-             echo "Content-type: application/json"
-             echo ""
-             echo "{\"status\":\"success\",\"minutes\":$MIN}"
-             exit 0
-
-        elif [ "$ACTION" = "sync_set_interval" ]; then
-             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
-             MIN="$(get_post_var "minutes")"
-             case "$MIN" in
-                 ''|*[!0-9]*) MIN="" ;;
-             esac
-             if [ -z "$MIN" ]; then
-                 echo "Content-type: application/json"
-                 echo ""
-                 echo '{"status":"error","message":"Invalid minutes value"}'
-                 exit 0
-             fi
-
-             CRON_EXPR=""
-             if [ "$MIN" = "0" ]; then
-                 CRON_EXPR=""
-             else
-                 case "$MIN" in
-                     15) CRON_EXPR="*/15 * * * *" ;;
-                     30) CRON_EXPR="*/30 * * * *" ;;
-                     60) CRON_EXPR="0 * * * *" ;;
-                     120) CRON_EXPR="0 */2 * * *" ;;
-                     360) CRON_EXPR="0 */6 * * *" ;;
-                     720) CRON_EXPR="0 */12 * * *" ;;
-                     1440) CRON_EXPR="0 0 * * *" ;;
-                     *) CRON_EXPR="" ;;
-                 esac
-             fi
-
-             if [ "$MIN" != "0" ] && [ -z "$CRON_EXPR" ]; then
-                 echo "Content-type: application/json"
-                 echo ""
-                 echo '{"status":"error","message":"Unsupported interval. Use 0, 15, 30, 60, 120, 360, 720, or 1440."}'
-                 exit 0
-             fi
-
-             $UCI_BIN set pisowifi.license.auto_sync_minutes="$MIN" 2>/dev/null || true
-             $UCI_BIN commit pisowifi 2>/dev/null || true
-
-             CRON_FILE="/etc/crontabs/root"
-             [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
-             TMP_CRON="/tmp/pisowifi_cron_root_$$"
-             if [ -f "$CRON_FILE" ]; then
-                 $CAT "$CRON_FILE" | $GREP -v "pisowifi_auto_sync" > "$TMP_CRON" 2>/dev/null
-             else
-                 $CAT /dev/null > "$TMP_CRON" 2>/dev/null
-             fi
-
-             if [ "$MIN" != "0" ]; then
-                 echo "$CRON_EXPR sh /usr/bin/wifi_devices_sync_auto.sh >/tmp/pisowifi_auto_sync.log 2>&1 # pisowifi_auto_sync" >> "$TMP_CRON"
-             fi
-
-             mv "$TMP_CRON" "$CRON_FILE" 2>/dev/null || true
-             chmod 600 "$CRON_FILE" 2>/dev/null || true
-             [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
-
-             echo "Content-type: application/json"
-             echo ""
-             echo "{\"status\":\"success\",\"minutes\":$MIN}"
-             exit 0
-        elif [ "$ACTION" = "sync_get_interval" ]; then
-             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
-             MIN="$($UCI_BIN -q get pisowifi.license.auto_sync_minutes 2>/dev/null)"
-             [ -z "$MIN" ] && MIN="30"
-             case "$MIN" in
-                 ''|*[!0-9]*) MIN="30" ;;
-             esac
-             echo "Content-type: application/json"
-             echo ""
-             echo "{\"status\":\"success\",\"minutes\":$MIN}"
-             exit 0
-
-        elif [ "$ACTION" = "sync_set_interval" ]; then
-             UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
-             MIN="$(get_post_var "minutes")"
-             case "$MIN" in
-                 ''|*[!0-9]*) MIN="" ;;
-             esac
-             if [ -z "$MIN" ]; then
-                 echo "Content-type: application/json"
-                 echo ""
-                 echo '{"status":"error","message":"Invalid minutes value"}'
-                 exit 0
-             fi
-
-             CRON_EXPR=""
-             if [ "$MIN" = "0" ]; then
-                 CRON_EXPR=""
-             else
-                 case "$MIN" in
-                     15) CRON_EXPR="*/15 * * * *" ;;
-                     30) CRON_EXPR="*/30 * * * *" ;;
-                     60) CRON_EXPR="0 * * * *" ;;
-                     120) CRON_EXPR="0 */2 * * *" ;;
-                     360) CRON_EXPR="0 */6 * * *" ;;
-                     720) CRON_EXPR="0 */12 * * *" ;;
-                     1440) CRON_EXPR="0 0 * * *" ;;
-                     *) CRON_EXPR="" ;;
-                 esac
-             fi
-
-             if [ "$MIN" != "0" ] && [ -z "$CRON_EXPR" ]; then
-                 echo "Content-type: application/json"
-                 echo ""
-                 echo '{"status":"error","message":"Unsupported interval. Use 0, 15, 30, 60, 120, 360, 720, or 1440."}'
-                 exit 0
-             fi
-
-             $UCI_BIN set pisowifi.license.auto_sync_minutes="$MIN" 2>/dev/null || true
-             $UCI_BIN commit pisowifi 2>/dev/null || true
-
-             CRON_FILE="/etc/crontabs/root"
-             [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
-             TMP_CRON="/tmp/pisowifi_cron_root_$$"
-             if [ -f "$CRON_FILE" ]; then
-                 $CAT "$CRON_FILE" | $GREP -v "pisowifi_auto_sync" > "$TMP_CRON" 2>/dev/null
-             else
-                 $CAT /dev/null > "$TMP_CRON" 2>/dev/null
-             fi
-
-             if [ "$MIN" != "0" ]; then
-                 echo "$CRON_EXPR sh /usr/bin/wifi_devices_sync_auto.sh >/tmp/pisowifi_auto_sync.log 2>&1 # pisowifi_auto_sync" >> "$TMP_CRON"
-             fi
-
-             mv "$TMP_CRON" "$CRON_FILE" 2>/dev/null || true
-             chmod 600 "$CRON_FILE" 2>/dev/null || true
-             [ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1 || true
-
-             echo "Content-type: application/json"
-             echo ""
-             echo "{\"status\":\"success\",\"minutes\":$MIN}"
-             exit 0
         elif [ "$ACTION" = "update_wifi" ]; then
              SSID=$(get_post_var "ssid")
              ENC=$(get_post_var "encryption")
@@ -1354,16 +1113,10 @@ echo "  .btn-primary { background: var(--primary); color: white; }"
 echo "  .btn-danger { background: var(--danger); color: white; }"
 echo "  .chart-container { height: 200px; width: 100%; margin-top: 10px; position: relative; }"
 echo "  canvas { width: 100% !important; height: 100% !important; }"
-echo "  .sidebar-toggle { display: none; position: fixed; top: 12px; left: 12px; z-index: 1002; background: var(--sidebar-bg); color: white; border: 0; border-radius: 10px; padding: 10px 12px; font-size: 18px; line-height: 1; }"
-echo "  .sidebar-overlay { display: none; position: fixed; inset: 0; background: rgba(15,23,42,0.45); z-index: 1000; }"
-echo "  body.sidebar-open .sidebar { transform: translateX(0); }"
-echo "  body.sidebar-open .sidebar-overlay { display: block; }"
-echo "  @media (max-width: 768px) { body { display: block; } .sidebar { position: fixed; top: 0; left: 0; height: 100vh; width: 260px; max-width: 85vw; padding: 16px; box-sizing: border-box; transform: translateX(-110%); transition: transform .2s ease; z-index: 1001; overflow-y: auto; } .main-content { padding: 16px; } .sidebar-toggle { display: inline-flex; align-items: center; justify-content: center; } .header { padding-left: 44px; } table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; } th, td { white-space: nowrap; } }"
+echo "  @media (max-width: 768px) { body { flex-direction: column; } .sidebar { width: 100%; padding: 10px; box-sizing: border-box; } .main-content { padding: 15px; } }"
 echo "</style></head><body>"
 
 # Render Sidebar
-echo "<button class='sidebar-toggle' type='button' onclick='toggleSidebar()' aria-label='Menu'>☰</button>"
-echo "<div id='sidebar-overlay' class='sidebar-overlay' onclick='toggleSidebar(false)'></div>"
 echo "<div class='sidebar'>"
 echo "  <h2>NEXI-FI ADMIN</h2>"
 echo "  <nav>"
@@ -1384,7 +1137,6 @@ echo "  </div>"
 echo "</div>"
 
 echo "<div class='main-content'><div class='container'>"
-echo "<script>function toggleSidebar(force){var open=document.body.classList.contains('sidebar-open');var next=(typeof force==='boolean')?force:!open;if(next){document.body.classList.add('sidebar-open');}else{document.body.classList.remove('sidebar-open');}}window.addEventListener('resize',function(){if(window.innerWidth>768)document.body.classList.remove('sidebar-open');});document.addEventListener('keydown',function(e){if(e.key==='Escape')document.body.classList.remove('sidebar-open');});document.addEventListener('click',function(e){var t=e.target;if(t&&t.classList&&t.classList.contains('nav-link')&&window.innerWidth<=768){document.body.classList.remove('sidebar-open');}});</script>"
 
     if [ "$TAB" = "dashboard" ]; then
         # Dashboard Content
@@ -1822,25 +1574,6 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
                 STATUS_COLOR="#6b7280"
             fi
             
-            ONLINE_STATUS="Offline"
-            ONLINE_COLOR="#6b7280"
-            if [ "$IS_CONNECTED" = "1" ]; then
-                ONLINE_STATUS="Online"
-                ONLINE_COLOR="#22c55e"
-            fi
-            SESSION_SECS=0
-            SESSION_PAUSED=0
-            if [ "$PAUSED_TS" -gt 0 ]; then
-                SESSION_SECS="$PAUSED_TS"
-                SESSION_PAUSED=1
-            elif [ "$END_TS" -gt "$NOW" ]; then
-                SESSION_SECS=$((END_TS - NOW))
-            fi
-            SH=$((SESSION_SECS / 3600))
-            SM=$(((SESSION_SECS % 3600) / 60))
-            SS=$((SESSION_SECS % 60))
-            SESSION_TEXT=$(printf "%02d:%02d:%02d" "$SH" "$SM" "$SS")
-
             # Use current IP if device is connected, otherwise use stored IP
             DISPLAY_IP="$CURRENT_IP"
             [ -z "$DISPLAY_IP" ] && DISPLAY_IP="$IPADDR"
@@ -1849,13 +1582,9 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
             [ -z "$EH" ] && EH="(unknown)"
             EIP=$(esc "$DISPLAY_IP")
             EM=$(esc "$MAC_UP")
-            TOKEN=$(sqlite3 "$DB_FILE" "SELECT session_token FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
-            [ -z "$TOKEN" ] && TOKEN="None"
-            ETOKEN=$(esc "$TOKEN")
-
             EN=$(esc "$NOTES")
             
-            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td style='font-size:11px; color:#64748b;'>$ETOKEN</td><td><span style='color:$ONLINE_COLOR; font-weight:600;'>$ONLINE_STATUS</span></td><td><span class='session-timer' data-remaining='$SESSION_SECS' data-paused='$SESSION_PAUSED' style='font-weight:600;'>$SESSION_TEXT</span></td><td>$EN</td><td>"
+            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td><span style='color:$STATUS_COLOR; font-weight:600;'>$STATUS</span></td><td>$EN</td><td>"
             echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center; margin-bottom:6px;'>"
             echo "    <input type='hidden' name='action' value='update_device'>"
             echo "    <input type='hidden' name='mac' value='$MAC_UP'>"

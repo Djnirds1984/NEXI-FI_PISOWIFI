@@ -1991,7 +1991,13 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         printf "%s" "$1" | $SED "s/'/''/g"
     }
 
+    cleanup_old_supa_tmp() {
+        command -v find >/dev/null 2>&1 || return 0
+        find /tmp -maxdepth 1 -type f \( -name 'pisowifi_supa_*' -o -name 'pisowifi_supa_err_*' \) -mmin +60 -delete 2>/dev/null || true
+    }
+
     supa_request() {
+        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         PATH="$3"
@@ -2023,6 +2029,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     }
 
     supa_patch() {
+        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         PATH="$3"
@@ -2055,6 +2062,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     }
 
     supa_rpc() {
+        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         FN="$3"
@@ -2087,6 +2095,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     }
 
     supa_insert() {
+        cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
         PATH="$3"
