@@ -85,7 +85,7 @@ if command -v sqlite3 >/dev/null 2>&1; then
     sqlite3 "$DB_FILE" "CREATE TABLE IF NOT EXISTS license (id INTEGER PRIMARY KEY, status TEXT, license_key TEXT, expires_at TEXT, vendor_uuid TEXT, hardware_id TEXT, valid INTEGER, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);" 2>/dev/null
     
     # Check for 'status' column in 'devices' table and add if missing (Soft Delete Support)
-    HAS_STATUS=$(sqlite3 "$DB_FILE" "PRAGMA table_info(devices);" 2>/dev/null | grep "status")
+    HAS_STATUS=$(sqlite3 "$DB_FILE" "PRAGMA table_info(devices);" 2>/dev/null | $GREP "status")
     if [ -z "$HAS_STATUS" ]; then
         sqlite3 "$DB_FILE" "ALTER TABLE devices ADD COLUMN status TEXT DEFAULT 'active';" 2>/dev/null
     fi
@@ -1235,17 +1235,46 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              exit 0
              
         elif [ "$ACTION" = "update_settings" ]; then
-             NEW_PASS=$(get_post_var "new_pass")
-             
-             if [ -n "$NEW_PASS" ]; then
-                 uci set pisowifi.settings.admin_password="$NEW_PASS"
-                 uci commit pisowifi
-             fi
-             
-             echo "Status: 302 Found"
-             echo "Location: /cgi-bin/admin?tab=settings&msg=saved"
-             echo ""
-             exit 0
+            NEW_PASS=$(get_post_var "new_pass")
+            ZONE=$(get_post_var "timezone_zone")
+            THEME=$(get_post_var "admin_theme")
+
+            if [ -n "$NEW_PASS" ]; then
+                uci set pisowifi.settings.admin_password="$NEW_PASS" 2>/dev/null
+            fi
+
+            ZONE_SAFE=$(printf "%s" "$ZONE" | $TR -cd 'A-Za-z0-9_/-')
+            TZSTR=""
+            case "$ZONE_SAFE" in
+                "UTC") TZSTR="UTC0" ;;
+                "Asia/Manila"|"Asia/Singapore"|"Asia/Hong_Kong") TZSTR="<+08>-8" ;;
+                "Asia/Tokyo"|"Asia/Seoul") TZSTR="<+09>-9" ;;
+                "Australia/Sydney") TZSTR="<+10>-10" ;;
+                "") TZSTR="" ;;
+                *) TZSTR="" ;;
+            esac
+            if [ -n "$ZONE_SAFE" ] && [ -n "$TZSTR" ]; then
+                uci set system.@system[0].zonename="$ZONE_SAFE" 2>/dev/null
+                uci set system.@system[0].timezone="$TZSTR" 2>/dev/null
+                uci commit system 2>/dev/null
+
+                if [ -f "/usr/share/zoneinfo/$ZONE_SAFE" ]; then
+                    ln -sf "/usr/share/zoneinfo/$ZONE_SAFE" /etc/localtime 2>/dev/null || true
+                fi
+                printf "%s\n" "$ZONE_SAFE" > /etc/TZ 2>/dev/null || true
+                [ -x /etc/init.d/system ] && /etc/init.d/system reload >/dev/null 2>&1 || true
+            fi
+
+            THEME_SAFE=$(printf "%s" "$THEME" | $TR -cd 'A-Za-z0-9_-')
+            [ -z "$THEME_SAFE" ] && THEME_SAFE="default"
+            uci set pisowifi.settings.admin_theme="$THEME_SAFE" 2>/dev/null
+
+            uci commit pisowifi 2>/dev/null
+
+            echo "Status: 302 Found"
+            echo "Location: /cgi-bin/admin?tab=settings&msg=saved"
+            echo ""
+            exit 0
              
         elif [ "$ACTION" = "update_standard_rate" ]; then
              RATE=$(get_post_var "rate")
@@ -1457,9 +1486,19 @@ echo ""
 
 # HTML Start
 echo "<!DOCTYPE html><html><head><title>NEXI-FI Admin Dashboard</title><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
+
+ADMIN_THEME=$($UCI -q get pisowifi.settings.admin_theme 2>/dev/null || echo "")
+[ -z "$ADMIN_THEME" ] && ADMIN_THEME=$($UCI -q get pisowifi.admin.theme 2>/dev/null || echo "default")
+case "$ADMIN_THEME" in
+    dark) THEME_ROOT="--primary:#22c55e;--secondary:#94a3b8;--success:#22c55e;--danger:#f87171;--bg:#0b1220;--sidebar-bg:#0f172a;--sidebar-text:#cbd5e1;--card-bg:#111a2e;--card-text:#e2e8f0;" ;;
+    ocean) THEME_ROOT="--primary:#06b6d4;--secondary:#64748b;--success:#22c55e;--danger:#fb7185;--bg:#f0f9ff;--sidebar-bg:#0b3a4a;--sidebar-text:#e0f2fe;--card-bg:#ffffff;--card-text:#0f172a;" ;;
+    sunset) THEME_ROOT="--primary:#f97316;--secondary:#64748b;--success:#22c55e;--danger:#ef4444;--bg:#fff7ed;--sidebar-bg:#451a03;--sidebar-text:#ffedd5;--card-bg:#ffffff;--card-text:#0f172a;" ;;
+    *) THEME_ROOT="--primary:#2563eb;--secondary:#64748b;--success:#22c55e;--danger:#ef4444;--bg:#f1f5f9;--sidebar-bg:#1e293b;--sidebar-text:#e2e8f0;--card-bg:#ffffff;--card-text:#0f172a;" ;;
+esac
+
 echo "<style>"
-echo "  :root { --primary: #2563eb; --secondary: #64748b; --success: #22c55e; --danger: #ef4444; --bg: #f1f5f9; --sidebar-bg: #1e293b; --sidebar-text: #e2e8f0; }"
-echo "  body { font-family: 'Inter', sans-serif; background: var(--bg); color: #1e293b; margin: 0; padding: 0; display: flex; min-height: 100vh; }"
+echo "  :root { $THEME_ROOT }"
+echo "  body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--card-text); margin: 0; padding: 0; display: flex; min-height: 100vh; }"
 echo "  .sidebar { width: 250px; background: var(--sidebar-bg); color: var(--sidebar-text); padding: 20px; display: flex; flex-direction: column; flex-shrink: 0; }"
 echo "  .sidebar h2 { color: white; margin-bottom: 30px; font-size: 1.25rem; text-transform: uppercase; letter-spacing: 0.1em; text-align: center; }"
 echo "  .nav-link { display: block; padding: 12px 16px; color: var(--sidebar-text); text-decoration: none; border-radius: 8px; margin-bottom: 8px; transition: all 0.2s; }"
@@ -1469,9 +1508,9 @@ echo "  .main-content { flex-grow: 1; padding: 30px; overflow-y: auto; }"
 echo "  .container { max-width: 1200px; margin: 0 auto; }"
 echo "  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }"
 echo "  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; margin-bottom: 24px; }"
-echo "  .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }"
+echo "  .card { background: var(--card-bg); padding: 20px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); color: var(--card-text); }"
 echo "  .card h3 { margin: 0 0 10px 0; font-size: 0.875rem; color: var(--secondary); text-transform: uppercase; letter-spacing: 0.05em; }"
-echo "  .card .value { font-size: 1.5rem; font-weight: 700; color: #0f172a; }"
+echo "  .card .value { font-size: 1.5rem; font-weight: 700; color: var(--card-text); }"
 echo "  .card .sub { font-size: 0.75rem; color: var(--secondary); margin-top: 4px; }"
 echo "  .progress-bg { background: #e2e8f0; height: 8px; border-radius: 4px; margin-top: 10px; overflow: hidden; }"
 echo "  .progress-fill { background: var(--primary); height: 100%; transition: width 0.3s ease; }"
@@ -1481,6 +1520,8 @@ echo "  td { padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 0.875re
 echo "  .btn { padding: 8px 16px; border-radius: 6px; border: none; font-weight: 600; cursor: pointer; transition: all 0.2s; }"
 echo "  .btn-primary { background: var(--primary); color: white; }"
 echo "  .btn-danger { background: var(--danger); color: white; }"
+echo "  input, select, textarea { background: var(--card-bg); color: var(--card-text); }"
+echo "  input, select, textarea { border-color: rgba(148,163,184,0.55) !important; }"
 echo "  .chart-container { height: 200px; width: 100%; margin-top: 10px; position: relative; }"
 echo "  canvas { width: 100% !important; height: 100% !important; }"
 echo "  .sidebar-toggle { display: none; position: fixed; top: 12px; left: 12px; z-index: 1002; background: var(--sidebar-bg); color: white; border: 0; border-radius: 10px; padding: 10px 12px; font-size: 18px; line-height: 1; }"
@@ -2500,13 +2541,41 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         
         echo "<div class='grid' style='grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));'>"
 
+        CUR_ZONE=$($UCI -q get system.@system[0].zonename 2>/dev/null || echo "")
+        [ -z "$CUR_ZONE" ] && [ -f /etc/TZ ] && CUR_ZONE=$($CAT /etc/TZ 2>/dev/null | $HEAD -n1 | $TR -d '\r')
+        [ -z "$CUR_ZONE" ] && CUR_ZONE="Asia/Manila"
+        CUR_THEME=$($UCI -q get pisowifi.settings.admin_theme 2>/dev/null || echo "")
+        [ -z "$CUR_THEME" ] && CUR_THEME=$($UCI -q get pisowifi.admin.theme 2>/dev/null || echo "default")
+
         echo "  <div class='card'>"
         echo "    <h3>General Configuration</h3>"
+        echo "    <div class='sub' style='margin-top:-6px; margin-bottom:10px;'>Included in Save: admin password, timezone, and admin theme.</div>"
         echo "    <form method='POST'>"
         echo "      <input type='hidden' name='action' value='update_settings'>"
-        echo "      <div style='margin-bottom: 20px;'>"
+        echo "      <div style='margin-bottom: 16px;'>"
         echo "        <label style='display:block; margin-bottom:8px; font-weight:600;'>New Admin Password</label>"
         echo "        <input type='password' name='new_pass' placeholder='Leave blank to keep current' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing: border-box;'>"
+        echo "      </div>"
+        echo "      <div style='margin-bottom: 16px;'>"
+        echo "        <label style='display:block; margin-bottom:8px; font-weight:600;'>Timezone</label>"
+        echo "        <select name='timezone_zone' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing:border-box;'>"
+        echo "          <option value='Asia/Manila' $([ \"$CUR_ZONE\" = \"Asia/Manila\" ] && echo selected)>Asia/Manila (PH)</option>"
+        echo "          <option value='Asia/Singapore' $([ \"$CUR_ZONE\" = \"Asia/Singapore\" ] && echo selected)>Asia/Singapore</option>"
+        echo "          <option value='Asia/Hong_Kong' $([ \"$CUR_ZONE\" = \"Asia/Hong_Kong\" ] && echo selected)>Asia/Hong_Kong</option>"
+        echo "          <option value='Asia/Tokyo' $([ \"$CUR_ZONE\" = \"Asia/Tokyo\" ] && echo selected)>Asia/Tokyo</option>"
+        echo "          <option value='Asia/Seoul' $([ \"$CUR_ZONE\" = \"Asia/Seoul\" ] && echo selected)>Asia/Seoul</option>"
+        echo "          <option value='Australia/Sydney' $([ \"$CUR_ZONE\" = \"Australia/Sydney\" ] && echo selected)>Australia/Sydney</option>"
+        echo "          <option value='UTC' $([ \"$CUR_ZONE\" = \"UTC\" ] && echo selected)>UTC</option>"
+        echo "        </select>"
+        echo "      </div>"
+        echo "      <div style='margin-bottom: 20px;'>"
+        echo "        <label style='display:block; margin-bottom:8px; font-weight:600;'>Admin Theme</label>"
+        echo "        <select name='admin_theme' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:1rem; box-sizing:border-box;'>"
+        echo "          <option value='default' $([ \"$CUR_THEME\" = \"default\" ] && echo selected)>Default</option>"
+        echo "          <option value='dark' $([ \"$CUR_THEME\" = \"dark\" ] && echo selected)>Dark</option>"
+        echo "          <option value='ocean' $([ \"$CUR_THEME\" = \"ocean\" ] && echo selected)>Ocean</option>"
+        echo "          <option value='sunset' $([ \"$CUR_THEME\" = \"sunset\" ] && echo selected)>Sunset</option>"
+        echo "        </select>"
         echo "      </div>"
         echo "      <button class='btn btn-primary' style='width:100%; padding: 12px;'>Save Settings</button>"
         echo "    </form>"
