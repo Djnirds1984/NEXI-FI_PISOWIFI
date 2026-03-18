@@ -261,20 +261,32 @@ function resumeTime() {
 }
 
 function startCoin() {
-  fetch(apiUrl + "?action=start_coin").then(r => r.json()).then(() => {
-    document.getElementById("coin-modal").style.display="block";
-    document.getElementById("coin-count").innerText="0";
-    document.getElementById("coin-time").innerText="0";
-    document.getElementById("connect-btn").style.display="none";
-    if(interval) clearInterval(interval);
-    interval = setInterval(() => {
-      fetch(apiUrl + "?action=check_coin").then(r => r.json()).then(d => {
-        document.getElementById("coin-count").innerText = d.count;
-        document.getElementById("coin-time").innerText = d.minutes;
-        if(d.count > 0) document.getElementById("connect-btn").style.display="block";
-      }).catch(() => {});
-    }, 1000);
-  }).catch(() => { alert("Failed to start coin session. Please refresh the page."); });
+  // Try to acquire lock and start coin session in one atomic operation
+  fetch(apiUrl + "?action=start_coin").then(r => r.json()).then(data => {
+    if(data.status === "started" && data.lock_acquired) {
+      // Successfully acquired lock - show modal
+      document.getElementById("coin-modal").style.display="block";
+      document.getElementById("coin-count").innerText="0";
+      document.getElementById("coin-time").innerText="0";
+      document.getElementById("connect-btn").style.display="none";
+        if(interval) clearInterval(interval);
+        interval = setInterval(() => {
+          fetch(apiUrl + "?action=check_coin").then(r => r.json()).then(d => {
+            document.getElementById("coin-count").innerText = d.count;
+            document.getElementById("coin-time").innerText = d.minutes;
+            if(d.count > 0) document.getElementById("connect-btn").style.display="block";
+          }).catch(() => {});
+        }, 1000);
+      } else if(data.error && data.error.includes("locked by another device")) {
+        // Coinslot is locked by another device
+        alert("Coinslot is currently in use by another device. Please try again later.");
+      } else if(data.error) {
+        alert(data.error + " (Device: " + data.locked_by_mac + ")");
+      } else {
+        alert("Failed to start coin session. Please try again.");
+      }
+    })
+    .catch(() => { alert("Failed to start coin session. Please refresh the page."); });
 }
 
 function connect() {
@@ -299,6 +311,14 @@ function closeModal() {
   document.getElementById("coin-modal").style.display="none";
   if(interval) clearInterval(interval);
   stopAudio();
+  
+  // Release coinslot lock when closing modal
+  fetch(apiUrl + "?action=release_coinslot_lock")
+  .then(r => r.json())
+  .then(data => {
+    console.log("Coinslot lock released:", data);
+  })
+  .catch(err => console.error("Failed to release lock:", err));
 }
 
 setTimeout(function() {

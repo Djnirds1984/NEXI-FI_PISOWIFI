@@ -612,7 +612,12 @@ while IFS='|' read -r MAC IP DEV SSTART SEND; do
 
     TOKEN="$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_token FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null | head -n1)"
     TOKEN_ESC="$(printf '%s' "$TOKEN" | sed 's/\"/\\\"/g')"
-    BODY="{\"vendor_id\":\"$VENDOR_ID\",\"machine_id\":\"$MACHINE_ID\",\"mac_address\":\"$MAC_ESC\",\"ip_address\":\"$IP_ESC\",\"device_name\":\"$DEV_ESC\",\"remaining_seconds\":$REM"
+    LOCAL_PAID="$(sqlite3 -separator '|' "$DB_FILE" "SELECT COALESCE(SUM(coins),0) FROM coins WHERE upper(mac)=upper('$MAC_UP');" 2>/dev/null | head -n1)"
+    case "$LOCAL_PAID" in
+        ''|*[!0-9]*) LOCAL_PAID=0 ;;
+    esac
+
+    BODY="{\"vendor_id\":\"$VENDOR_ID\",\"machine_id\":\"$MACHINE_ID\",\"mac_address\":\"$MAC_ESC\",\"ip_address\":\"$IP_ESC\",\"device_name\":\"$DEV_ESC\",\"remaining_seconds\":$REM,\"total_paid\":$LOCAL_PAID"
     if [ -n "$TOKEN_ESC" ]; then
         BODY="$BODY,\"session_token\":\"$TOKEN_ESC\""
     fi
