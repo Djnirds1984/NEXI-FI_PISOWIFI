@@ -83,6 +83,12 @@ DB_FILE="/etc/pisowifi/pisowifi.db"
 [ -d /etc/pisowifi ] || mkdir -p /etc/pisowifi
 if command -v sqlite3 >/dev/null 2>&1; then
     sqlite3 "$DB_FILE" "CREATE TABLE IF NOT EXISTS license (id INTEGER PRIMARY KEY, status TEXT, license_key TEXT, expires_at TEXT, vendor_uuid TEXT, hardware_id TEXT, valid INTEGER, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);" 2>/dev/null
+    
+    # Check for 'status' column in 'devices' table and add if missing (Soft Delete Support)
+    HAS_STATUS=$(sqlite3 "$DB_FILE" "PRAGMA table_info(devices);" 2>/dev/null | grep "status")
+    if [ -z "$HAS_STATUS" ]; then
+        sqlite3 "$DB_FILE" "ALTER TABLE devices ADD COLUMN status TEXT DEFAULT 'active';" 2>/dev/null
+    fi
 fi
 
 # Simple Login Check
@@ -139,7 +145,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
-        PATH="$3"
+        API_PATH="$3"
         SUPA_HTTP_CODE=""
         SUPA_CURL_EXIT="0"
         SUPA_CURL_ERR=""
@@ -155,7 +161,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         fi
         TMP="/tmp/pisowifi_supa_$$"
         ERR="/tmp/pisowifi_supa_err_$$"
-        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" "$URL/rest/v1/$PATH" 2>"$ERR")
+        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" "$URL/rest/v1/$API_PATH" 2>"$ERR")
         SUPA_CURL_EXIT="$?"
         if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
             SUPA_HTTP_CODE="0"
@@ -171,7 +177,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
-        PATH="$3"
+        API_PATH="$3"
         BODY="$4"
         SUPA_HTTP_CODE=""
         SUPA_CURL_EXIT="0"
@@ -188,7 +194,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         fi
         TMP="/tmp/pisowifi_supa_$$"
         ERR="/tmp/pisowifi_supa_err_$$"
-        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -X PATCH -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" -H "Content-Type: application/json" -H "Prefer: return=representation" --data "$BODY" "$URL/rest/v1/$PATH" 2>"$ERR")
+        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -X PATCH -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" -H "Content-Type: application/json" -H "Prefer: return=representation" --data "$BODY" "$URL/rest/v1/$API_PATH" 2>"$ERR")
         SUPA_CURL_EXIT="$?"
         if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
             SUPA_HTTP_CODE="0"
@@ -237,7 +243,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         cleanup_old_supa_tmp
         URL="$1"
         KEY="$2"
-        PATH="$3"
+        API_PATH="$3"
         BODY="$4"
         SUPA_HTTP_CODE=""
         SUPA_CURL_EXIT="0"
@@ -254,7 +260,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         fi
         TMP="/tmp/pisowifi_supa_$$"
         ERR="/tmp/pisowifi_supa_err_$$"
-        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -X POST -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" -H "Content-Type: application/json" -H "Prefer: return=representation" --data "$BODY" "$URL/rest/v1/$PATH" 2>"$ERR")
+        SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -X POST -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" -H "Content-Type: application/json" -H "Prefer: return=representation" --data "$BODY" "$URL/rest/v1/$API_PATH" 2>"$ERR")
         SUPA_CURL_EXIT="$?"
         if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
             SUPA_HTTP_CODE="0"
@@ -729,7 +735,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              HOST_SQL=$(sql_escape "$HOSTNAME")
              NOTES_SQL=$(sql_escape "$NOTES")
 
-             sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
+             sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', status='active', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
 
              echo "Status: 302 Found"
              echo "Location: /cgi-bin/admin?tab=devices&msg=device_saved"
@@ -747,7 +753,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              HOST_SQL=$(sql_escape "$HOSTNAME")
              NOTES_SQL=$(sql_escape "$NOTES")
 
-             sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
+             sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET ip='$IP_SQL', hostname='$HOST_SQL', notes='$NOTES_SQL', status='active', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
 
              echo "Status: 302 Found"
              echo "Location: /cgi-bin/admin?tab=devices&msg=device_saved"
@@ -757,7 +763,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         elif [ "$ACTION" = "delete_device" ]; then
              MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
              MAC_SQL=$(sql_escape "$MAC")
-             sqlite3 "$DB_FILE" "DELETE FROM devices WHERE mac='$MAC_SQL';" 2>/dev/null
+             sqlite3 "$DB_FILE" "UPDATE devices SET status='deleted' WHERE mac='$MAC_SQL'; DELETE FROM users WHERE mac='$MAC_SQL';" 2>/dev/null
 
              echo "Status: 302 Found"
              echo "Location: /cgi-bin/admin?tab=devices&msg=device_deleted"
@@ -800,6 +806,88 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              echo ""
              exit 0
 
+        elif [ "$ACTION" = "device_edit" ]; then
+             MAC=$(get_post_var "mac" | tr 'a-z' 'A-Z')
+             IP_ADDR=$(get_post_var "ip")
+             HOSTNAME=$(get_post_var "hostname")
+             ADD_MIN=$(get_post_var "add_minutes")
+             DEDUCT_MIN=$(get_post_var "deduct_minutes")
+
+             case "$ADD_MIN" in
+                 ''|*[!0-9]*) ADD_MIN=0 ;;
+             esac
+             case "$DEDUCT_MIN" in
+                 ''|*[!0-9]*) DEDUCT_MIN=0 ;;
+             esac
+
+             NOW_TS=$($DATE +%s)
+             MAC_SQL=$(sql_escape "$MAC")
+             IP_SQL=$(sql_escape "$IP_ADDR")
+
+             if [ -n "$HOSTNAME" ]; then
+                 HOST_SQL=$(sql_escape "$HOSTNAME")
+                 sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO devices (mac, created_at, updated_at) VALUES ('$MAC_SQL', strftime('%s','now'), strftime('%s','now')); UPDATE devices SET hostname='$HOST_SQL', updated_at=strftime('%s','now') WHERE mac='$MAC_SQL';" 2>/dev/null
+             fi
+
+             DELTA_MIN=$((ADD_MIN - DEDUCT_MIN))
+             if [ "$DELTA_MIN" -ne 0 ]; then
+                 TOKEN=$(sqlite3 "$DB_FILE" "SELECT session_token FROM users WHERE mac='$MAC_SQL' LIMIT 1;" 2>/dev/null)
+                 CUR_REM=0
+                 NEW_REM=0
+                 USED_SUPA=0
+
+                 ROAM_SUPA_URL=$($UCI -q get pisowifi.supabase.url 2>/dev/null || echo "")
+                 ROAM_SUPA_KEY=$($UCI -q get pisowifi.supabase.key 2>/dev/null || echo "")
+
+                 if [ -n "$ROAM_SUPA_URL" ] && [ -n "$ROAM_SUPA_KEY" ] && [ -n "$TOKEN" ]; then
+                     supa_request "$ROAM_SUPA_URL" "$ROAM_SUPA_KEY" "sessions?select=remaining_seconds&session_uuid=eq.$TOKEN&limit=1"
+                     if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                         CUR_REM=$(echo "$SUPA_BODY" | $GREP -o '"remaining_seconds":[0-9]*' | $CUT -d: -f2 | $HEAD -1)
+                         case "$CUR_REM" in
+                             ''|*[!0-9]*) CUR_REM=0 ;;
+                         esac
+                         NEW_REM=$((CUR_REM + (DELTA_MIN * 60)))
+                         [ "$NEW_REM" -lt 0 ] && NEW_REM=0
+                         PATCH_BODY="{\"remaining_seconds\": $NEW_REM}"
+                         supa_patch "$ROAM_SUPA_URL" "$ROAM_SUPA_KEY" "sessions?session_uuid=eq.$TOKEN" "$PATCH_BODY"
+                         if [ "$SUPA_HTTP_CODE" = "200" ] || [ "$SUPA_HTTP_CODE" = "204" ]; then
+                             USED_SUPA=1
+                         fi
+                     fi
+                 fi
+
+                 if [ "$USED_SUPA" = "0" ]; then
+                     USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$MAC_SQL' LIMIT 1;" 2>/dev/null)
+                     END_TS=$(echo "$USER_ROW" | $CUT -d'|' -f1)
+                     PAUSED_TS=$(echo "$USER_ROW" | $CUT -d'|' -f2)
+                     [ -z "$END_TS" ] && END_TS=0
+                     [ -z "$PAUSED_TS" ] && PAUSED_TS=0
+                     if [ "$PAUSED_TS" -gt 0 ]; then
+                         CUR_REM=$PAUSED_TS
+                     elif [ "$END_TS" -gt "$NOW_TS" ]; then
+                         CUR_REM=$((END_TS - NOW_TS))
+                     else
+                         CUR_REM=0
+                     fi
+                     NEW_REM=$((CUR_REM + (DELTA_MIN * 60)))
+                     [ "$NEW_REM" -lt 0 ] && NEW_REM=0
+                 fi
+
+                 if [ "$NEW_REM" -gt 0 ]; then
+                     NEW_END=$((NOW_TS + NEW_REM))
+                     sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO users (mac, ip, session_start, session_end, paused_time) VALUES ('$MAC_SQL', '$IP_SQL', $NOW_TS, $NEW_END, 0); UPDATE users SET ip='$IP_SQL', session_end=$NEW_END, paused_time=0 WHERE mac='$MAC_SQL';" 2>/dev/null
+                     /usr/bin/pisowifi_nftables.sh allow "$MAC" "$IP_ADDR" >/dev/null 2>&1 &
+                 else
+                     sqlite3 "$DB_FILE" "UPDATE users SET ip='$IP_SQL', session_end=0, paused_time=0 WHERE mac='$MAC_SQL';" 2>/dev/null
+                     /usr/bin/pisowifi_nftables.sh deny "$MAC" >/dev/null 2>&1 &
+                 fi
+             fi
+
+             echo "Status: 302 Found"
+             echo "Location: /cgi-bin/admin?tab=devices&msg=device_saved"
+             echo ""
+             exit 0
+
         elif [ "$ACTION" = "sync_devices" ]; then
              UCI_BIN="$(command -v uci 2>/dev/null || echo /sbin/uci)"
              CENTRALIZED_KEY="$($UCI_BIN -q get pisowifi.license.centralized_key 2>/dev/null)"
@@ -835,15 +923,56 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              if [ -f "/usr/bin/wifi_devices_sync_auto.sh" ]; then
                  SYNC_RESULT=$(sh /usr/bin/wifi_devices_sync_auto.sh 2>&1)
                  SYNC_STATUS=$?
+
+                 COINS_SYNCED=0
+                 SUPA_URL_ROAM="$($UCI_BIN -q get pisowifi.license.supabase_url 2>/dev/null || echo "")"
+                 SUPA_KEY_ROAM="$($UCI_BIN -q get pisowifi.license.supabase_service_key 2>/dev/null || echo "")"
+                 [ -z "$SUPA_KEY_ROAM" ] && SUPA_KEY_ROAM="$($UCI_BIN -q get pisowifi.license.supabase_key 2>/dev/null || echo "")"
+                 MACHINE_ID_ROAM="$($UCI_BIN -q get pisowifi.license.vendor_uuid 2>/dev/null || echo "")"
+                 if [ -z "$SUPA_URL_ROAM" ] || [ -z "$SUPA_KEY_ROAM" ]; then
+                     if [ -f /etc/pisowifi/supabase.env ]; then
+                        [ -z "$SUPA_URL_ROAM" ] && SUPA_URL_ROAM="$(grep -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | $CUT -d= -f2- | $TR -d '\r' | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//')"
+                        [ -z "$SUPA_KEY_ROAM" ] && SUPA_KEY_ROAM="$(grep -m1 '^SUPABASE_SERVICE_ROLE_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | $CUT -d= -f2- | $TR -d '\r' | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//')"
+                        [ -z "$SUPA_KEY_ROAM" ] && SUPA_KEY_ROAM="$(grep -m1 '^SUPABASE_ANON_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | $CUT -d= -f2- | $TR -d '\r' | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//')"
+                     fi
+                 fi
+                 if [ "$SYNC_STATUS" -eq 0 ] && [ -n "$SUPA_URL_ROAM" ] && [ -n "$SUPA_KEY_ROAM" ] && command -v sqlite3 >/dev/null 2>&1; then
+                     sqlite3 -separator '|' "$DB_FILE" "SELECT mac FROM devices ORDER BY updated_at DESC;" 2>/dev/null | while IFS='|' read MACADDR; do
+                         [ -z "$MACADDR" ] && continue
+                         MAC_UP=$(echo "$MACADDR" | tr 'a-z' 'A-Z')
+                         LOCAL_PAID=$(sqlite3 "$DB_FILE" "SELECT COALESCE(SUM(coins),0) FROM coins WHERE upper(mac)=upper('$MAC_UP');" 2>/dev/null)
+                         [ -z "$LOCAL_PAID" ] && LOCAL_PAID=0
+                         case "$LOCAL_PAID" in
+                             ''|*[!0-9]*) LOCAL_PAID=0 ;;
+                         esac
+                         BODY="{\"total_paid\": $LOCAL_PAID, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                         if [ -n "$MACHINE_ID_ROAM" ]; then
+                             supa_patch "$SUPA_URL_ROAM" "$SUPA_KEY_ROAM" "wifi_devices?machine_id=eq.$MACHINE_ID_ROAM&mac_address=ilike.$MAC_UP" "$BODY"
+                         else
+                             supa_patch "$SUPA_URL_ROAM" "$SUPA_KEY_ROAM" "wifi_devices?mac_address=ilike.$MAC_UP" "$BODY"
+                         fi
+                         if [ "$SUPA_HTTP_CODE" = "204" ] || [ "$SUPA_HTTP_CODE" = "200" ]; then
+                             COINS_SYNCED=$((COINS_SYNCED + 1))
+                         fi
+                     done
+                 fi
                  
                  echo "Content-type: application/json"
                  echo ""
                  if [ $SYNC_STATUS -eq 0 ]; then
                      SYNC_SAFE="$(printf '%s' "$SYNC_RESULT" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g')"
                      if [ -n "$SYNC_SAFE" ]; then
-                         echo "{\"status\":\"success\",\"message\":\"Device sync completed: $SYNC_SAFE\"}"
+                         if [ "$COINS_SYNCED" -gt 0 ] 2>/dev/null; then
+                             echo "{\"status\":\"success\",\"message\":\"Device sync completed: $SYNC_SAFE | coins synced: $COINS_SYNCED\"}"
+                         else
+                             echo "{\"status\":\"success\",\"message\":\"Device sync completed: $SYNC_SAFE\"}"
+                         fi
                      else
-                         echo '{"status":"success","message":"Device sync completed successfully."}'
+                         if [ "$COINS_SYNCED" -gt 0 ] 2>/dev/null; then
+                             echo "{\"status\":\"success\",\"message\":\"Device sync completed successfully. | coins synced: $COINS_SYNCED\"}"
+                         else
+                             echo '{"status":"success","message":"Device sync completed successfully."}'
+                         fi
                      fi
                  else
                      SYNC_SAFE="$(printf '%s' "$SYNC_RESULT" | tr '\r\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g')"
@@ -1646,6 +1775,43 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
             fi
         }
 
+        cleanup_old_supa_tmp() {
+            command -v find >/dev/null 2>&1 || return 0
+            find /tmp -maxdepth 1 -type f \( -name 'pisowifi_supa_*' -o -name 'pisowifi_supa_err_*' \) -mmin +60 -delete 2>/dev/null || true
+        }
+
+        supa_request() {
+            cleanup_old_supa_tmp
+            URL="$1"
+            KEY="$2"
+            API_PATH="$3"
+            SUPA_HTTP_CODE=""
+            SUPA_CURL_EXIT="0"
+            SUPA_CURL_ERR=""
+            SUPA_BODY=""
+            CURL_BIN="/usr/bin/curl"
+            [ -x "$CURL_BIN" ] || CURL_BIN="/bin/curl"
+            [ -x "$CURL_BIN" ] || CURL_BIN=""
+            if [ -z "$CURL_BIN" ]; then
+                SUPA_HTTP_CODE="0"
+                SUPA_CURL_EXIT="127"
+                SUPA_CURL_ERR="curl_missing"
+                return
+            fi
+            TMP="/tmp/pisowifi_supa_$$"
+            ERR="/tmp/pisowifi_supa_err_$$"
+            SUPA_HTTP_CODE=$("$CURL_BIN" -sS -o "$TMP" -w "%{http_code}" --connect-timeout 8 --max-time 15 -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -H "Accept: application/json" -H "Accept-Encoding: identity" "$URL/rest/v1/$API_PATH" 2>"$ERR")
+            SUPA_CURL_EXIT="$?"
+            if [ "$SUPA_CURL_EXIT" != "0" ] || [ -z "$SUPA_HTTP_CODE" ]; then
+                SUPA_HTTP_CODE="0"
+                SUPA_CURL_ERR=$($HEAD -1 "$ERR" 2>/dev/null | $TR -d '\r' | $TR '\n' ' ')
+                [ -z "$SUPA_CURL_ERR" ] && SUPA_CURL_ERR="curl_failed"
+            fi
+            SUPA_BODY=$($CAT "$TMP" 2>/dev/null)
+            $CAT /dev/null > "$TMP" 2>/dev/null
+            rm -f "$TMP" "$ERR" 2>/dev/null || true
+        }
+
         NOW=$($DATE +%s)
         LEASE_FILES="/tmp/dhcp.leases /tmp/dnsmasq.leases /var/dhcp.leases"
         LEASE_FILE=""
@@ -1765,10 +1931,21 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "<p style='color:#64748b; font-size:14px; margin-bottom:8px;'>Devices are automatically saved when they connect to the network. Online devices show green status.</p>"
         echo "<button id='sync-all-btn' class='btn btn-primary' style='background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); border:none; padding:8px 16px; border-radius:6px; color:white; cursor:pointer;'>Sync All Devices</button>"
         echo "</div>"
-        echo "<table><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Status</th><th>Notes</th><th>Actions</th></tr>"
+        ROAM_SUPA_URL=$($UCI -q get pisowifi.supabase.url 2>/dev/null || echo "")
+        ROAM_SUPA_KEY=$($UCI -q get pisowifi.supabase.key 2>/dev/null || echo "")
+        ROAM_SUPA_SERVICE_KEY=$($UCI -q get pisowifi.license.supabase_service_key 2>/dev/null || echo "")
+        ROAM_SUPA_MACHINE_ID=$($UCI -q get pisowifi.license.vendor_uuid 2>/dev/null || echo "")
+        if [ -z "$ROAM_SUPA_URL" ] || [ -z "$ROAM_SUPA_KEY" ] || [ -z "$ROAM_SUPA_SERVICE_KEY" ]; then
+            if [ -f /etc/pisowifi/supabase.env ]; then
+                [ -z "$ROAM_SUPA_URL" ] && ROAM_SUPA_URL="$(sed -n 's/^SUPABASE_URL=\(.*\)$/\1/p' /etc/pisowifi/supabase.env 2>/dev/null | $HEAD -n1 | $TR -d '\r' | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//')"
+                [ -z "$ROAM_SUPA_SERVICE_KEY" ] && ROAM_SUPA_SERVICE_KEY="$(sed -n 's/^SUPABASE_SERVICE_ROLE_KEY=\(.*\)$/\1/p' /etc/pisowifi/supabase.env 2>/dev/null | $HEAD -n1 | $TR -d '\r' | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//')"
+                [ -z "$ROAM_SUPA_KEY" ] && ROAM_SUPA_KEY="$(sed -n 's/^SUPABASE_ANON_KEY=\(.*\)$/\1/p' /etc/pisowifi/supabase.env 2>/dev/null | $HEAD -n1 | $TR -d '\r' | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//')"
+            fi
+        fi
+        echo "<table><tr><th>Hostname</th><th>IP</th><th>MAC</th><th>Status</th><th>Session Token</th><th>Notes</th><th>Remaining Time</th><th>Total Coins Inserted</th><th>Local Coins</th><th>Actions</th></tr>"
         
-        # Display all devices with connection status
-        sqlite3 -separator '|' "$DB_FILE" "SELECT mac, ip, hostname, notes FROM devices ORDER BY updated_at DESC;" 2>/dev/null | while IFS='|' read MACADDR IPADDR HOSTNAME NOTES; do
+        # Display all devices with connection status (exclude soft-deleted)
+        sqlite3 -separator '|' "$DB_FILE" "SELECT mac, ip, hostname, notes FROM devices WHERE status IS NULL OR status != 'deleted' ORDER BY updated_at DESC;" 2>/dev/null | while IFS='|' read MACADDR IPADDR HOSTNAME NOTES; do
             [ -z "$MACADDR" ] && continue
             MAC_UP=$(echo "$MACADDR" | tr 'a-z' 'A-Z')
             
@@ -1799,47 +1976,125 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
                 fi
             fi
             
-            # Get user session info
-            USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
-            END_TS=$(echo "$USER_ROW" | cut -d'|' -f1)
-            PAUSED_TS=$(echo "$USER_ROW" | cut -d'|' -f2)
-            [ -z "$END_TS" ] && END_TS=0
-            [ -z "$PAUSED_TS" ] && PAUSED_TS=0
-            
-            # Determine status and color
-            if [ "$PAUSED_TS" -gt 0 ]; then
-                STATUS="Paused"
-                STATUS_COLOR="#ef4444"
-            elif [ "$END_TS" -gt "$NOW" ]; then
-                REM=$((END_TS - NOW))
-                STATUS="Active ($(fmt_time "$REM"))"
-                STATUS_COLOR="#10b981"
-            elif [ "$IS_CONNECTED" = "1" ]; then
-                STATUS="Online"
-                STATUS_COLOR="#22c55e"
-            else
-                STATUS="Offline"
-                STATUS_COLOR="#6b7280"
-            fi
-            
             ONLINE_STATUS="Offline"
             ONLINE_COLOR="#6b7280"
             if [ "$IS_CONNECTED" = "1" ]; then
                 ONLINE_STATUS="Online"
                 ONLINE_COLOR="#22c55e"
             fi
+            TOKEN=$(sqlite3 "$DB_FILE" "SELECT session_token FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
+            [ -z "$TOKEN" ] && TOKEN="None"
+
             SESSION_SECS=0
             SESSION_PAUSED=0
+            
+            # Check local DB first for accurate real-time tracking
+            USER_ROW=$(sqlite3 -separator '|' "$DB_FILE" "SELECT session_end, paused_time FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
+            END_TS=$(echo "$USER_ROW" | $CUT -d'|' -f1)
+            PAUSED_TS=$(echo "$USER_ROW" | $CUT -d'|' -f2)
+            [ -z "$END_TS" ] && END_TS=0
+            [ -z "$PAUSED_TS" ] && PAUSED_TS=0
+            
             if [ "$PAUSED_TS" -gt 0 ]; then
                 SESSION_SECS="$PAUSED_TS"
                 SESSION_PAUSED=1
             elif [ "$END_TS" -gt "$NOW" ]; then
                 SESSION_SECS=$((END_TS - NOW))
             fi
+
+            # Fallback to Supabase if local time is 0 (e.g., roaming user not fully synced locally)
+            if [ "$SESSION_SECS" -eq 0 ] && [ -n "$ROAM_SUPA_URL" ] && [ -n "$ROAM_SUPA_KEY" ] && [ -n "$TOKEN" ] && [ "$TOKEN" != "None" ]; then
+                supa_request "$ROAM_SUPA_URL" "$ROAM_SUPA_KEY" "sessions?select=remaining_seconds,is_paused&session_uuid=eq.$TOKEN&limit=1"
+                if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                    REM_SEC=$(echo "$SUPA_BODY" | $GREP -o '"remaining_seconds":[0-9]*' | $CUT -d: -f2 | $HEAD -1)
+                    IS_PAUSED=$(echo "$SUPA_BODY" | $GREP -o '"is_paused":[^,}]*' | $CUT -d: -f2 | $HEAD -1)
+                    [ -z "$REM_SEC" ] && REM_SEC=0
+                    if [ "$REM_SEC" -gt 0 ]; then
+                        SESSION_SECS="$REM_SEC"
+                        [ "$IS_PAUSED" = "true" ] && SESSION_PAUSED=1
+                    fi
+                fi
+            fi
+
             SH=$((SESSION_SECS / 3600))
             SM=$(((SESSION_SECS % 3600) / 60))
             SS=$((SESSION_SECS % 60))
             SESSION_TEXT=$(printf "%02d:%02d:%02d" "$SH" "$SM" "$SS")
+
+            TOTAL_PAID="-"
+            if [ -n "$ROAM_SUPA_URL" ] && { [ -n "$ROAM_SUPA_SERVICE_KEY" ] || [ -n "$ROAM_SUPA_KEY" ]; }; then
+                COINS_KEY="$ROAM_SUPA_SERVICE_KEY"
+                [ -z "$COINS_KEY" ] && COINS_KEY="$ROAM_SUPA_KEY"
+
+                if [ -n "$TOKEN" ] && [ "$TOKEN" != "None" ]; then
+                    supa_request "$ROAM_SUPA_URL" "$COINS_KEY" "sessions?select=total_paid&session_uuid=eq.$TOKEN&limit=1"
+                    if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                        PAID_VAL=$(echo "$SUPA_BODY" | $GREP -o '"total_paid":[0-9][0-9.]*' | $CUT -d: -f2 | $HEAD -1)
+                        if [ -z "$PAID_VAL" ]; then
+                            echo "$SUPA_BODY" | $GREP -q '"total_paid":null' && PAID_VAL="0"
+                        fi
+                        case "$PAID_VAL" in
+                            ''|*[!0-9.]*) PAID_VAL="" ;;
+                        esac
+                        [ -n "$PAID_VAL" ] && TOTAL_PAID="$PAID_VAL"
+                    fi
+                fi
+
+                if [ "$TOTAL_PAID" = "-" ]; then
+                    supa_request "$ROAM_SUPA_URL" "$COINS_KEY" "sessions?select=total_paid&mac=eq.$MAC_UP&limit=1"
+                    if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                        PAID_VAL=$(echo "$SUPA_BODY" | $GREP -o '"total_paid":[0-9][0-9.]*' | $CUT -d: -f2 | $HEAD -1)
+                        if [ -z "$PAID_VAL" ]; then
+                            echo "$SUPA_BODY" | $GREP -q '"total_paid":null' && PAID_VAL="0"
+                        fi
+                        case "$PAID_VAL" in
+                            ''|*[!0-9.]*) PAID_VAL="" ;;
+                        esac
+                        [ -n "$PAID_VAL" ] && TOTAL_PAID="$PAID_VAL"
+                    fi
+                fi
+
+                if [ "$TOTAL_PAID" = "-" ]; then
+                    if [ -n "$ROAM_SUPA_MACHINE_ID" ]; then
+                        supa_request "$ROAM_SUPA_URL" "$COINS_KEY" "wifi_devices?select=total_paid&machine_id=eq.$ROAM_SUPA_MACHINE_ID&mac_address=ilike.$MAC_UP&limit=1"
+                    else
+                        supa_request "$ROAM_SUPA_URL" "$COINS_KEY" "wifi_devices?select=total_paid&mac_address=ilike.$MAC_UP&limit=1"
+                    fi
+                    if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                        PAID_VAL=$(echo "$SUPA_BODY" | $GREP -o '"total_paid":[0-9][0-9.]*' | $CUT -d: -f2 | $HEAD -1)
+                        if [ -z "$PAID_VAL" ]; then
+                            echo "$SUPA_BODY" | $GREP -q '"total_paid":null' && PAID_VAL="0"
+                        fi
+                        case "$PAID_VAL" in
+                            ''|*[!0-9.]*) PAID_VAL="" ;;
+                        esac
+                        [ -n "$PAID_VAL" ] && TOTAL_PAID="$PAID_VAL"
+                    elif [ -n "$TOKEN" ] && [ "$TOKEN" != "None" ]; then
+                        supa_request "$ROAM_SUPA_URL" "$COINS_KEY" "wifi_devices?select=total_paid&session_token=eq.$TOKEN&limit=1"
+                        if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                            PAID_VAL=$(echo "$SUPA_BODY" | $GREP -o '"total_paid":[0-9][0-9.]*' | $CUT -d: -f2 | $HEAD -1)
+                            if [ -z "$PAID_VAL" ]; then
+                                echo "$SUPA_BODY" | $GREP -q '"total_paid":null' && PAID_VAL="0"
+                            fi
+                            case "$PAID_VAL" in
+                                ''|*[!0-9.]*) PAID_VAL="" ;;
+                            esac
+                            [ -n "$PAID_VAL" ] && TOTAL_PAID="$PAID_VAL"
+                        fi
+                    fi
+                fi
+            fi
+
+            LOCAL_BASE=$(sqlite3 "$DB_FILE" "SELECT COALESCE(SUM(coins),0) FROM coins WHERE upper(mac)=upper('$MAC_UP');" 2>/dev/null)
+            [ -z "$LOCAL_BASE" ] && LOCAL_BASE=0
+            LOCKED=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM coinslot_locks WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
+            [ -z "$LOCKED" ] && LOCKED=0
+            LOCAL_PENDING=0
+            if [ "$LOCKED" -gt 0 ] 2>/dev/null; then
+                LOCAL_PENDING=$(sqlite3 "$DB_FILE" "SELECT COALESCE(SUM(coins),0) FROM coins WHERE mac='00:00:00:00:00:00';" 2>/dev/null)
+                [ -z "$LOCAL_PENDING" ] && LOCAL_PENDING=0
+            fi
+            LOCAL_PAID=$((LOCAL_BASE + LOCAL_PENDING))
 
             # Use current IP if device is connected, otherwise use stored IP
             DISPLAY_IP="$CURRENT_IP"
@@ -1849,28 +2104,12 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
             [ -z "$EH" ] && EH="(unknown)"
             EIP=$(esc "$DISPLAY_IP")
             EM=$(esc "$MAC_UP")
-            TOKEN=$(sqlite3 "$DB_FILE" "SELECT session_token FROM users WHERE mac='$MAC_UP' LIMIT 1;" 2>/dev/null)
-            [ -z "$TOKEN" ] && TOKEN="None"
             ETOKEN=$(esc "$TOKEN")
 
             EN=$(esc "$NOTES")
             
-            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td style='font-size:11px; color:#64748b;'>$ETOKEN</td><td><span style='color:$ONLINE_COLOR; font-weight:600;'>$ONLINE_STATUS</span></td><td><span class='session-timer' data-remaining='$SESSION_SECS' data-paused='$SESSION_PAUSED' style='font-weight:600;'>$SESSION_TEXT</span></td><td>$EN</td><td>"
-            echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center; margin-bottom:6px;'>"
-            echo "    <input type='hidden' name='action' value='update_device'>"
-            echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
-            echo "    <input name='ip' value='$EIP' placeholder='IP' style='width:120px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
-            echo "    <input name='hostname' value='$EH' placeholder='Hostname' style='width:160px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
-            echo "    <input name='notes' value='$EN' placeholder='Notes' style='width:160px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
-            echo "    <button class='btn btn-primary' style='padding:8px 10px;'>Update</button>"
-            echo "  </form>"
-            echo "  <form method='POST' style='display:inline-flex; gap:8px; align-items:center;'>"
-            echo "    <input type='hidden' name='action' value='device_add_time'>"
-            echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
-            echo "    <input type='hidden' name='ip' value='$DISPLAY_IP'>"
-            echo "    <input type='number' name='add_minutes' min='1' placeholder='+min' style='width:90px; padding:8px; border:1px solid #cbd5e1; border-radius:6px;'>"
-            echo "    <button class='btn btn-primary' style='padding:8px 10px;'>Add Time</button>"
-            echo "  </form>"
+            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td><span style='color:$ONLINE_COLOR; font-weight:600;'>$ONLINE_STATUS</span></td><td style='font-size:11px; color:#64748b; max-width:240px; word-break:break-all;'>$ETOKEN</td><td>$EN</td><td><span class='session-timer' data-remaining='$SESSION_SECS' data-paused='$SESSION_PAUSED' style='font-weight:600;'>$SESSION_TEXT</span></td><td style='font-weight:600;'>₱$TOTAL_PAID</td><td style='font-weight:600;'>₱$LOCAL_PAID</td><td>"
+            echo "  <button type='button' class='btn btn-primary edit-device-btn' data-mac='$MAC_UP' data-ip='$DISPLAY_IP' data-hostname=\"$EH\" data-token=\"$ETOKEN\" style='padding:8px 10px;'>Edit</button>"
             echo "  <form method='POST' style='display:inline; margin-left:10px;'>"
             echo "    <input type='hidden' name='action' value='delete_device'>"
             echo "    <input type='hidden' name='mac' value='$MAC_UP'>"
@@ -1879,10 +2118,65 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
             echo "</td></tr>"
         done
         echo "</table>"
+        echo "<div id='device-edit-modal' style='display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); align-items:center; justify-content:center; z-index:9999;'>"
+        echo "  <div style='background:white; width:560px; max-width:95vw; border-radius:12px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,0.25);'>"
+        echo "    <div style='display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;'>"
+        echo "      <div style='font-size:16px; font-weight:700;'>Edit Device</div>"
+        echo "      <button type='button' id='device-edit-close' class='btn' style='padding:6px 10px; background:#e2e8f0;'>Close</button>"
+        echo "    </div>"
+        echo "    <form method='POST' id='device-edit-form' style='display:grid; gap:12px;'>"
+        echo "      <input type='hidden' name='action' value='device_edit'>"
+        echo "      <input type='hidden' name='mac' id='device-edit-mac' value=''>"
+        echo "      <input type='hidden' name='ip' id='device-edit-ip' value=''>"
+        echo "      <div style='display:grid; grid-template-columns: 140px 1fr; align-items:center; gap:10px;'>"
+        echo "        <div style='color:#64748b; font-size:13px;'>Session Token</div>"
+        echo "        <div id='device-edit-token' style='font-size:12px; color:#0f172a; word-break:break-all; padding:8px 10px; border:1px solid #cbd5e1; border-radius:8px; background:#f8fafc;'></div>"
+        echo "      </div>"
+        echo "      <div style='display:grid; grid-template-columns: 140px 1fr; align-items:center; gap:10px;'>"
+        echo "        <label for='device-edit-hostname' style='font-weight:600;'>Hostname</label>"
+        echo "        <input name='hostname' id='device-edit-hostname' placeholder='Device name' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px;'>"
+        echo "      </div>"
+        echo "      <div style='display:grid; grid-template-columns: 1fr 1fr; gap:12px;'>"
+        echo "        <div>"
+        echo "          <label style='display:block; margin-bottom:6px; font-weight:600;'>Add Minutes</label>"
+        echo "          <input type='number' name='add_minutes' min='0' value='0' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px;'>"
+        echo "        </div>"
+        echo "        <div>"
+        echo "          <label style='display:block; margin-bottom:6px; font-weight:600;'>Deduct Minutes</label>"
+        echo "          <input type='number' name='deduct_minutes' min='0' value='0' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px;'>"
+        echo "        </div>"
+        echo "      </div>"
+        echo "      <div style='display:flex; justify-content:flex-end; gap:10px; margin-top:6px;'>"
+        echo "        <button type='submit' class='btn btn-primary' style='padding:10px 14px;'>Save</button>"
+        echo "      </div>"
+        echo "    </form>"
+        echo "  </div>"
+        echo "</div>"
         echo "</div>"
         
         # Add sync functionality JavaScript
         echo "<script>"
+        echo "(function(){"
+        echo "  var modal = document.getElementById('device-edit-modal');"
+        echo "  var closeBtn = document.getElementById('device-edit-close');"
+        echo "  var macEl = document.getElementById('device-edit-mac');"
+        echo "  var ipEl = document.getElementById('device-edit-ip');"
+        echo "  var hostnameEl = document.getElementById('device-edit-hostname');"
+        echo "  var tokenEl = document.getElementById('device-edit-token');"
+        echo "  function openModal(btn){"
+        echo "    macEl.value = btn.dataset.mac || '';"
+        echo "    ipEl.value = btn.dataset.ip || '';"
+        echo "    hostnameEl.value = btn.dataset.hostname || '';"
+        echo "    tokenEl.textContent = btn.dataset.token || '';"
+        echo "    modal.style.display = 'flex';"
+        echo "  }"
+        echo "  function closeModal(){ modal.style.display='none'; }"
+        echo "  document.querySelectorAll('.edit-device-btn').forEach(function(btn){"
+        echo "    btn.addEventListener('click', function(){ openModal(btn); });"
+        echo "  });"
+        echo "  closeBtn.addEventListener('click', closeModal);"
+        echo "  modal.addEventListener('click', function(e){ if(e.target === modal) closeModal(); });"
+        echo "})();"
         echo "document.getElementById('sync-all-btn').addEventListener('click', function() {"
         echo "  var btn = this;"
         echo "  var originalText = btn.textContent;"

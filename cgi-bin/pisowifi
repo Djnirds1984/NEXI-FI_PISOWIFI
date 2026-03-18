@@ -465,11 +465,6 @@ handle_api() {
             logger -t pisowifi "[LOCK_DEBUG] Attempting atomic lock acquisition..."
             if acquire_coinslot_lock "$MAC" "$SID"; then
                 logger -t pisowifi "[LOCK_DEBUG] ✅ SUCCESS - Device $MAC successfully acquired coinslot lock"
-                logger -t pisowifi "[LOCK_DEBUG] Clearing coins from database for this user..."
-                
-                # Clear coins from database for this user
-                query_db "DELETE FROM coins WHERE mac='$MAC'"
-                
                 logger -t pisowifi "[LOCK_DEBUG] === START_COIN REQUEST SUCCESS ==="
                 json_response "{\"status\": \"started\", \"lock_acquired\": true, \"session_token\": \"$SID\", \"mac\": \"$MAC\", \"button_enabled\": true}"
             else
@@ -536,16 +531,47 @@ handle_api() {
                 # Sync to Supabase for Roaming
                 if [ -n "$SUPA_URL" ] && [ -n "$SID" ]; then
                     REM_SEC=$((NEW_EXPIRY - NOW))
+                    case "$COUNT" in
+                        ''|*[!0-9]*) COUNT=0 ;;
+                    esac
+
                     # Check if session exists in Supabase
-                    supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=id&session_uuid=eq.$SID&limit=1"
+                    supa_request "$SUPA_URL" "$SUPA_KEY" "sessions?select=id,total_paid&session_uuid=eq.$SID&limit=1"
                     if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
-                        # Update existing
-                        SID_BODY="{\"mac\": \"$MAC\", \"remaining_seconds\": $REM_SEC, \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                        CUR_PAID=$(echo "$SUPA_BODY" | grep -o '"total_paid":[0-9][0-9.]*' | cut -d: -f2 | head -1)
+                        if [ -z "$CUR_PAID" ]; then
+                            echo "$SUPA_BODY" | grep -q '"total_paid":null' && CUR_PAID=0
+                        fi
+                        case "$CUR_PAID" in
+                            ''|*[!0-9.]*) CUR_PAID=0 ;;
+                        esac
+                        NEW_PAID=$(awk -v a="$CUR_PAID" -v b="$COUNT" 'BEGIN{printf "%.2f", (a+0)+(b+0)}')
+
+                        SID_BODY="{\"mac\": \"$MAC\", \"remaining_seconds\": $REM_SEC, \"total_paid\": $NEW_PAID, \"is_paused\": false, \"updated_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
                         supa_patch "$SUPA_URL" "$SUPA_KEY" "sessions?session_uuid=eq.$SID" "$SID_BODY"
                     else
-                        # Insert new
-                        SID_BODY="{\"mac\": \"$MAC\", \"remaining_seconds\": $REM_SEC, \"session_uuid\": \"$SID\", \"connected_at\": $NOW, \"is_paused\": false}"
+                        NEW_PAID=$(awk -v b="$COUNT" 'BEGIN{printf "%.2f", (b+0)}')
+                        SID_BODY="{\"mac\": \"$MAC\", \"remaining_seconds\": $REM_SEC, \"total_paid\": $NEW_PAID, \"session_uuid\": \"$SID\", \"connected_at\": $NOW, \"is_paused\": false}"
                         supa_insert "$SUPA_URL" "$SUPA_KEY" "sessions" "$SID_BODY"
+                    fi
+                fi
+
+                if [ -n "$SUPA_URL" ] && [ "$COUNT" -gt 0 ] 2>/dev/null && { [ -n "$SUPA_SERVICE_KEY" ] || [ -n "$SUPA_KEY" ]; }; then
+                    COINS_KEY="$SUPA_SERVICE_KEY"
+                    [ -z "$COINS_KEY" ] && COINS_KEY="$SUPA_KEY"
+
+                    supa_request "$SUPA_URL" "$COINS_KEY" "wifi_devices?select=total_paid&mac_address=ilike.$MAC&limit=1"
+                    if [ "$SUPA_HTTP_CODE" = "200" ] && [ -n "$SUPA_BODY" ] && [ "$SUPA_BODY" != "[]" ]; then
+                        CUR_PAID=$(echo "$SUPA_BODY" | grep -o '"total_paid":[0-9][0-9.]*' | cut -d: -f2 | head -1)
+                        if [ -z "$CUR_PAID" ]; then
+                            echo "$SUPA_BODY" | grep -q '"total_paid":null' && CUR_PAID=0
+                        fi
+                        case "$CUR_PAID" in
+                            ''|*[!0-9.]*) CUR_PAID=0 ;;
+                        esac
+                        NEW_PAID=$(awk -v a="$CUR_PAID" -v b="$COUNT" 'BEGIN{printf "%.2f", (a+0)+(b+0)}')
+                        WD_BODY="{\"total_paid\": $NEW_PAID, \"last_cloud_sync\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+                        supa_patch "$SUPA_URL" "$COINS_KEY" "wifi_devices?mac_address=ilike.$MAC" "$WD_BODY"
                     fi
                 fi
                 
