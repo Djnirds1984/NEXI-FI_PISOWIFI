@@ -464,7 +464,7 @@ handle_api() {
             # Try to acquire lock atomically
             logger -t pisowifi "[LOCK_DEBUG] Attempting atomic lock acquisition..."
             if acquire_coinslot_lock "$MAC" "$SID"; then
-                logger -t pisowifi "[LOCK_DEBUG] ✅ SUCCESS - Device $MAC successfully acquired coinslot lock"
+                logger -t pisowifi "[LOCK_DEBUG] SUCCESS - Device $MAC successfully acquired coinslot lock"
                 logger -t pisowifi "[LOCK_DEBUG] === START_COIN REQUEST SUCCESS ==="
                 json_response "{\"status\": \"started\", \"lock_acquired\": true, \"session_token\": \"$SID\", \"mac\": \"$MAC\", \"button_enabled\": true}"
             else

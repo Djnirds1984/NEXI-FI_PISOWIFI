@@ -1,0 +1,5 @@
+* text=auto
+*.sh text eol=lf
+cgi-bin/* text eol=lf
+root/** text eol=lf
+

@@ -1,4 +1,4 @@
-#!/bin/sh
+﻿#!/bin/sh
 
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 BB="/bin/busybox"
@@ -313,13 +313,16 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         [ -f /etc/pisowifi/supabase.env ] || return 1
         FILE_URL=$($GREP -m1 '^SUPABASE_URL=' /etc/pisowifi/supabase.env 2>/dev/null | $CUT -d= -f2- | $TR -d '\r')
         FILE_KEY=$($GREP -m1 '^SUPABASE_ANON_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | $CUT -d= -f2- | $TR -d '\r')
+        FILE_SVC=$($GREP -m1 '^SUPABASE_SERVICE_ROLE_KEY=' /etc/pisowifi/supabase.env 2>/dev/null | $CUT -d= -f2- | $TR -d '\r')
         FILE_URL=$(echo "$FILE_URL" | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
         FILE_KEY=$(echo "$FILE_KEY" | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
+        FILE_SVC=$(echo "$FILE_SVC" | $SED 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["`'"'"']//; s/["`'"'"']$//')
         [ -z "$FILE_URL" ] && return 1
         [ -z "$FILE_KEY" ] && return 1
         "$UCI" set pisowifi.license=license
         "$UCI" set pisowifi.license.supabase_url="$FILE_URL"
         "$UCI" set pisowifi.license.supabase_key="$FILE_KEY"
+        [ -n "$FILE_SVC" ] && "$UCI" set pisowifi.license.supabase_service_key="$FILE_SVC"
         "$UCI" commit pisowifi
         return 0
     }
@@ -357,6 +360,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         if [ "$ACTION" = "activate_license" ] || [ "$ACTION" = "license_check" ]; then
              SUPA_URL=$("$UCI" get pisowifi.license.supabase_url 2>/dev/null)
              SUPA_KEY=$("$UCI" get pisowifi.license.supabase_key 2>/dev/null)
+             SUPA_SVC=$("$UCI" get pisowifi.license.supabase_service_key 2>/dev/null)
              NOW_TS=$($DATE +%s)
              OPENWRT_TABLE="pisowifi_openwrt"
 
@@ -374,6 +378,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  load_supabase_env >/dev/null 2>&1 || true
                  SUPA_URL=$("$UCI" get pisowifi.license.supabase_url 2>/dev/null)
                  SUPA_KEY=$("$UCI" get pisowifi.license.supabase_key 2>/dev/null)
+                 SUPA_SVC=$("$UCI" get pisowifi.license.supabase_service_key 2>/dev/null)
              fi
 
              if [ -z "$SUPA_URL" ] || [ -z "$SUPA_KEY" ]; then
@@ -382,12 +387,24 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  echo ""
                  exit 0
              fi
+             
+             # Use Service Role Key if available to bypass RLS for license checks
+             USE_KEY="$SUPA_KEY"
+             [ -n "$SUPA_SVC" ] && USE_KEY="$SUPA_SVC"
 
              # First, check by hardware_id
-             supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key&hardware_id=eq.$HARDWARE_ID&limit=1"
+             supa_request "$SUPA_URL" "$USE_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key&hardware_id=eq.$HARDWARE_ID&limit=1"
              RESP="$SUPA_BODY"
              LAST_CODE="$SUPA_HTTP_CODE"
              log_license "Check HW: $HARDWARE_ID code=$LAST_CODE"
+
+             if [ "$LAST_CODE" = "0" ]; then
+                 log_license "Supabase request failed exit=$SUPA_CURL_EXIT err=$SUPA_CURL_ERR"
+                 echo "Status: 302 Found"
+                 echo "Location: /cgi-bin/admin?tab=settings&msg=license_supabase_error"
+                 echo ""
+                 exit 0
+             fi
 
              FOUND_BY_HW=0
              if [ "$LAST_CODE" = "200" ] && echo "$RESP" | $GREP -q '"id"'; then
@@ -406,10 +423,17 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                  
                  TRIAL_BODY=$(printf '{"hardware_id":"%s","status":"trial","expires_at":"%s"}' "$HARDWARE_ID" "$EXP_DATE")
                  log_license "Creating trial: $TRIAL_BODY"
-                 supa_insert "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE" "$TRIAL_BODY"
+                 supa_insert "$SUPA_URL" "$USE_KEY" "$OPENWRT_TABLE" "$TRIAL_BODY"
                  RESP="$SUPA_BODY"
                  LAST_CODE="$SUPA_HTTP_CODE"
                  log_license "Trial creation code: $LAST_CODE"
+                if [ "$LAST_CODE" = "0" ]; then
+                    log_license "Supabase request failed exit=$SUPA_CURL_EXIT err=$SUPA_CURL_ERR"
+                    echo "Status: 302 Found"
+                    echo "Location: /cgi-bin/admin?tab=settings&msg=license_supabase_error"
+                    echo ""
+                    exit 0
+                fi
                  if [ "$LAST_CODE" = "201" ] || [ "$LAST_CODE" = "200" ]; then
                      FOUND_BY_HW=1
                  fi
@@ -419,19 +443,40 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
              if [ "$ACTION" = "activate_license" ] && [ "$FOUND_BY_HW" = "0" ]; then
                  LIC_KEY=$(get_post_var "license_key")
                  if [ -n "$LIC_KEY" ]; then
-                     supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
+                     supa_request "$SUPA_URL" "$USE_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
                      RESP="$SUPA_BODY"
                      LAST_CODE="$SUPA_HTTP_CODE"
+                    if [ "$LAST_CODE" = "0" ]; then
+                        log_license "Supabase request failed exit=$SUPA_CURL_EXIT err=$SUPA_CURL_ERR"
+                        echo "Status: 302 Found"
+                        echo "Location: /cgi-bin/admin?tab=settings&msg=license_supabase_error"
+                        echo ""
+                        exit 0
+                    fi
                      if [ "$LAST_CODE" = "200" ] && echo "$RESP" | $GREP -q '"id"'; then
                          # Found license key, check if already bound
                          BOUND_HW=$(echo "$RESP" | json_first "hardware_id")
                          if [ -z "$BOUND_HW" ] || [ "$BOUND_HW" = "null" ]; then
                              # Bind it
                              PATCH_BODY=$(printf '{"hardware_id":"%s","activated_at":"%s","status":"active"}' "$HARDWARE_ID" "$($DATE -Iseconds 2>/dev/null || $DATE +%Y-%m-%dT%H:%M:%SZ)")
-                             supa_patch "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?license_key=ilike.$LIC_KEY" "$PATCH_BODY"
+                             supa_patch "$SUPA_URL" "$USE_KEY" "$OPENWRT_TABLE?license_key=ilike.$LIC_KEY" "$PATCH_BODY"
+                            if [ "$SUPA_HTTP_CODE" = "0" ]; then
+                                log_license "Supabase request failed exit=$SUPA_CURL_EXIT err=$SUPA_CURL_ERR"
+                                echo "Status: 302 Found"
+                                echo "Location: /cgi-bin/admin?tab=settings&msg=license_supabase_error"
+                                echo ""
+                                exit 0
+                            fi
                              # Refresh data
-                             supa_request "$SUPA_URL" "$SUPA_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
+                             supa_request "$SUPA_URL" "$USE_KEY" "$OPENWRT_TABLE?select=id,status,expires_at,vendor_uuid,vendor_id,license_key,hardware_id&license_key=ilike.$LIC_KEY&limit=1"
                              RESP="$SUPA_BODY"
+                            if [ "$SUPA_HTTP_CODE" = "0" ]; then
+                                log_license "Supabase request failed exit=$SUPA_CURL_EXIT err=$SUPA_CURL_ERR"
+                                echo "Status: 302 Found"
+                                echo "Location: /cgi-bin/admin?tab=settings&msg=license_supabase_error"
+                                echo ""
+                                exit 0
+                            fi
                              FOUND_BY_HW=1
                          else
                              if [ "$BOUND_HW" != "$HARDWARE_ID" ]; then
@@ -484,16 +529,16 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
                      log_license "Syncing to vendors: $VENDOR_BODY"
                      
                      # First check if exists
-                     supa_request "$SUPA_URL" "$SUPA_KEY" "vendors?select=id&hardware_id=eq.$HARDWARE_ID&limit=1"
+                     supa_request "$SUPA_URL" "$USE_KEY" "vendors?select=id&hardware_id=eq.$HARDWARE_ID&limit=1"
                      V_EXIST_RESP="$SUPA_BODY"
                      V_EXIST_CODE="$SUPA_HTTP_CODE"
                      
                      if [ "$V_EXIST_CODE" = "200" ] && echo "$V_EXIST_RESP" | $GREP -q '"id"'; then
                          log_license "Machine exists in vendors, patching..."
-                         supa_patch "$SUPA_URL" "$SUPA_KEY" "vendors?hardware_id=eq.$HARDWARE_ID" "$VENDOR_BODY"
+                         supa_patch "$SUPA_URL" "$USE_KEY" "vendors?hardware_id=eq.$HARDWARE_ID" "$VENDOR_BODY"
                      else
                          log_license "Machine missing in vendors, inserting..."
-                         supa_insert "$SUPA_URL" "$SUPA_KEY" "vendors" "$VENDOR_BODY"
+                         supa_insert "$SUPA_URL" "$USE_KEY" "vendors" "$VENDOR_BODY"
                      fi
                      log_license "Sync result code: $SUPA_HTTP_CODE"
                  fi
@@ -2541,6 +2586,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         if echo "$QUERY_STRING" | grep -q "msg=license_ok"; then echo "<div class='alert' style='background:#dcfce7; color:#166534; padding:15px; border-radius:8px; margin-bottom:20px;'>License Activated!</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_hw_mismatch"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>License is bound to a different device.</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_not_found"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>License key not found.</div>"; fi
+        if echo "$QUERY_STRING" | grep -q "msg=license_supabase_error"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Cannot reach Supabase. Check internet/WAN and install CA certs (opkg install ca-bundle ca-certificates). Then try again.</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_fetch_failed"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Could not reach Supabase.</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_rls_denied"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Supabase denied access (RLS/permissions).</div>"; fi
         if echo "$QUERY_STRING" | grep -q "msg=license_rls_empty"; then echo "<div class='alert' style='background:#fee2e2; color:#991b1b; padding:15px; border-radius:8px; margin-bottom:20px;'>Supabase returned no rows for anon key (check RLS/policies/grants).</div>"; fi

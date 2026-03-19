@@ -1856,6 +1856,23 @@ fi
 EOF
 chmod +x /www/cgi-bin/pisowifi
 
+fix_script_file() {
+    FILE="$1"
+    [ -f "$FILE" ] || return 0
+    sed -i 's/\r$//' "$FILE" 2>/dev/null || {
+        TMPF="/tmp/$(basename "$FILE").tmp"
+        tr -d '\r' < "$FILE" > "$TMPF" 2>/dev/null && mv "$TMPF" "$FILE"
+    }
+    if command -v hexdump >/dev/null 2>&1; then
+        if [ "$(head -c 3 "$FILE" 2>/dev/null | hexdump -v -e '1/1 "%02x"')" = "efbbbf" ]; then
+            TMPF="/tmp/$(basename "$FILE").nobom"
+            tail -c +4 "$FILE" > "$TMPF" 2>/dev/null && mv "$TMPF" "$FILE"
+        fi
+    fi
+}
+
+fix_script_file /www/cgi-bin/pisowifi
+
 # 3.5 Create Admin Panel CGI
 echo "Creating Admin Panel..."
 cat << 'EOF' > /www/cgi-bin/admin
@@ -3951,6 +3968,8 @@ echo "</body></html>"
 EOF
 chmod +x /www/cgi-bin/admin
 
+fix_script_file /www/cgi-bin/admin
+
 mkdir -p /www/portal_themes
 
 cat << 'HTML' > /www/portal_themes/theme_glass.html
@@ -4749,14 +4768,61 @@ if [ -f /www/cgi-bin/luci ]; then
     mv /www/cgi-bin/luci /www/cgi-bin/luci.bak
 fi
 
-# Set LAN IP to 10.0.0.1
+# Ensure LAN interface exists and is static on 10.0.0.1
+if ! uci -q get network.lan >/dev/null 2>&1; then
+    uci set network.lan='interface'
+fi
+
+uci set network.lan.proto='static'
 uci set network.lan.ipaddr='10.0.0.1'
+uci set network.lan.netmask='255.255.255.0'
+uci -q set network.lan.ip6assign='60'
+
+# Ensure LAN bridging works across both legacy (ifname) and DSA (device/ports) OpenWrt builds
+DSA_MODE=0
+uci show network 2>/dev/null | grep -q '=device' && DSA_MODE=1
+
+if [ "$DSA_MODE" = "1" ]; then
+    BR_DEV_SECTION=$(uci show network 2>/dev/null | grep -m1 "\.name='br-lan'" | cut -d. -f2 | cut -d= -f1)
+    if [ -z "$BR_DEV_SECTION" ]; then
+        BR_DEV_SECTION=$(uci add network device 2>/dev/null)
+        uci set network."$BR_DEV_SECTION".name='br-lan'
+    fi
+    uci set network."$BR_DEV_SECTION".type='bridge'
+    uci -q delete network."$BR_DEV_SECTION".ports
+    [ -d /sys/class/net/eth0 ] && uci add_list network."$BR_DEV_SECTION".ports='eth0'
+    [ -d /sys/class/net/eth1 ] && uci add_list network."$BR_DEV_SECTION".ports='eth1'
+
+    uci -q delete network.lan.ifname
+    uci set network.lan.device='br-lan'
+else
+    uci set network.lan.type='bridge'
+    LAN_DEVICES=""
+    [ -d /sys/class/net/eth0 ] && LAN_DEVICES="eth0"
+    [ -d /sys/class/net/eth1 ] && LAN_DEVICES="$LAN_DEVICES eth1"
+    [ -n "$LAN_DEVICES" ] && uci set network.lan.ifname="$LAN_DEVICES"
+fi
+
 uci commit network
+
+# Ensure DHCP server is enabled on LAN
+if ! uci -q get dhcp.lan >/dev/null 2>&1; then
+    uci set dhcp.lan='dhcp'
+fi
+uci set dhcp.lan.interface='lan'
+uci set dhcp.lan.ignore='0'
+uci -q set dhcp.lan.start='100'
+uci -q set dhcp.lan.limit='150'
+uci -q set dhcp.lan.leasetime='12h'
+uci commit dhcp
 
 # Enable all WiFi radios (avoid hardcoding radio0)
 RADIOS=$(uci show wireless 2>/dev/null | grep "=wifi-device" | cut -d. -f2 | cut -d= -f1)
 for r in $RADIOS; do
     uci set wireless."$r".disabled='0' 2>/dev/null || true
+    uci -q set wireless."$r".country='PH' 2>/dev/null || true
+    uci -q set wireless."$r".channel='auto' 2>/dev/null || true
+    uci -q set wireless."$r".htmode='HT20' 2>/dev/null || true
 done
 
 # Configure all AP interfaces (avoid hardcoding @wifi-iface[0])
@@ -4792,6 +4858,13 @@ fi
 
 # Reload WiFi (Ignore errors if radio busy)
 /sbin/wifi reload 2>/dev/null || true
+
+# Restart DHCP/DNS services to apply LAN/DHCP changes
+/etc/init.d/dnsmasq restart 2>/dev/null || true
+/etc/init.d/odhcpd restart 2>/dev/null || true
+
+# Ensure captive portal nft rules are loaded
+[ -x /usr/bin/pisowifi_nftables.sh ] && /usr/bin/pisowifi_nftables.sh init >/dev/null 2>&1 || true
 
 echo "Network Configured: IP 10.0.0.1, SSID 'NEXI-FI PISOWIFI'"
 
