@@ -1275,6 +1275,14 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
             echo "Location: /cgi-bin/admin?tab=settings&msg=saved"
             echo ""
             exit 0
+
+        elif [ "$ACTION" = "reboot_router" ]; then
+            echo "Status: 200 OK"
+            echo "Content-type: text/html; charset=utf-8"
+            echo ""
+            echo "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Restarting Router</title></head><body style='font-family:sans-serif; padding:24px;'><h2>Restart Router</h2><p>Restarting router now. Please wait 30-60 seconds and reconnect.</p></body></html>"
+            ( sleep 1; /sbin/reboot >/dev/null 2>&1 || reboot >/dev/null 2>&1 ) &
+            exit 0
              
         elif [ "$ACTION" = "update_standard_rate" ]; then
              RATE=$(get_post_var "rate")
@@ -1532,7 +1540,7 @@ echo "  @media (max-width: 768px) { body { display: block; } .sidebar { position
 echo "</style></head><body>"
 
 # Render Sidebar
-echo "<button class='sidebar-toggle' type='button' onclick='toggleSidebar()' aria-label='Menu'>☰</button>"
+echo "<button class='sidebar-toggle' type='button' onclick='toggleSidebar()' aria-label='Menu'>&#9776;</button>"
 echo "<div id='sidebar-overlay' class='sidebar-overlay' onclick='toggleSidebar(false)'></div>"
 echo "<div class='sidebar'>"
 echo "  <h2>NEXI-FI ADMIN</h2>"
@@ -1554,6 +1562,14 @@ echo "  </div>"
 echo "</div>"
 
 echo "<div class='main-content'><div class='container'>"
+echo "<div style='position:sticky; top:0; z-index:999; background:var(--bg); padding:10px 0; margin:-10px 0 10px 0;'>"
+echo "  <div style='display:flex; justify-content:flex-end; gap:10px;'>"
+echo "    <form method='POST' style='margin:0;' onsubmit=\"return confirm('Restart router now?');\">"
+echo "      <input type='hidden' name='action' value='reboot_router'>"
+echo "      <button class='btn btn-danger' type='submit' style='padding:10px 14px; font-weight:800;'>Restart Router</button>"
+echo "    </form>"
+echo "  </div>"
+echo "</div>"
 echo "<script>function toggleSidebar(force){var open=document.body.classList.contains('sidebar-open');var next=(typeof force==='boolean')?force:!open;if(next){document.body.classList.add('sidebar-open');}else{document.body.classList.remove('sidebar-open');}}window.addEventListener('resize',function(){if(window.innerWidth>768)document.body.classList.remove('sidebar-open');});document.addEventListener('keydown',function(e){if(e.key==='Escape')document.body.classList.remove('sidebar-open');});document.addEventListener('click',function(e){var t=e.target;if(t&&t.classList&&t.classList.contains('nav-link')&&window.innerWidth<=768){document.body.classList.remove('sidebar-open');}});</script>"
 
     if [ "$TAB" = "dashboard" ]; then
@@ -1584,7 +1600,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "  <div class='card'><h3>Router Model</h3><div class='value' style='font-size:1.1rem'>$MODEL</div><div class='sub'>$CORES CPU Cores</div></div>"
         echo "  <div class='card'><h3>RAM Usage</h3><div class='value'>$MEM_PCT%</div><div class='progress-bg'><div class='progress-fill' style='width:$MEM_PCT%'></div></div><div class='sub'>$((MEM_USED/1024))MB / $((MEM_TOTAL/1024))MB</div></div>"
         echo "  <div class='card'><h3>Storage (Overlay)</h3><div class='value'>$OVERLAY_PCT%</div><div class='progress-bg'><div class='progress-fill' style='width:$OVERLAY_PCT%'></div></div><div class='sub'>$((OVERLAY_USED/1024))MB Used</div></div>"
-        echo "  <div class='card'><h3>Users</h3><div class='value'>$ACTIVE_USERS / $TOTAL_USERS</div><div class='sub'><span style='color:var(--success)'>● $ACTIVE_USERS Online</span> | <span style='color:var(--secondary)'>○ $DISCONNECTED_USERS Offline</span></div></div>"
+        echo "  <div class='card'><h3>Users</h3><div class='value'>$ACTIVE_USERS / $TOTAL_USERS</div><div class='sub'><span style='color:var(--success)'>&#9679; $ACTIVE_USERS Online</span> | <span style='color:var(--secondary)'>&#9675; $DISCONNECTED_USERS Offline</span></div></div>"
         echo "</div>"
 
         # Traffic Chart
@@ -1665,7 +1681,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "      <input type='hidden' name='action' value='add_custom_rate'>"
         
         echo "      <div style='flex:1; min-width:100px;'>"
-        echo "        <label style='display:block; margin-bottom:5px; font-weight:600;'>Currency (₱)</label>"
+        echo "        <label style='display:block; margin-bottom:5px; font-weight:600;'>Currency (&#8369;)</label>"
         echo "        <input type='number' name='amount' placeholder='1' style='width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px; box-sizing:border-box;' required>"
         echo "      </div>"
         
@@ -1703,7 +1719,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         
         echo "      <button class='btn btn-primary' style='padding: 10px 30px; width:100%;'>Add Rate</button>"
         echo "    </form>"
-        echo "    <div class='alert' style='background:#fffbeb; color:#92400e; margin-top:10px; font-size:0.8rem;'>⚠️ Limits are in the Bandwidth section</div>"
+        echo "    <div class='alert' style='background:#fffbeb; color:#92400e; margin-top:10px; font-size:0.8rem;'>&#9888; Limits are in the Bandwidth section</div>"
         echo "  </div>"
         echo "</div>"
         
@@ -1711,8 +1727,8 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "  <h3>Active Rate Definitions</h3>"
         echo "  <table>"
         echo "    <tr><th>Denomination</th><th>Duration</th><th>Expiration</th><th>Action</th></tr>"
-        # List Standard Rate (₱1)
-        echo "    <tr><td>₱1</td><td>$CURRENT_RATE Minutes</td><td>-</td><td>-</td></tr>"
+        # List Standard Rate (&#8369;1)
+        echo "    <tr><td>&#8369;1</td><td>$CURRENT_RATE Minutes</td><td>-</td><td>-</td></tr>"
         # List Custom Rates
         # Need complex SQL to format output nicely or do it in shell
         sqlite3 -separator '|' $DB_FILE "SELECT amount, minutes, is_pausable, expiration, id FROM rates WHERE amount != 1 ORDER BY amount ASC" 2>/dev/null | while read line; do
@@ -1736,7 +1752,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
                 else EXP_TXT="${EXP}m"; fi
             fi
             
-            echo "    <tr><td>₱$AMT</td><td>$DUR</td><td>$EXP_TXT</td><td>"
+            echo "    <tr><td>&#8369;$AMT</td><td>$DUR</td><td>$EXP_TXT</td><td>"
             echo "      <form method='POST' style='display:inline;'><input type='hidden' name='action' value='delete_rate'><input type='hidden' name='rate_id' value='$ID'><button class='btn btn-danger' style='padding:4px 8px; font-size:11px;'>DELETE</button></form>"
             echo "    </td></tr>"
         done
@@ -2149,7 +2165,7 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
 
             EN=$(esc "$NOTES")
             
-            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td><span style='color:$ONLINE_COLOR; font-weight:600;'>$ONLINE_STATUS</span></td><td style='font-size:11px; color:#64748b; max-width:240px; word-break:break-all;'>$ETOKEN</td><td>$EN</td><td><span class='session-timer' data-remaining='$SESSION_SECS' data-paused='$SESSION_PAUSED' style='font-weight:600;'>$SESSION_TEXT</span></td><td style='font-weight:600;'>₱$TOTAL_PAID</td><td style='font-weight:600;'>₱$LOCAL_PAID</td><td>"
+            echo "<tr><td>$EH</td><td>$EIP</td><td>$EM</td><td><span style='color:$ONLINE_COLOR; font-weight:600;'>$ONLINE_STATUS</span></td><td style='font-size:11px; color:#64748b; max-width:240px; word-break:break-all;'>$ETOKEN</td><td>$EN</td><td><span class='session-timer' data-remaining='$SESSION_SECS' data-paused='$SESSION_PAUSED' style='font-weight:600;'>$SESSION_TEXT</span></td><td style='font-weight:600;'>&#8369;$TOTAL_PAID</td><td style='font-weight:600;'>&#8369;$LOCAL_PAID</td><td>"
             echo "  <button type='button' class='btn btn-primary edit-device-btn' data-mac='$MAC_UP' data-ip='$DISPLAY_IP' data-hostname=\"$EH\" data-token=\"$ETOKEN\" style='padding:8px 10px;'>Edit</button>"
             echo "  <form method='POST' style='display:inline; margin-left:10px;'>"
             echo "    <input type='hidden' name='action' value='delete_device'>"
@@ -2232,16 +2248,16 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         echo "  .then(response => response.json())"
         echo "  .then(data => {"
         echo "    if(data.status === 'success') {"
-        echo "      alert('✅ ' + data.message);"
+        echo "      alert('OK: ' + data.message);"
         echo "      location.reload();"
         echo "    } else {"
-        echo "      alert('❌ ' + data.message);"
+        echo "      alert('Error: ' + data.message);"
         echo "      btn.textContent = originalText;"
         echo "      btn.disabled = false;"
         echo "    }"
         echo "  })"
         echo "  .catch(error => {"
-        echo "    alert('❌ Sync failed: ' + error);"
+        echo "    alert('Sync failed: ' + error);"
         echo "    btn.textContent = originalText;"
         echo "    btn.disabled = false;"
         echo "  });"
@@ -2259,15 +2275,15 @@ echo "<script>function toggleSidebar(force){var open=document.body.classList.con
         [ -z "$TODAY_SALES" ] && TODAY_SALES=0
 
         echo "<div class='grid'>"
-        echo "  <div class='card'><h3>Total Revenue</h3><div class='value'>₱$TOTAL_SALES</div></div>"
-        echo "  <div class='card'><h3>Today's Revenue</h3><div class='value'>₱$TODAY_SALES</div></div>"
+        echo "  <div class='card'><h3>Total Revenue</h3><div class='value'>&#8369;$TOTAL_SALES</div></div>"
+        echo "  <div class='card'><h3>Today's Revenue</h3><div class='value'>&#8369;$TODAY_SALES</div></div>"
         echo "</div>"
 
         # Sales History Table
         echo "<div class='card'>"
         echo "<h3>Transaction History</h3>"
         echo "<table><tr><th>ID</th><th>Time</th><th>MAC</th><th>Amount</th></tr>"
-        sqlite3 -separator '</td><td>' $DB_FILE "SELECT id, datetime(timestamp, 'unixepoch', 'localtime'), mac, '₱'||coins FROM coins WHERE mac != '00:00:00:00:00:00' ORDER BY id DESC LIMIT 50;" 2>/dev/null | awk '{print "<tr><td>" $0 "</td></tr>"}'
+        sqlite3 -separator '</td><td>' $DB_FILE "SELECT id, datetime(timestamp, 'unixepoch', 'localtime'), mac, '&#8369;'||coins FROM coins WHERE mac != '00:00:00:00:00:00' ORDER BY id DESC LIMIT 50;" 2>/dev/null | awk '{print "<tr><td>" $0 "</td></tr>"}'
         echo "</table>"
         echo "</div>"
     
